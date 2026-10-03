@@ -621,10 +621,17 @@ async def tool_checks(check: Checker, settings: Any, site: str, chat_base: str, 
     shown_norm, _ = normal.feed("（点头）好的。")
     tail_norm, _ = normal.flush()
     check.ok("普通收尾不被误伤", shown_norm + tail_norm == "（点头）好的。", repr(shown_norm + tail_norm))
+    after_body = StreamGuard()
+    shown_before, _ = after_body.feed("我少催你。\n")
+    shown_after, _ = after_body.feed("你想聊什么？\n")
+    tail_after, _ = after_body.flush()
+    check.ok("正文之后的整行套话不进气泡", "你想聊什么" not in shown_before + shown_after + tail_after,
+             repr(shown_before + shown_after + tail_after))
     only = StreamGuard()
     shown_only, _ = only.feed("你想聊什么？\n")
     tail_only, _ = only.flush()
-    check.ok("整行只有套话时不进气泡", "你想聊什么" not in shown_only + tail_only, repr(shown_only + tail_only))
+    # 整条只有这一句时照旧放出去：宁可留一句问话，也不能给人看空气泡
+    check.ok("独此一句时不吞成空气泡", "你想聊什么" in shown_only + tail_only, repr(shown_only + tail_only))
 
     # ---------------- 引擎：原生 tool_calls 全程静默 ----------------
     from core.bot import MySoulBot
