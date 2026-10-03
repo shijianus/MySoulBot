@@ -70,6 +70,7 @@ GROUP_LOCKED: Final[frozenset[str]] = frozenset(
         "panel", "persona", "char", "model", "edit", "append", "note", "user", "sync",
         "tools", "tool", "debug", "clear", "status", "prompt", "memory", "facts", "soul",
         "clawd", "profile", "whoami", "archive", "audit", "log", "relations", "dynamics",
+        "rapport", "温度", "rhythm", "体温",
     }
 )
 # 已经搬进控制台的旧命令：给一行「去哪儿找」，而不是把调试信息摊在对话里
@@ -462,6 +463,10 @@ class App:
             "append": self._panel_append,
             "edit": self._panel_edit,
             "archive": self._panel_archive,
+            "rapport": self._panel_rapport,
+            "温度": self._panel_rapport,
+            "rhythm": self._panel_rhythm,
+            "体温": self._panel_rhythm,
             "audit": self._panel_audit,
             "persona": self._panel_persona,
             "char": self._panel_persona,
@@ -526,6 +531,8 @@ class App:
             ("明文日志", f"{info['bytes'] // 1024} KB · 文件 {'、'.join(info['log_files']) or '（尚无）'}"),
             ("已归档", str(len(info["archived"])) + (" 份：" + "、".join(info["archived"]) if info["archived"] else " 份")),
             ("工具", registry.summary() + f" · 形态 {self.bot.tool_mode(self.user_id)}"),
+            ("此刻", self._rhythm_brief()),
+            ("温度", self._rapport_brief()),
             ("对话模型", f"{self._settings.model} @ {self._settings.base_url}"),
             ("抽取模型", self._settings.effective_extractor_model),
         ]
@@ -571,6 +578,20 @@ class App:
             f"{'群聊' if self._settings.group_mode else '1V1'} · 工具 {'on' if self._settings.tools_enabled else 'off'}"
         )
         return True
+
+    def _rhythm_brief(self) -> str:
+        presence = self.bot.presence_of(self.user_id)
+        if presence is None:
+            return "（本轮尚未开始）"
+        return (
+            f"{presence.slot.label} · 余温 {int(presence.mood_residual * 100)}%"
+            f" · 耐心 {int(presence.patience.left * 100)}%"
+            + (f" · 隔了 {presence._gap_text()}" if presence.gap_days else "")
+        )
+
+    def _rapport_brief(self) -> str:
+        rapport = self.bot.rapport_of(self.user_id)
+        return f"{rapport.value}/100 · {rapport.label}" if rapport else "（未结算）"
 
     async def _panel_log(self) -> bool:
         if not self._quiet_events:
@@ -668,6 +689,44 @@ class App:
             self.ui.warn(f"{editor} 退出码 {code}，文件可能未保存")
         content = await self.storage.read_doc(self.user_id, doc)
         self.ui.line(f"  {doc}.md {'已更新（%d 字符）' % len(content) if content.strip() else '现在是空的，下一轮会退回模板'}")
+        return True
+
+    async def _panel_rapport(self, arg: str) -> bool:
+        """只读：熟络度、阶段分寸、依据。没有 set——温度只能由相处攒出来。"""
+        rapport = await self.bot.rapport.read(self.user_id)
+        rows = [
+            ("熟络度", f"{rapport.value}/100"),
+            ("阶段", f"{rapport.label} · {rapport.stage}"),
+            ("峰值", str(int(round(rapport.peak)))),
+            ("依据", " · ".join(rapport.evidence) or "刚开始"),
+            ("这一轮涨了多少", " · ".join(f"{key} {value:+g}" for key, value in rapport.deltas.items()) or "—"),
+        ]
+        self.ui.table("熟络度", rows)
+        self.ui.line(f"  分寸：{rapport.conduct}")
+        if (arg or "").strip().lower() in {"why", "依据", "为什么"}:
+            counters = dict((self.bot.session(self.user_id).state or {}).get("rapport") or {})
+            self.ui.raw("计数字段", "\n".join(f"{key} = {value}" for key, value in sorted(counters.items())))
+            self.ui.line("  温度由引擎按「轮次 / 深夜 / 他新交代的事 / 攒下的分寸 / 吵过又好和」累积，"
+                         "隔久了会凉但不会掉破峰值的一半。命令与酒馆都改不了它。")
+        return True
+
+    async def _panel_rhythm(self) -> bool:
+        presence = self.bot.presence_of(self.user_id)
+        if presence is None:
+            self.ui.line("  这一轮还没开始，体温暖不出来（先说一句 /panel rhythm 之前随便聊一句）")
+            return True
+        rows = [
+            ("此刻", presence.stamp.strftime("%Y-%m-%d %H:%M") + f"（{self._settings.user_timezone or '系统时区'}）"),
+            ("时段", f"{presence.slot.label}" + (" · 深夜" if presence.deep_night else "")),
+            ("身体", presence.slot.body),
+            ("分寸", presence.slot.conduct),
+            ("情绪余温", f"{int(presence.mood_residual * 100)}%"
+             + (f" · 效价 {presence.mood.valence:+g}" if presence.mood.valence else "")
+             + (f" · 起因：{presence.mood.cause}" if presence.mood.cause else "")),
+            ("耐心余额", f"{int(presence.patience.left * 100)}% · 今天第 {presence.patience.turns_today} 轮"),
+            ("隔了多久", presence._gap_text() if presence.gap_days else "（没有上一见的记录）"),
+        ]
+        self.ui.table("此刻的我", rows)
         return True
 
     async def _panel_archive(self) -> bool:
@@ -793,7 +852,7 @@ class App:
 
 # ---------------------------------------------------------------- 辅助函数
 PANEL_ARG_COMMANDS: Final[frozenset[str]] = frozenset(
-    {"tool", "debug", "model", "note", "append", "edit", "persona", "char", "user"}
+    {"tool", "debug", "model", "note", "append", "edit", "persona", "char", "user", "rapport", "温度"}
 )
 
 
