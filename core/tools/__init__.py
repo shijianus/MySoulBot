@@ -2,7 +2,7 @@
 
 from core.tools.base import Tool, ToolContext, ToolParam, ToolResult
 from core.tools.git import GitSync
-from core.tools.media import ImageGen, Snapshot
+from core.tools.media import ImageGen, SeeImage, Snapshot
 from core.tools.protocol import Directive, StreamGuard, parse_directive, strip_markers
 from core.tools.registry import DEFAULT_TOOLS, ToolRegistry
 from core.tools.soul import Reflect
@@ -16,6 +16,7 @@ __all__ = [
     "GitSync",
     "ImageGen",
     "Reflect",
+    "SeeImage",
     "Snapshot",
     "StreamGuard",
     "Tool",

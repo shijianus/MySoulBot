@@ -14,6 +14,7 @@ from core.card_loader import (
 )
 from core.clawd_soul import ClawdSoul
 from core.memory_extractor import ExtractionOutcome, MemoryExtractor
+from core.panel import build_doc, build_status, build_timeline
 from core.presence import Mood, Patience, Presence, build_presence, slot_for
 from core.prompt_builder import PromptBuilder, PromptLayers
 from core.rapport import Rapport, RapportEngine, parse_temperature, stage_for
@@ -27,12 +28,14 @@ from core.storage_manager import (
 )
 from core.tools import ToolRegistry, ToolResult
 from core.tools.protocol import StreamGuard, parse_directive
+from core.vision import ImageRef, VisionError, find_sources, ingest
 
 __all__ = [
     "BotError",
     "CardError",
     "ClawdSoul",
     "ExtractionOutcome",
+    "ImageRef",
     "MemoryExtractor",
     "MySoulBot",
     "PersonaApplied",
@@ -54,7 +57,14 @@ __all__ = [
     "TavernCard",
     "ToolRegistry",
     "ToolResult",
+    "VisionError",
+    "build_doc",
+    "build_presence",
+    "build_status",
+    "build_timeline",
     "compile_soul",
+    "find_sources",
+    "ingest",
     "load_card_file",
     "normalize_fact",
     "parse_card",
@@ -62,7 +72,6 @@ __all__ = [
     "parse_facts",
     "scan_size_gate",
     "slugify",
-    "build_presence",
     "parse_temperature",
     "slot_for",
     "stage_for",

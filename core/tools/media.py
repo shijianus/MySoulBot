@@ -24,6 +24,14 @@ from urllib.request import Request, urlopen
 
 from core.tools.base import Tool, ToolContext, ToolParam, ToolResult
 from core.tools.webio import FetchError, _assert_public_host, fetch
+from core.vision import (
+    ImageRef,
+    VisionError,
+    adopt_file,
+    ingest,
+    note as vision_note,
+    view_url,
+)
 
 _SCREEN_TOOLS: Final[tuple[tuple[str, tuple[str, ...]], ...]] = (
     ("grim", ("grim", "{out}")),
@@ -78,13 +86,22 @@ class ImageGen(Tool):
         except Exception as exc:  # noqa: BLE001 - 绘图失败不冒泡到界面
             return ToolResult.failure(f"{type(exc).__name__}: {exc}")
         await asyncio.to_thread(path.write_bytes, data)
+        link = view_url(ctx.settings, ctx.user_id, path)
         note = (
-            f"画好了：{path}\n（本地图像后端是占位实现，产出的是纯色渐变图，不是真的画面内容。"
+            f"画好了：{path}\n能点开的地址：{link}\n"
+            "（本地图像后端是占位实现，产出的是纯色渐变图，不是真的画面内容。"
             "别把它说成你画了什么具体东西。）"
             if provider == "stub"
-            else f"画好了：{path}\n描述：{prompt}"
+            else f"画好了：{path}\n能点开的地址：{link}\n描述：{prompt}"
         )
-        return ToolResult.success(note, artifacts=[path], meta={"provider": provider})
+        try:
+            ref = adopt_file(path, ctx.settings)
+        except VisionError:
+            ref = None
+        meta: dict[str, Any] = {"provider": provider, "link": link}
+        if ref is not None:
+            meta["images"] = [ref]
+        return ToolResult.success(note, artifacts=[path], meta=meta)
 
     @staticmethod
     def _openai(ctx: ToolContext, prompt: str, size: str) -> bytes:
@@ -119,6 +136,39 @@ class ImageGen(Tool):
         if first.get("url"):
             return _download_bytes(first["url"], s.web_timeout, s.web_max_bytes, s.web_allow_private)
         raise FetchError("画图接口的返回我读不懂")
+
+
+class SeeImage(Tool):
+    name = "see_image"
+    description = (
+        "他递来一张图（本机路径、网址，或他贴出来的那串 base64），你把它收进眼里再开口。"
+        "不用复述文件名，也不用宣告「已接收」——看见了就说你看见的那个部分。"
+    )
+    hint = "能看他发来的图片"
+    params = (ToolParam("source", "string", "图片路径、http(s) 链接，或 data:image;base64 串"),)
+    primary_arg = "source"
+
+    def available(self, ctx: ToolContext) -> bool:
+        return ctx.settings.tools_enabled and ctx.settings.vision_enabled
+
+    async def run(self, ctx: ToolContext, args: dict[str, Any]) -> ToolResult:
+        source = str(args.get("source", "")).strip()
+        if not source:
+            return ToolResult.failure(
+                "没给图的来路", say="（他没说要看哪张。自然地问他一句就行，别报参数名。）"
+            )
+        try:
+            ref = await asyncio.to_thread(ingest, source, ctx.settings, ctx.storage, ctx.user_id)
+        except VisionError as exc:
+            return ToolResult.failure(str(exc), say=f"（收不下这张：{exc}。照你自己的方式说一句就行。）")
+        except Exception as exc:  # noqa: BLE001 - 读盘失败不冒泡到界面
+            return ToolResult.failure(f"{type(exc).__name__}: {exc}")
+        seen = ctx.settings.vision_enabled
+        return ToolResult.success(
+            vision_note([ref], seen=seen),
+            artifacts=[ref.path],
+            meta={"images": [ref], "link": view_url(ctx.settings, ctx.user_id, ref.path)},
+        )
 
 
 def _download_bytes(url: str, timeout: float, max_bytes: int, allow_private: bool = False) -> bytes:
@@ -202,9 +252,16 @@ class Snapshot(Tool):
             except (OSError, subprocess.TimeoutExpired):
                 continue
             if done.returncode == 0 and path.is_file():
-                return ToolResult.success(
-                    f"拍好了：{path}", artifacts=[path], meta={"tool": command}
-                )
+                meta: dict[str, Any] = {"tool": command}
+                body = f"拍好了：{path}"
+                try:
+                    ref = adopt_file(path, ctx.settings)
+                except VisionError:
+                    ref = None
+                if ref is not None:
+                    meta["images"] = [ref]
+                    body += "\n" + vision_note([ref], seen=ctx.settings.vision_enabled)
+                return ToolResult.success(body, artifacts=[path], meta=meta)
         return ToolResult.failure(
             "屏幕抓取命令都没成功", say="（这会儿我拍不到屏幕，可能是没有显示环境。）"
         )

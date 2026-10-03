@@ -23,7 +23,7 @@ from typing import Any, Final
 from core.storage_manager import atomic_write
 from core.tools.base import Tool, ToolContext, ToolResult
 from core.tools.git import GitSync
-from core.tools.media import ImageGen, Snapshot
+from core.tools.media import ImageGen, SeeImage, Snapshot
 from core.tools.protocol import Directive
 from core.tools.soul import Reflect
 from core.tools.web import WebBrowse, WebSearch
@@ -34,6 +34,7 @@ DEFAULT_TOOLS: Final[tuple[type[Tool], ...]] = (
     WebBrowse,
     WebSearch,
     ImageGen,
+    SeeImage,
     Snapshot,
     GitSync,
     Reflect,
@@ -50,6 +51,11 @@ ALIASES: Final[dict[str, str]] = {
     "generate_image": "image_gen",
     "paint": "image_gen",
     "image": "image_gen",
+    "see": "see_image",
+    "look": "see_image",
+    "view_image": "see_image",
+    "photo": "see_image",
+    "看图": "see_image",
     "screenshot": "snapshot",
     "screen": "snapshot",
     "capture": "snapshot",
