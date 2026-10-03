@@ -241,6 +241,11 @@ class Settings(BaseSettings):
     def effective_extractor_model(self) -> str:
         return self.extractor_model or self.model
 
+    @property
+    def effective_vision_model(self) -> str:
+        """带图的那一趟实际用的模型名：没单独配就跟主模型走。"""
+        return self.vision_model or self.model
+
     def extractor_credentials(self) -> tuple[str, str]:
         """返回 (api_key, base_url)，未单独配置时回落到主模型。"""
         return (

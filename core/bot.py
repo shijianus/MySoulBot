@@ -658,6 +658,23 @@ class MySoulBot:
         # 整组进出：绝不留下没有下单头的 tool 消息，那会让严格网关直接 400
         return (groups + [group])[-TOOL_TRAIL_ROUNDS:]
 
+    def _model_for(self, messages: list[Message]) -> str:
+        """带图分段的那一趟走 VISION_MODEL，其余走 MODEL。
+
+        判据是「请求体里真的有 image 分段」，不是「他这轮贴了图」：工具拍来、
+        画来的图同样得交给看得见东西的那个模型。网关只有对话模型时留空即可，
+        接口拒绝图像分段的退回路径由 `_should_degrade_vision` 负责。
+        """
+        if not self._settings.vision_model:
+            return self._settings.model
+        for message in messages:
+            content = message.get("content")
+            if isinstance(content, list) and any(
+                isinstance(part, dict) and part.get("type") == "image_url" for part in content
+            ):
+                return self._settings.effective_vision_model
+        return self._settings.model
+
     async def _call_stream(
         self,
         messages: list[Message],
@@ -667,7 +684,7 @@ class MySoulBot:
         sink: dict[str, Any] | None = None,
     ) -> AsyncIterator[str]:
         kwargs: dict[str, Any] = {
-            "model": self._settings.model,
+            "model": self._model_for(messages),
             "messages": messages,
             "temperature": float(params["temperature"]),
             "top_p": float(params["top_p"]),

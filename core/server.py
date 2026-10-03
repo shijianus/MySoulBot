@@ -475,6 +475,7 @@ class SoulServer:
             "rapport_enabled": self._settings.rapport_enabled,
             "extractor_enabled": self._settings.extractor_enabled,
             "vision_enabled": self._settings.vision_enabled,
+            "vision_model": self._settings.effective_vision_model,
             "panel_enabled": self._settings.panel_enabled,
             "requests": self.requests,
             "active_turns": self.active,
