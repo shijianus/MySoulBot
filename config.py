@@ -71,6 +71,9 @@ class Settings(BaseSettings):
     immersive: bool = Field(default=True, description="主气泡只输出角色表达，不挂调试前缀")
     chat_mode: str = Field(default="solo", description="solo=1V1；group=群聊（锁死一切参数与状态指令）")
     diagnostics: bool = Field(default=False, description="显示错误细节与运维提示（由 /panel debug 开关）")
+    trim_stock_closers: bool = Field(
+        default=True, description="切掉角色在句尾挂的套话反问（「你想聊什么」「还有什么我能帮」）"
+    )
 
     # ---------------- 工具层 ----------------
     tools_enabled: bool = True

@@ -579,6 +579,53 @@ async def tool_checks(check: Checker, settings: Any, site: str, chat_base: str, 
     check.ok("裸值映射到主参数", tool is not None and tool.from_bare("一只猫")["prompt"] == "一只猫")  # type: ignore[union-attr]
     check.ok("parse_directive 拒绝普通台词", parse_directive("（笑了笑）你说得对") is None)
 
+    # ---------------- 句尾套话反问：轻量截断，但不误伤真问句 ----------------
+    from core.tools.protocol import trim_stock_closer
+
+    for src, want in (
+        ("（点头）了解，我会少催你。你想聊别的话题吗？", "（点头）了解，我会少催你。"),
+        ("今晚的报错我看了。需要我继续吗", "今晚的报错我看了。"),
+        ("（笑了笑）你今天话很少。还有什么想说的吗？", "（笑了笑）你今天话很少。"),
+        ("写完了。随时找我。", "写完了。"),
+        ("先别急着给建议。你觉得呢？", "先别急着给建议。"),
+        ("我明白，专注在作息的调整上。你觉得这样好吗？", "我明白，专注在作息的调整上。"),
+        ("改作息不容易。你怎么看？", "改作息不容易。"),
+    ):
+        check.ok(f"切掉套话尾句：{want[:12]}", trim_stock_closer(src) == want, repr(trim_stock_closer(src)))
+    for keep in (
+        "明天几点？",
+        "那篇讲深海发电的成本，你怎么看？",
+        "（把灯拧暗）我在。",
+        "你想聊什么都行。",
+        "这个方案我看了，你觉得哪里需要改？",
+        "我把账算完了。你看第二行那个数对不对？",
+    ):
+        check.ok(f"真实内容不误伤：{keep[:10]}", trim_stock_closer(keep) == keep, repr(trim_stock_closer(keep)))
+    check.ok("只有一句时不切（宁可留着）", trim_stock_closer("你想聊什么？") == "你想聊什么？")
+    check.ok("空输入原样退回", trim_stock_closer("") == "")
+
+    live = StreamGuard()
+    shown_live, _ = live.feed("嗯。我少催你。\n你想聊别的话题吗？")
+    tail_live, _ = live.flush()
+    check.ok("流末尾的套话在 flush 处被切", "你想聊别的话题" not in shown_live + tail_live, repr(shown_live + tail_live))
+    check.ok("正文部分照常显示", "我少催你" in shown_live + tail_live, repr(shown_live + tail_live))
+    check.ok("被切的句子进了 swallowed", any("别的话题" in item for item in live.swallowed), str(live.swallowed[-2:]))
+    off = StreamGuard(trim_closers=False)
+    shown_off, _ = off.feed("嗯。我少催你。\n你想聊别的话题吗？")
+    tail_off, _ = off.flush()
+    check.ok("TRIM_STOCK_CLOSERS=false 时照原样给", "你想聊别的话题吗" in shown_off + tail_off, repr(shown_off + tail_off))
+    held = StreamGuard()
+    shown_held, _ = held.feed("今晚的")
+    check.ok("行首不像套话就逐字放行", shown_held == "今晚的", repr(shown_held))
+    normal = StreamGuard()
+    shown_norm, _ = normal.feed("（点头）好的。")
+    tail_norm, _ = normal.flush()
+    check.ok("普通收尾不被误伤", shown_norm + tail_norm == "（点头）好的。", repr(shown_norm + tail_norm))
+    only = StreamGuard()
+    shown_only, _ = only.feed("你想聊什么？\n")
+    tail_only, _ = only.flush()
+    check.ok("整行只有套话时不进气泡", "你想聊什么" not in shown_only + tail_only, repr(shown_only + tail_only))
+
     # ---------------- 引擎：原生 tool_calls 全程静默 ----------------
     from core.bot import MySoulBot
     from core.memory_extractor import MemoryExtractor

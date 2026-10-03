@@ -304,7 +304,7 @@ class MySoulBot:
         registry = self.registry(user_id)
         mode = self._tool_mode(session, registry)
         params = session.merged_params(self._settings)
-        guard = StreamGuard()
+        guard = StreamGuard(trim_closers=self._settings.trim_stock_closers)
         visible: list[str] = []
         groups: list[list[Message]] = []  # 每组=一次「下单+结果」，永不拆开，避免留下无主的 tool 消息
         rounds = 0

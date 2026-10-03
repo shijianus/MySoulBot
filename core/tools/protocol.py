@@ -118,6 +118,60 @@ def _opens_span(text: str) -> bool:
     return text.count(MARK_OPEN) > text.count(MARK_CLOSE)
 
 
+# 模型（尤其 gpt-oss 系）爱在结尾挂一句无信息量反问。prompt 层的禁令管不住所有时候，
+# 这里在流的**最后一段**补一道轻量截断。判定刻意保守：尾句必须同时满足
+# ①剥掉动作括号后不超过 16 字；②每个字都落在「客套字表」内；③含至少一个套话词干。
+# 带真实信息的问句照旧放行（「明天几点？」的 明/天/几 不在字表里），
+# 整条只有一句话时绝不切——宁可留着一句问话，也不能把角色的话切没了。
+_CLOSER_CHARS: Final[frozenset[str]] = frozenset(
+    "你我他她它们还有一没什么都想聊说话题问做别的其他需要帮忙继续吗呢吧点儿可以能就这那啊呀噢好"
+    "随时找喊叫在起个事了的觉得意不出过太会希望给接下去听陪伴静默首怎样儿么看怎"
+    "？?。！!…，、；;：:（）() \t"
+)
+_CLOSER_STEMS: Final[tuple[str, ...]] = (
+    "什么", "想聊", "想说", "想问", "想做", "需要", "帮", "继续", "觉得", "怎么看",
+    "怎么说", "别的", "其他", "随时", "都在", "在这儿", "在这里", "希望帮",
+)
+_LEAD_ACTION: Final[re.Pattern[str]] = re.compile(r"^\s*[（(][^）)]*[）)]\s*")
+_SENTENCE_END: Final[re.Pattern[str]] = re.compile(r"(?<=[。！？!?…])")
+_MAX_CLOSER_CHARS: Final[int] = 16
+# 尾句观望用的开头：命中就先不放行，等流结束再决定切不切。
+# 只影响「最后一行」的显示时机（流一结束就放出），打字机手感不受影响。
+_CLOSER_HEADS: Final[tuple[str, ...]] = (
+    "你", "您", "还有", "还", "需要", "觉得", "随时", "我", "希望", "那么", "另外", "想",
+)
+
+
+def _could_be_closer(fragment: str) -> bool:
+    head = fragment.lstrip()
+    if not head:
+        return False
+    return any(head.startswith(stem) or stem.startswith(head) for stem in _CLOSER_HEADS)
+
+
+def _is_stock_closer(sentence: str) -> bool:
+    tail = _LEAD_ACTION.sub("", sentence).strip().strip("「」\"'“”")
+    if not tail or len(tail) > _MAX_CLOSER_CHARS:
+        return False
+    if not all(ch in _CLOSER_CHARS for ch in tail):
+        return False
+    return any(stem in tail for stem in _CLOSER_STEMS)
+
+
+def trim_stock_closer(text: str) -> str:
+    """切掉结尾那句套话反问；切完什么都不剩就原样退回。"""
+    body = text.rstrip()
+    if not body:
+        return text
+    parts = [piece for piece in _SENTENCE_END.split(body) if piece]
+    if len(parts) < 2:
+        return text
+    if not _is_stock_closer(parts[-1]):
+        return text
+    kept = "".join(parts[:-1]).rstrip()
+    return kept if kept.strip() else text
+
+
 def strip_markers(text: str, swallowed: list[str] | None = None) -> str:
     """剥掉 `⟦…⟧`；没有闭合标记的尾巴直接截断——标记本身绝不外泄。"""
     if MARK_OPEN not in text:
@@ -141,10 +195,11 @@ def strip_markers(text: str, swallowed: list[str] | None = None) -> str:
 class StreamGuard:
     """把增量文本切成「可显示」与「下单」两路。"""
 
-    def __init__(self, *, hold: bool = True) -> None:
+    def __init__(self, *, hold: bool = True, trim_closers: bool = True) -> None:
         self._pending = ""
         self._line_start = True
         self._hold = hold
+        self._trim = trim_closers
         self._dropping = False  # 本行已判定为机器声，到换行之前继续丢
         self._in_span = False  # ⟦ 开了没关，跨行残骸继续吞
         self.swallowed: list[str] = []
@@ -199,7 +254,9 @@ class StreamGuard:
                 out.append(head.rstrip())
             return "".join(out), directives
 
-        waiting = bool(buffer) and self._line_start and self._hold and _could_be_mechanical(buffer)
+        waiting = bool(buffer) and self._line_start and self._hold and (
+            _could_be_mechanical(buffer) or (self._trim and _could_be_closer(buffer))
+        )
         if waiting and len(buffer) < HOLD_MAX:
             self._pending = buffer  # 行首可疑，再等一个字
             return "".join(out), directives
@@ -219,7 +276,7 @@ class StreamGuard:
         return "".join(out), directives
 
     def flush(self) -> tuple[str, list[Directive]]:
-        """流结束：结算最后一段（可能没有换行）。"""
+        """流结束：结算最后一段（可能没有换行），并顺手切掉结尾的套话反问。"""
         if self._dropping or self._in_span:
             self._pending = ""
             return "", []
@@ -227,8 +284,15 @@ class StreamGuard:
         if not buffer:
             return "", []
         if self._line_start or MARK_OPEN in buffer:
-            return self._finish_line(buffer)
-        return strip_markers(buffer, self.swallowed), []
+            shown, directives = self._finish_line(buffer)
+        else:
+            shown, directives = strip_markers(buffer, self.swallowed), []
+        if self._trim:
+            trimmed = trim_stock_closer(shown)
+            if trimmed != shown:
+                self.swallowed.append(shown[len(trimmed):].strip())
+            shown = trimmed
+        return shown, directives
 
     # ------------------------------------------------------------ 行处理
     def _finish_line(self, line: str) -> tuple[str, list[Directive]]:
@@ -241,6 +305,10 @@ class StreamGuard:
             self.swallowed.extend(item.line for item in mixed)
             return strip_markers(line, []), mixed
         if is_mechanical_line(line):
+            self.swallowed.append(line.strip())
+            return "", []
+        if self._trim and _is_stock_closer(line):
+            # 整行就是一句套话反问：没有别的 content 可保留，直接不收进气泡
             self.swallowed.append(line.strip())
             return "", []
         shown = strip_markers(line, self.swallowed)
