@@ -205,6 +205,7 @@ class PromptBuilder:
         images: Sequence[ImageRef] = (),
         vision_on: bool = True,
         media_extra: str = "",
+        group_mode: bool | None = None,
     ) -> tuple[list[Message], PromptLayers]:
         """返回可直接送入 Chat Completions 的完整消息列表，以及本次的分层明细。
 
@@ -215,6 +216,7 @@ class PromptBuilder:
             user_id, history, today=today, tool_mode=tool_mode, tools=tools,
             speakers=speakers, presence=presence, rapport=rapport,
             images=images, vision_on=vision_on, media_extra=media_extra,
+            group_mode=group_mode,
         )
         messages: list[Message] = [{"role": "system", "content": system_prompt}]
         messages.extend(self._normalize_history(history or []))
@@ -247,8 +249,14 @@ class PromptBuilder:
         images: Sequence[ImageRef] = (),
         vision_on: bool = True,
         media_extra: str = "",
+        group_mode: bool | None = None,
     ) -> tuple[str, PromptLayers]:
-        """组装 system prompt，同时返回分层明细。"""
+        """组装 system prompt，同时返回分层明细。
+
+        `group_mode` 是**回合级**的场景锁：QQ 群聊与终端群聊共用同一套引擎实例，
+        但一个是全局配置、一个是这一句话恰好在群里。留空才跟随 CHAT_MODE。
+        """
+        group = self._settings.group_mode if group_mode is None else bool(group_mode)
         day = today or dt.date.today()
         soul, profile, facts, relations = await self._load(user_id)
         clawd_text = await self._clawd.read_text()
@@ -290,7 +298,7 @@ class PromptBuilder:
         body.append(self._section("memory", self._render_memory(facts, relations)))
 
         rules = [HARD_RULES, ANTI_AFFECTATION]
-        if self._settings.group_mode:
+        if group:
             rules.append(GROUP_RULES)
         if mode == "inline":
             rules.append(active.instructions())
@@ -302,6 +310,7 @@ class PromptBuilder:
                 self._render_context(
                     user_id, day, layers.recent_turns, mode, active, speakers, presence, rapport,
                     "\n".join(line for line in (vision_note(list(images), seen=vision_on), media_extra) if line),
+                    group=group,
                 ),
             )
         )
@@ -360,11 +369,12 @@ class PromptBuilder:
         presence: Any = None,
         rapport: Any = None,
         media_note: str = "",
+        group: bool = False,
     ) -> str:
         lines = [
             f"当前日期：{day.isoformat()}（新增记忆条目使用这个日期，不要臆测别的日子）",
         ]
-        if self._settings.group_mode:
+        if group:
             present = [name for name in (speakers or []) if name]
             lines.append(
                 "在场：" + ("、".join(present) if present else f"{user_id} 与其他人")

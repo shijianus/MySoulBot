@@ -90,9 +90,9 @@ class Settings(BaseSettings):
     server_host: str = Field(default="127.0.0.1", description="只绑回环：这套灵魂与记忆不该裸露在局域网里")
     server_port: int = Field(default=11555, ge=1, le=65535)
 
-    # ---------------- OneBot 接入（QQ 等聊天协议，裸机部署；本阶段只预埋，不激活任何逻辑）----------------
+    # ---------------- OneBot 接入（QQ 等聊天协议，裸机部署；本阶段已激活）----------------
     onebot_enabled: bool = Field(
-        default=False, description="总开关：false 时不额外监听任何端口，也没有任何代码读下面这几项"
+        default=False, description="总开关：false 时不额外监听任何端口，网桥一行代码都不会跑"
     )
     onebot_host: str = Field(
         default="127.0.0.1", description="只绑回环：QQ 那边的事不该被整个网段读到（与 SERVER_HOST 同一条规矩）"
@@ -101,10 +101,16 @@ class Settings(BaseSettings):
         default=11556, ge=1, le=65535, description="与酒馆端点 11555 错开：一个给自己人用，一个给协议端进来"
     )
     onebot_access_token: str = Field(
-        default="", description="协议端与本服务之间的鉴权串；留空只在本机回环下才可接受"
+        default="",
+        description="协议端与本服务之间的鉴权串；留空时不许绑非回环地址（网桥启动就拒绝）",
+    )
+    onebot_bot_name: str = Field(
+        default="",
+        description="群聊里喊她接话的名字，逗号分隔可写好几个；留空则用协议端报回的昵称",
     )
     onebot_auto_record: bool = Field(
-        default=False, description="QQ 里的每句话是否自动送进记忆抽取（默认关：先确认过再记）"
+        default=False,
+        description="私聊说完话是否顺手念出声（回一条 QQ 语音）；群聊永不出声，那是刷屏",
     )
 
     # ---------------- 工具层 ----------------

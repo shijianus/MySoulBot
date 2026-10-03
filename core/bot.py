@@ -174,20 +174,34 @@ class MySoulBot:
     def model(self) -> str:
         return self._settings.model
 
-    def registry(self, user_id: str) -> ToolRegistry:
-        """给某个用户装配可用工具。工具层失败不影响对话——空注册表就是「没有能使的劲」。"""
+    def registry(self, user_id: str, *, group_mode: bool | None = None) -> ToolRegistry:
+        """给某个用户装配可用工具。工具层失败不影响对话——空注册表就是「没有能使的劲」。
+
+        `group_mode` 是回合级场景：QQ 那一头同一秒可能既在群里又在私聊里，
+        工具的群聊锁（例如「群聊里不改写灵魂」）必须跟着这一句话的场合走，而不是跟着全局配置。
+        """
         if not self._settings.tools_enabled:
-            return ToolRegistry(self._context(user_id), [])
+            return ToolRegistry(self._context(user_id, group_mode), [])
         try:
-            return ToolRegistry(self._context(user_id))
+            return ToolRegistry(self._context(user_id, group_mode))
         except Exception as exc:  # noqa: BLE001 - 工具装配失败只是少点能力
             logger.warning("工具装配失败，本轮无工具可用: %s", exc)
-            return ToolRegistry(self._context(user_id), [])
+            return ToolRegistry(self._context(user_id, group_mode), [])
 
-    def _context(self, user_id: str) -> ToolContext:
+    def _context(self, user_id: str, group_mode: bool | None = None) -> ToolContext:
         return ToolContext(
-            settings=self._settings, storage=self._storage, user_id=user_id, clawd=self.clawd
+            settings=self._scene(group_mode), storage=self._storage, user_id=user_id, clawd=self.clawd
         )
+
+    def _scene(self, group_mode: bool | None) -> Settings:
+        """把「这一句话的场合」换成一份只在这一回合生效的配置副本。
+
+        不改全局 `chat_mode`：那会让同一进程里下一条私聊消息也带上群聊准则，
+        而 QQ 恰恰是群与私聊共用一个引擎实例的那个入口。
+        """
+        if group_mode is None or group_mode == self._settings.group_mode:
+            return self._settings
+        return self._settings.model_copy(update={"chat_mode": "group" if group_mode else "solo"})
 
     def _get_client(self) -> AsyncOpenAI:
         if self._client is None:
@@ -387,6 +401,7 @@ class MySoulBot:
         speakers: list[str] | None = None,
         now: dt.datetime | None = None,
         images: Sequence[Any] = (),  # noqa: ANN401 - core.vision.ImageRef 或图片来源字符串
+        group_mode: bool | None = None,
     ) -> AsyncIterator[str]:
         """流式产出一段角色回复。
 
@@ -394,6 +409,7 @@ class MySoulBot:
         结果只补进送给模型的消息列表。生成器结束时，日志与反思抽取已提交后台。
 
         `images` 走原生多模态通道：模型是真的在看，不是在读一段别人的转述。
+        `group_mode` 锁定这一回合的场景（群聊准则 + 工具群聊锁），留空跟随 CHAT_MODE。
         """
         session = self._sessions.get(user_id) or await self.open_session(user_id)
         if session.busy:
@@ -402,7 +418,7 @@ class MySoulBot:
 
         day = today or self._today
         session.stamp = resolve_now(now, self._settings.user_timezone)
-        registry = self.registry(user_id)
+        registry = self.registry(user_id, group_mode=group_mode)
         mode = self._tool_mode(session, registry)
         params = session.merged_params(self._settings)
         refs, problems = await self._ingest(user_id, images)
@@ -431,6 +447,7 @@ class MySoulBot:
                         images=refs,
                         vision_on=vision_on,
                         media_extra=problems,
+                        group_mode=group_mode,
                     )
                     rebuild = False
                 sink: dict[str, Any] = {"tool_calls": []}
