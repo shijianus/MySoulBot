@@ -112,6 +112,7 @@ class VoiceClip:
     """一段已经落盘的声音。"""
 
     path: Path
+    route: str
     url: str
     seconds: float
     bytes_len: int
@@ -120,7 +121,7 @@ class VoiceClip:
 
     def as_dict(self) -> dict[str, Any]:
         return {
-            "audio": self.url,
+            "audio": self.route,
             "seconds": round(self.seconds, 2),
             "provider": self.provider,
             "night": self.prosody.night,
@@ -172,12 +173,18 @@ def _edge_present() -> bool:
         return False
 
 
+def audio_route(user_id: str, path: Path) -> str:
+    """同源相对路径。界面要的是「从我这个地址取」——手机从局域网 IP 打开面板时，
+    回一个写死 127.0.0.1 的绝对地址等于让它去自己手机上找声音。"""
+    return f"/media/audio/{quote(user_id)}/{quote(path.name)}"
+
+
 def audio_url(settings: Settings, user_id: str, path: Path) -> str:
-    """播放地址。服务起着才点得开，措辞交给界面，不在这里承诺。"""
+    """绝对地址：说给角色听，她可以原样念给他。"""
     host = settings.server_host or "127.0.0.1"
     if host in {"0.0.0.0", "::"}:
         host = "127.0.0.1"
-    return f"http://{host}:{settings.server_port}/media/audio/{quote(user_id)}/{quote(path.name)}"
+    return f"http://{host}:{settings.server_port}{audio_route(user_id, path)}"
 
 
 def _stamp_name(user_id: str, suffix: str) -> str:
@@ -229,6 +236,7 @@ async def synthesize(
         raise VoiceError("念出来是空的")
     return VoiceClip(
         path=path,
+        route=audio_route(user_id, path),
         url=audio_url(settings, user_id, path),
         seconds=seconds,
         bytes_len=size,

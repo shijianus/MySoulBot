@@ -6,14 +6,17 @@
 路由：
 - `POST /v1/chat/completions` —— 流式（SSE）与非流式都支持，酒馆 Chat Completion 直接可用
 - `POST /v1/completions`      —— 老式 Text Completion 模式
+- `POST /voice/say`           —— 把说出口的话念成一段音频（Web 伴侣端的播放条；纯渲染）
 - `GET  /v1/models`           —— 酒馆探活要看的模型列表
-- `GET  /healthz`             —— 引擎状态（模型、存储目录、是否挂工具）
+- `GET  /healthz`             —— 引擎状态（模型、存储目录、是否挂工具、语音走哪条路）
 - `GET  /panel`               —— 沉浸 Web 面板（纯静态 HTML/CSS/JS，无打包）
 - `GET  /api/state|/api/timeline|/api/docs/<档>` —— 面板的只读数据
 - `GET  /media/<用户>/<文件>` —— 工具产物（生成的图、拍下的屏）的静态查看链接
+- `GET  /media/audio/<用户>/<文件>` —— 念出来的声音
 
 **面板只读**：`/api/*` 与 `/panel*` 只接 GET，其余一律 405。熟络度没有写入口——
-温度只能由引擎在真实回合里攒，网页上一个 PATCH 按钮都不长。
+温度只能由引擎在真实回合里攒，网页上一个 PATCH 按钮都不长。`/voice/say` 能收 POST，
+是因为它只出声不记事：不建会话、不进上下文、不碰 `state.json`。
 
 **多端同一套灵魂与记忆**：服务与 CLI 用同一个 `storage/`，同一个用户目录下的
 SOUL / USER / MEMORY / RELATIONS / state.json 完全共享。酒馆那边发的 messages 里的历史
@@ -46,6 +49,7 @@ from core.clawd_soul import ClawdSoul
 from core.memory_extractor import MemoryExtractor
 from core.prompt_builder import PromptBuilder
 from core.storage_manager import PathSafetyError, StorageManager
+from core.tools.voice import VoiceError, audio_sniff, provider_of, synthesize
 from core.vision import sniff
 
 logger: Final = logging.getLogger("mysoulbot.server")
@@ -71,6 +75,15 @@ _MEDIA_MEDIA: Final[dict[str, str]] = {
     ".webp": "image/webp",
     ".txt": "text/plain; charset=utf-8",
 }
+# 音频单独一档：`vision.sniff` 见 RIFF 就认 WEBP，拿它验 .wav 会被伪装的图骗过去
+_AUDIO_MEDIA: Final[dict[str, str]] = {
+    ".wav": "audio/wav",
+    ".mp3": "audio/mpeg",
+    ".ogg": "audio/ogg",
+    ".aif": "audio/aiff",
+    ".aiff": "audio/aiff",
+}
+_VOICE_MAX_CONCURRENT: Final[int] = 2
 _READ_ONLY_PREFIXES: Final[tuple[str, ...]] = ("/api", "/panel", "/media")
 _PANEL_FILES: Final[frozenset[str]] = frozenset({"index.html", "app.css", "app.js"})
 
@@ -102,6 +115,7 @@ class SoulServer:
         self._assets: dict[str, tuple[bytes, str]] = {}
         self.requests = 0
         self.active = 0  # 正在出话的回合数：停机前要等它归零
+        self._voice_running = 0  # 同时在念的句数：合成是 CPU 活，不能由着界面敞开灌
 
     @property
     def settings(self) -> Settings:
@@ -204,6 +218,9 @@ class SoulServer:
         if path.rstrip("/") == "/v1/completions":
             await self._completion(writer, payload, query, headers)
             return
+        if path.rstrip("/") == "/voice/say":
+            await self._say(writer, payload, query, headers)
+            return
         raise HttpError(404, f"没有这个路径：{path}")
 
     # ------------------------------------------------------------ 面板与产物
@@ -237,6 +254,9 @@ class SoulServer:
                 raise HttpError(404, f"面板没有这一份：{doc}")
             view = await panel.build_doc(self.storage, self._user_for_panel(query), doc)
             await self._send_json(writer, view)
+            return True
+        if clean.startswith("/media/audio/"):
+            await self._send_audio(writer, clean[len("/media/audio/") :])
             return True
         if clean.startswith("/media/"):
             await self._send_media(writer, clean[len("/media/") :])
@@ -282,25 +302,42 @@ class SoulServer:
         )
 
     async def _send_media(self, writer: asyncio.StreamWriter, rest: str) -> None:
-        """工具产物的静态查看链接。只准读本用户 artifacts/ 目录里的那一个文件。"""
+        """工具产物（画来的、拍来的）的静态查看链接。"""
+        await self._send_artifact(writer, rest, audio=False)
+
+    async def _send_audio(self, writer: asyncio.StreamWriter, rest: str) -> None:
+        """念出来的声音。片段短（默认上限 24 秒），整份发出去就够，不谎称支持 Range。"""
+        await self._send_artifact(writer, rest, audio=True)
+
+    async def _send_artifact(
+        self, writer: asyncio.StreamWriter, rest: str, *, audio: bool
+    ) -> None:
+        """只准读本用户产物目录里的那一个文件：后缀要在清单里，内容还要与后缀对得上。"""
         user_id, _, name = rest.partition("/")
         name = unquote(name)
         try:
-            directory = self.storage.user_dir(user_id) / "artifacts"
+            directory = (
+                self.storage.audio_dir(user_id)
+                if audio
+                else self.storage.user_dir(user_id) / "artifacts"
+            )
         except PathSafetyError as exc:
             raise HttpError(400, str(exc)) from exc
         if not name or "/" in name or "\\" in name or name.startswith("."):
-            raise HttpError(400, "只能取 artifacts 目录里的单个文件")
+            raise HttpError(400, "只能取产物目录里的单个文件")
+        allow = _AUDIO_MEDIA if audio else _MEDIA_MEDIA
         suffix = Path(name).suffix.lower()
-        if suffix not in _MEDIA_MEDIA:
+        if suffix not in allow:
             raise HttpError(415, f"这东西不在可查看的清单里：{suffix or '没有后缀'}")
         path = (directory / name).resolve()
         if path.parent != directory.resolve() or not path.is_file():
             raise HttpError(404, "没有这个产物")
         data = await asyncio.to_thread(path.read_bytes)
-        media = _MEDIA_MEDIA[suffix]
+        media = allow[suffix]
         if media.startswith("image/") and not sniff(data):
             raise HttpError(415, "这文件的后缀和内容不一致")
+        if media.startswith("audio/") and not audio_sniff(data):
+            raise HttpError(415, "这东西不是能播的声音")
         await _write(
             writer,
             200,
@@ -402,6 +439,41 @@ class SoulServer:
             writer, 200, body, extra={"Content-Type": "application/json", **_CORS_HEADERS}
         )
 
+    async def _say(
+        self,
+        writer: asyncio.StreamWriter,
+        payload: dict[str, Any],
+        query: dict[str, list[str]],
+        headers: Mapping[str, str],
+    ) -> None:
+        """把说出口的话念成一段能播的声音。
+
+        这是纯渲染的一条路：不建会话、不进上下文、一个字都不碰 state.json——
+        温度只能由相处攒出来，「让她出声」不该有任何改写关系动态的副作用。
+        失败收敛成 `{ok:false}`：界面上什么都不挂，而不是冒一个点得响的红叉。
+        """
+        user_id = self._user_of(payload, query, headers)
+        if not self._settings.tts_enabled or provider_of(self._settings) == "none":
+            await self._send_json(writer, {"ok": False, "reason": "这条路没接声音"})
+            return
+        text = str(payload.get("text") or "")
+        if not text.strip():
+            raise HttpError(400, "没有要说出口的话")
+        if self._voice_running >= _VOICE_MAX_CONCURRENT:
+            await self._send_json(writer, {"ok": False, "reason": "正念着上一句，稍等一下"})
+            return
+        self._voice_running += 1
+        try:
+            clip = await synthesize(text, self._settings, self.storage, user_id)
+        except VoiceError as exc:
+            await self._send_json(writer, {"ok": False, "reason": str(exc)})
+            return
+        except PathSafetyError as exc:
+            raise HttpError(400, str(exc)) from exc
+        finally:
+            self._voice_running -= 1
+        await self._send_json(writer, {"ok": True, **clip.as_dict()})
+
     async def _generate(
         self, user_id: str, text: str, images: list[str] | None = None
     ) -> AsyncIterator[str]:
@@ -476,6 +548,8 @@ class SoulServer:
             "extractor_enabled": self._settings.extractor_enabled,
             "vision_enabled": self._settings.vision_enabled,
             "vision_model": self._settings.effective_vision_model,
+            "tts_enabled": self._settings.tts_enabled,
+            "tts_provider": provider_of(self._settings),
             "panel_enabled": self._settings.panel_enabled,
             "requests": self.requests,
             "active_turns": self.active,
