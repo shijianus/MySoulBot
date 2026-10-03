@@ -108,9 +108,10 @@ class SoulServer:
         return self._settings
 
     # ------------------------------------------------------------ 生命周期
-    async def start(self, host: str = "", port: int = 0) -> tuple[str, int]:
+    async def start(self, host: str = "", port: int | None = None) -> tuple[str, int]:
         host = host or self._settings.server_host
-        port = port or self._settings.server_port
+        # 0 是「给我随机端口」的合法意思，不能被当成「没填」而回落成配置端口
+        port = self._settings.server_port if port is None else port
         await self.clawd.ensure()
         if self.extractor.enabled:
             self.extractor.start()
@@ -664,7 +665,7 @@ def main(argv: list[str] | None = None) -> int:
         description="MySoulBot 的 OpenAI 兼容本地端点（酒馆 SillyTavern 直连 + 沉浸面板）",
     )
     parser.add_argument("--host", default="", help="默认只绑 127.0.0.1")
-    parser.add_argument("--port", type=int, default=0, help="默认取 SERVER_PORT（11555）")
+    parser.add_argument("--port", type=int, default=None, help="默认取 SERVER_PORT（11555）")
     parser.add_argument("--public", action="store_true", help="绑 0.0.0.0（会把灵魂和记忆裸露在网段里）")
     parser.add_argument("--verbose", action="store_true", help="输出引擎日志到终端")
     parser.add_argument(
