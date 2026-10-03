@@ -359,11 +359,14 @@ class SoulServer:
 
         await _stream_head(writer)
         await _sse(writer, reply_id, created, model, {"role": "assistant", "content": ""})
+        streaming = self._generate(user_id, text, shots)
         try:
-            async for piece in self._generate(user_id, text, shots):
+            async for piece in streaming:
                 await _sse(writer, reply_id, created, model, {"content": piece})
-        except HttpError:
-            raise
+        finally:
+            # 浏览器切后台、手机锁屏都会把写入打断在这一句上：不显式关掉生成器，
+            # 这一用户的回合锁与 busy 标记要一直占到垃圾回收，之后再也发不出话。
+            await streaming.aclose()
         await _sse(writer, reply_id, created, model, {}, finish="stop")
         await _write_raw(writer, b"data: [DONE]\n\n")
         writer.close()
