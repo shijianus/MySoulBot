@@ -438,7 +438,8 @@ async def tool_checks(check: Checker, settings: Any, site: str, chat_base: str, 
     await storage.ensure_user(ctx.user_id)
     registry = ToolRegistry(ctx)
 
-    check.ok("默认挂载六个工具", len(registry) == 6, str(registry.names))
+    check.ok("默认挂载七个工具", len(registry) == 7, str(registry.names))
+    check.ok("看图能力也在清单里", "see_image" in registry.names, str(registry.names))
     check.ok("工具清单是人话", "能看网页" in registry.summary() or "能查资料" in registry.summary(), registry.summary())
     check.ok("原生声明结构正确", registry.native_specs()[0]["function"]["name"] == "web_browse")
     check.ok("行内协议含暗号与不可见约定", "⟦tool:" in registry.instructions() and "对方看不见" in registry.instructions())

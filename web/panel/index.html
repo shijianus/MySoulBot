@@ -1,0 +1,86 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>此刻</title>
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+<main id="stage" aria-live="polite">
+  <header class="top">
+    <div class="who">
+      <h1 id="name">…</h1>
+      <p id="title" class="sub"></p>
+    </div>
+    <div class="clock">
+      <span id="clock" class="time"></span>
+      <span id="slot" class="slot"></span>
+    </div>
+  </header>
+
+  <section class="card heat">
+    <div class="card-head">
+      <span class="label">我们之间</span>
+      <span class="lock" title="温度只能由相处攒出来">只读 · 不可调节</span>
+    </div>
+    <div class="heat-main">
+      <strong id="stage-label">—</strong>
+      <span id="score" class="score"></span>
+    </div>
+    <div class="bar" aria-hidden="true"><i id="heat-fill"></i></div>
+    <p id="conduct" class="conduct"></p>
+    <p id="evidence" class="evidence"></p>
+  </section>
+
+  <section class="card body-state">
+    <div class="card-head"><span class="label">她的此刻</span></div>
+    <div class="gauges">
+      <div class="gauge">
+        <span class="g-label">心情</span>
+        <strong id="mood">—</strong>
+        <span id="mood-left" class="g-note"></span>
+      </div>
+      <div class="gauge">
+        <span class="g-label">精力</span>
+        <strong id="energy">—</strong>
+        <span id="energy-note" class="g-note"></span>
+      </div>
+      <div class="gauge">
+        <span class="g-label">在一起</span>
+        <strong id="together">—</strong>
+        <span id="together-note" class="g-note"></span>
+      </div>
+    </div>
+    <p id="body" class="body-line"></p>
+    <p id="gap" class="gap-line"></p>
+  </section>
+
+  <nav class="tabs" role="tablist">
+    <button class="tab on" data-view="machine" role="tab">记忆时光机</button>
+    <button class="tab" data-view="docs" role="tab">她写的原话</button>
+  </nav>
+
+  <section id="view-machine" class="view on">
+    <div class="strip" id="activity" aria-hidden="true"></div>
+    <div class="track">
+      <h2 class="track-title">他交代过的事</h2>
+      <ul id="facts" class="list"></ul>
+      <h2 class="track-title">怎么跟他相处</h2>
+      <ul id="dynamics" class="list"></ul>
+      <p id="archive-note" class="note"></p>
+    </div>
+  </section>
+
+  <section id="view-docs" class="view">
+    <div class="doc-pick" id="doc-tabs"></div>
+    <pre id="doc-body" class="doc"></pre>
+  </section>
+
+  <p id="quiet" class="quiet"></p>
+  <noscript><p class="quiet">这页需要一点 JavaScript 才能读到实时状态。</p></noscript>
+</main>
+<script src="app.js"></script>
+</body>
+</html>

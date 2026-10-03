@@ -1,6 +1,6 @@
 """OpenAI 兼容的本地服务：让酒馆（SillyTavern）直连本机 MySoulBot。
 
-为什么手搓 HTTP：本环境没有 aiohttp/fastapi，而这一层只需要三个路由。
+为什么手搓 HTTP：本环境没有 aiohttp/fastapi，而这一层只需要几个路由。
 标准库 `asyncio.start_server` 就够，且 clone 即用、零新依赖。
 
 路由：
@@ -8,6 +8,12 @@
 - `POST /v1/completions`      —— 老式 Text Completion 模式
 - `GET  /v1/models`           —— 酒馆探活要看的模型列表
 - `GET  /healthz`             —— 引擎状态（模型、存储目录、是否挂工具）
+- `GET  /panel`               —— 沉浸 Web 面板（纯静态 HTML/CSS/JS，无打包）
+- `GET  /api/state|/api/timeline|/api/docs/<档>` —— 面板的只读数据
+- `GET  /media/<用户>/<文件>` —— 工具产物（生成的图、拍下的屏）的静态查看链接
+
+**面板只读**：`/api/*` 与 `/panel*` 只接 GET，其余一律 405。熟络度没有写入口——
+温度只能由引擎在真实回合里攒，网页上一个 PATCH 按钮都不长。
 
 **多端同一套灵魂与记忆**：服务与 CLI 用同一个 `storage/`，同一个用户目录下的
 SOUL / USER / MEMORY / RELATIONS / state.json 完全共享。酒馆那边发的 messages 里的历史
@@ -28,26 +34,45 @@ import json
 import logging
 import time
 from collections.abc import AsyncIterator, Mapping
+from pathlib import Path
 from typing import Any, Final
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 from config import Settings
+from core import panel
 from core.bot import BotError, MySoulBot
 from core.card_loader import PersonaLibrary
 from core.clawd_soul import ClawdSoul
 from core.memory_extractor import MemoryExtractor
 from core.prompt_builder import PromptBuilder
 from core.storage_manager import PathSafetyError, StorageManager
+from core.vision import sniff
 
 logger: Final = logging.getLogger("mysoulbot.server")
 
-_MAX_BODY_BYTES: Final[int] = 4_000_000
+_MAX_BODY_BYTES: Final[int] = 12_000_000
 _STREAM_MEDIA: Final[str] = "text/event-stream"
 _CORS_HEADERS: Final[dict[str, str]] = {
     "Access-Control-Allow-Origin": "*",
     "Access-Control-Allow-Headers": "content-type,authorization,x-mysoulbot-user",
     "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
 }
+_PANEL_DIR: Final[Path] = Path(__file__).resolve().parents[1] / "web" / "panel"
+_ASSET_MEDIA: Final[dict[str, str]] = {
+    ".html": "text/html; charset=utf-8",
+    ".css": "text/css; charset=utf-8",
+    ".js": "text/javascript; charset=utf-8",
+}
+_MEDIA_MEDIA: Final[dict[str, str]] = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".gif": "image/gif",
+    ".webp": "image/webp",
+    ".txt": "text/plain; charset=utf-8",
+}
+_READ_ONLY_PREFIXES: Final[tuple[str, ...]] = ("/api", "/panel", "/media")
+_PANEL_FILES: Final[frozenset[str]] = frozenset({"index.html", "app.css", "app.js"})
 
 
 class HttpError(RuntimeError):
@@ -74,7 +99,9 @@ class SoulServer:
         self._opening: dict[str, asyncio.Lock] = {}
         self._server: asyncio.Server | None = None
         self._opened: set[str] = set()
+        self._assets: dict[str, tuple[bytes, str]] = {}
         self.requests = 0
+        self.active = 0  # 正在出话的回合数：停机前要等它归零
 
     @property
     def settings(self) -> Settings:
@@ -161,7 +188,13 @@ class SoulServer:
                 extra={"Content-Type": "application/json", **_CORS_HEADERS},
             )
             return
+        if method.upper() == "GET" and await self._panel_route(writer, path, query):
+            return
+        if any(path.rstrip("/").startswith(prefix) for prefix in _READ_ONLY_PREFIXES):
+            raise HttpError(405, "这一页只许看，不许改")
         if method.upper() != "POST":
+            if path.rstrip("/").startswith(("/v1", "/panel", "/api", "/media")):
+                raise HttpError(404, f"没有这个路径：{path}")
             raise HttpError(405, f"这个路径不接 {method}")
         payload = _json_of(body)
         if path.rstrip("/") == "/v1/chat/completions":
@@ -171,6 +204,108 @@ class SoulServer:
             await self._completion(writer, payload, query, headers)
             return
         raise HttpError(404, f"没有这个路径：{path}")
+
+    # ------------------------------------------------------------ 面板与产物
+    async def _panel_route(
+        self, writer: asyncio.StreamWriter, path: str, query: dict[str, list[str]]
+    ) -> bool:
+        """只读面板的全部 GET 路由；命中返回 True。"""
+        clean = path.rstrip("/")
+        if not self._settings.panel_enabled:
+            if clean.startswith("/panel") or clean.startswith("/api"):
+                raise HttpError(404, "面板没开着（PANEL_ENABLED=false）")
+            return False
+        if clean in ("/panel", ""):
+            await self._send_asset(writer, "index.html")
+            return True
+        if clean.startswith("/panel/"):
+            await self._send_asset(writer, clean[len("/panel/") :] or "index.html")
+            return True
+        if clean == "/api/state":
+            await self._send_json(writer, await self._state_of(query))
+            return True
+        if clean == "/api/timeline":
+            view = await panel.build_timeline(
+                self.storage, self._user_for_panel(query), limit=panel.TIMELINE_LIMIT
+            )
+            await self._send_json(writer, view)
+            return True
+        if clean.startswith("/api/docs/"):
+            doc = clean[len("/api/docs/") :].upper()
+            if doc not in panel.DOCS:
+                raise HttpError(404, f"面板没有这一份：{doc}")
+            view = await panel.build_doc(self.storage, self._user_for_panel(query), doc)
+            await self._send_json(writer, view)
+            return True
+        if clean.startswith("/media/"):
+            await self._send_media(writer, clean[len("/media/") :])
+            return True
+        return False
+
+    def _user_for_panel(self, query: dict[str, list[str]]) -> str:
+        candidate = (query.get("user") or [""])[0].strip()
+        if not candidate:
+            return self._settings.default_user_id
+        try:
+            self.storage.user_dir(candidate)
+        except PathSafetyError as exc:
+            raise HttpError(400, str(exc)) from exc
+        return candidate
+
+    async def _state_of(self, query: dict[str, list[str]]) -> dict[str, Any]:
+        return await panel.build_status(self._settings, self.storage, self._user_for_panel(query))
+
+    async def _send_json(self, writer: asyncio.StreamWriter, payload: dict[str, Any]) -> None:
+        await _write(
+            writer,
+            200,
+            json.dumps(payload, ensure_ascii=False).encode(),
+            extra={"Content-Type": "application/json; charset=utf-8", **_CORS_HEADERS},
+        )
+
+    async def _send_asset(self, writer: asyncio.StreamWriter, name: str) -> None:
+        """静态资源：读一次进内存，之后不碰磁盘。只认白名单文件名。"""
+        if name not in _PANEL_FILES:
+            raise HttpError(404, "面板里没有这个文件")
+        cached = self._assets.get(name)
+        if cached is None:
+            path = _PANEL_DIR / name
+            if not path.is_file():
+                raise HttpError(404, f"面板缺文件：{name}")
+            data = await asyncio.to_thread(path.read_bytes)
+            cached = (data, _ASSET_MEDIA[Path(name).suffix])
+            self._assets[name] = cached
+        body, media = cached
+        await _write(
+            writer, 200, body, extra={"Content-Type": media, "Cache-Control": "no-cache", **_CORS_HEADERS}
+        )
+
+    async def _send_media(self, writer: asyncio.StreamWriter, rest: str) -> None:
+        """工具产物的静态查看链接。只准读本用户 artifacts/ 目录里的那一个文件。"""
+        user_id, _, name = rest.partition("/")
+        name = unquote(name)
+        try:
+            directory = self.storage.user_dir(user_id) / "artifacts"
+        except PathSafetyError as exc:
+            raise HttpError(400, str(exc)) from exc
+        if not name or "/" in name or "\\" in name or name.startswith("."):
+            raise HttpError(400, "只能取 artifacts 目录里的单个文件")
+        suffix = Path(name).suffix.lower()
+        if suffix not in _MEDIA_MEDIA:
+            raise HttpError(415, f"这东西不在可查看的清单里：{suffix or '没有后缀'}")
+        path = (directory / name).resolve()
+        if path.parent != directory.resolve() or not path.is_file():
+            raise HttpError(404, "没有这个产物")
+        data = await asyncio.to_thread(path.read_bytes)
+        media = _MEDIA_MEDIA[suffix]
+        if media.startswith("image/") and not sniff(data):
+            raise HttpError(415, "这文件的后缀和内容不一致")
+        await _write(
+            writer,
+            200,
+            data,
+            extra={"Content-Type": media, "Content-Disposition": "inline", **_CORS_HEADERS},
+        )
 
     # ------------------------------------------------------------ 路由实现
     async def _chat(
@@ -182,18 +317,20 @@ class SoulServer:
     ) -> None:
         user_id = self._user_of(payload, query, headers)
         text = _last_user_text(payload)
-        if not text:
+        shots = _last_user_images(payload)
+        if not text and not shots:
             raise HttpError(400, "消息里没有用户说的话")
         await self._ensure_session(user_id)
         # 客户端送来的采样参数一律忽略：人格的节奏不是表单能改的
-        logger.info("酒馆请求 · user=%s stream=%s 参数忽略=%s", user_id, bool(payload.get("stream")),
+        logger.info("酒馆请求 · user=%s stream=%s 图=%d 参数忽略=%s", user_id,
+                    bool(payload.get("stream")), len(shots),
                     sorted(k for k in payload if k in {"temperature", "max_tokens", "top_p", "frequency_penalty"}))
         reply_id = f"chatcmpl-soul-{int(time.time() * 1000) % 10_000_000:07d}"
         created = int(time.time())
         model = self._settings.model
 
         if not payload.get("stream"):
-            chunks = [piece async for piece in self._generate(user_id, text)]
+            chunks = [piece async for piece in self._generate(user_id, text, shots)]
             content = "".join(chunks)
             body = json.dumps(
                 {
@@ -222,7 +359,7 @@ class SoulServer:
         await _stream_head(writer)
         await _sse(writer, reply_id, created, model, {"role": "assistant", "content": ""})
         try:
-            async for piece in self._generate(user_id, text):
+            async for piece in self._generate(user_id, text, shots):
                 await _sse(writer, reply_id, created, model, {"content": piece})
         except HttpError:
             raise
@@ -261,12 +398,17 @@ class SoulServer:
             writer, 200, body, extra={"Content-Type": "application/json", **_CORS_HEADERS}
         )
 
-    async def _generate(self, user_id: str, text: str) -> AsyncIterator[str]:
+    async def _generate(
+        self, user_id: str, text: str, images: list[str] | None = None
+    ) -> AsyncIterator[str]:
         """一个用户同一时刻只跑一轮；后来的请求排队，不甩「正在生成中」。"""
         lock = self._locks.setdefault(user_id, asyncio.Lock())
         async with lock:
+            self.active += 1
             try:
-                async for piece in self.bot.stream_reply(user_id, text, today=dt.date.today()):
+                async for piece in self.bot.stream_reply(
+                    user_id, text, today=dt.date.today(), images=images or []
+                ):
                     yield piece
             except BotError as exc:
                 # 引擎的错不能变成 500 吓走酒馆：给一句能看的话
@@ -274,6 +416,8 @@ class SoulServer:
                 yield "（我这边卡了一下）" + exc.message
             except PathSafetyError as exc:
                 raise HttpError(400, str(exc)) from exc
+            finally:
+                self.active -= 1
 
     async def _ensure_session(self, user_id: str) -> None:
         if user_id in self._opened:
@@ -326,8 +470,35 @@ class SoulServer:
             "tools_enabled": self._settings.tools_enabled,
             "rapport_enabled": self._settings.rapport_enabled,
             "extractor_enabled": self._settings.extractor_enabled,
+            "vision_enabled": self._settings.vision_enabled,
+            "panel_enabled": self._settings.panel_enabled,
             "requests": self.requests,
+            "active_turns": self.active,
+            "memory_backlog": self.bot.extractor.backlog,
         }
+
+    # ------------------------------------------------------------ 停机
+    async def close_listener(self) -> None:
+        """先停止接单，让在途的回合自己说完。"""
+        if self._server is not None:
+            self._server.close()
+            with contextlib.suppress(Exception):
+                await self._server.wait_closed()
+            self._server = None
+
+    async def drain(self, timeout: float | None = None) -> dict[str, Any]:
+        """优雅退出前的一道等：先看在途回合说完，再等内存里的记忆任务落盘。
+
+        后台抽取是 fire-and-forget 的——进程被直接掐掉就会丢掉那一口「刚攒下的事实」。
+        这里等到队列空为止；超时就如实报出还欠多少，让守护层把数字留在日志里。
+        """
+        grace = timeout if timeout is not None else self._settings.drain_timeout_seconds
+        deadline = time.monotonic() + grace
+        while self.active > 0 and time.monotonic() < deadline:
+            await asyncio.sleep(0.1)
+        turns_left = self.active
+        backlog = await self.bot.flush_extractions(max(1.0, deadline - time.monotonic()))
+        return {"turns_left": turns_left, "backlog": backlog}
 
 
 # ---------------------------------------------------------------- 传输细节
@@ -376,6 +547,30 @@ def _last_user_text(payload: Mapping[str, Any]) -> str:
         if str(message.get("role")) == "user":
             return _text_of(message.get("content"))
     return ""
+
+
+def _last_user_images(payload: Mapping[str, Any]) -> list[str]:
+    """酒馆发图走的是同一条通道：取最后一条 user 消息里的图片分段。
+
+    返回的是来路（`data:image/...;base64,` 或 http 链接），落盘与格式校验
+    由 `core.vision` 统一做——服务层不自己解 base64，两处解法迟早会分叉。
+    """
+    for message in reversed(list(payload.get("messages") or [])):
+        if not isinstance(message, Mapping) or str(message.get("role")) != "user":
+            continue
+        content = message.get("content")
+        if not isinstance(content, list):
+            return []
+        found: list[str] = []
+        for part in content:
+            if not isinstance(part, Mapping) or str(part.get("type")) != "image_url":
+                continue
+            link = part.get("image_url")
+            url = str((link or {}).get("url", "") if isinstance(link, Mapping) else link or "").strip()
+            if url:
+                found.append(url)
+        return found
+    return []
 
 
 def _text_of(content: Any) -> str:  # noqa: ANN401 - OpenAI 的 content 可以是字符串或分段数组
@@ -466,12 +661,15 @@ def main(argv: list[str] | None = None) -> int:
 
     parser = argparse.ArgumentParser(
         prog="mysoulbot-server",
-        description="MySoulBot 的 OpenAI 兼容本地端点（酒馆 SillyTavern 直连）",
+        description="MySoulBot 的 OpenAI 兼容本地端点（酒馆 SillyTavern 直连 + 沉浸面板）",
     )
     parser.add_argument("--host", default="", help="默认只绑 127.0.0.1")
     parser.add_argument("--port", type=int, default=0, help="默认取 SERVER_PORT（11555）")
     parser.add_argument("--public", action="store_true", help="绑 0.0.0.0（会把灵魂和记忆裸露在网段里）")
     parser.add_argument("--verbose", action="store_true", help="输出引擎日志到终端")
+    parser.add_argument(
+        "--grace", type=float, default=0.0, help="停机时等在途记忆落盘的秒数（默认取配置）"
+    )
     args = parser.parse_args(argv)
 
     from config import get_settings
@@ -483,22 +681,50 @@ def main(argv: list[str] | None = None) -> int:
     settings.apply_logging(terminal_info=args.verbose)
     server = SoulServer(settings)
     host = args.host or settings.server_host
+    grace = args.grace or settings.drain_timeout_seconds
     try:
-        asyncio.run(_serve(server, host, args.port))
+        asyncio.run(_serve(server, host, args.port, grace))
     except KeyboardInterrupt:
         print("已停止。")
     return 0
 
 
-async def _serve(server: SoulServer, host: str, port: int) -> None:
+async def _serve(server: SoulServer, host: str, port: int, grace: float) -> None:
     bound_host, bound_port = await server.start(host, port)
     print(f"MySoulBot · OpenAI 兼容端点： http://{bound_host}:{bound_port}/v1")
+    print(f"  沉浸面板： http://{bound_host}:{bound_port}/panel")
     print(f"  模型名（酒馆里填这个）： {server.settings.model}")
     print("  酒馆 → API 连接：Chat Completion，客户端 = OpenAI，兼容 = 本地")
+    serve_task = asyncio.create_task(server.serve_forever())
+    stop = asyncio.Event()
+    _install_stop_handlers(stop)
     try:
-        await server.serve_forever()
+        await stop.wait()
     finally:
+        serve_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await serve_task
+        await server.close_listener()
+        settled = await server.drain(grace)
         await server.stop()
+        if settled["backlog"] or settled["turns_left"]:
+            logger.warning(
+                "停机时仍有欠账：在途回合 %d、未落盘记忆 %d",
+                settled["turns_left"],
+                settled["backlog"],
+            )
+        else:
+            logger.info("停机前已排空：在途回合归零，记忆全部落盘")
+
+
+def _install_stop_handlers(stop: asyncio.Event) -> None:
+    """SIGTERM/SIGINT 都走同一条收尾路径——`stop` 是 systemd 的默认信号，不能当异常处理。"""
+    import signal
+
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        with contextlib.suppress(NotImplementedError, ValueError):
+            loop.add_signal_handler(sig, stop.set)
 
 
 if __name__ == "__main__":

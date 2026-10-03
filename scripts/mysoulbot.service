@@ -1,0 +1,35 @@
+# systemd 单元模板：把本地酒馆服务挂成开机常驻。
+#
+#   sudo cp scripts/mysoulbot.service /etc/systemd/system/mysoulbot.service
+#   编辑里面的 User / WorkingDirectory / ExecStart 三行为你的真实路径
+#   sudo systemctl daemon-reload
+#   systemctl enable --now mysoulbot
+#   systemctl status mysoulbot · journalctl -u mysoulbot -f
+#
+# TimeoutStopSec 是关键：SIGTERM 之后引擎要等在途回合说完、再等后台记忆落盘，
+# 默认 90s 足够；给 systemd 更短的时间就会在排空途中被 SIGKILL，白等。
+# 服务默认只绑 127.0.0.1（config 里 SERVER_HOST），别在 unit 里加 --public。
+
+[Unit]
+Description=MySoulBot · 本地灵魂服务（酒馆端点 + 沉浸面板）
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+User=CHANGE_ME
+WorkingDirectory=/home/CHANGE_ME/MySoulBot
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/home/CHANGE_ME/MySoulBot/.venv/bin/python /home/CHANGE_ME/MySoulBot/server.py
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=3
+KillSignal=SIGTERM
+TimeoutStopSec=90
+# 这套灵魂与记忆是本机的私有物：不往外发，也不让别人读你的凭据
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+
+[Install]
+WantedBy=default.target

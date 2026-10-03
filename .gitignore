@@ -24,3 +24,5 @@ storage/data/users/*/state.json
 storage/data/users/*/backups/
 storage/data/users/*/artifacts/
 storage/logs/
+# 守护进程的运行痕迹（pidfile 与 server.out）——机器本地状态，不该进版本库
+storage/run/

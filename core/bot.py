@@ -13,7 +13,7 @@ import asyncio
 import datetime as dt
 import json
 import logging
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Final
@@ -45,6 +45,14 @@ from core.storage_manager import StorageManager, StorageError
 from core.tools.base import ToolContext
 from core.tools.protocol import Directive, StreamGuard
 from core.tools.registry import ToolRegistry
+from core.vision import (
+    ImageRef,
+    VisionError,
+    content_parts,
+    ingest,
+    note as vision_note,
+    trim,
+)
 
 logger: Final = logging.getLogger("mysoulbot.bot")
 
@@ -78,6 +86,7 @@ class Session:
     persona_name: str = ""
     gen_params: dict[str, Any] = field(default_factory=dict)
     tool_mode: str = ""  # ""=自动；接口不认原生工具时被降级成 "inline"
+    vision_mode: str = ""  # ""=自动；接口不认多模态内容时被降级成 "off"
     tool_calls: int = 0
     # 体温与温度：一次刷新，整轮复用（保证同一轮内重复组装 prompt 结果一致）
     stamp: dt.datetime = field(default_factory=lambda: dt.datetime.now().astimezone())
@@ -371,11 +380,14 @@ class MySoulBot:
         today: dt.date | None = None,
         speakers: list[str] | None = None,
         now: dt.datetime | None = None,
+        images: Sequence[Any] = (),  # noqa: ANN401 - core.vision.ImageRef 或图片来源字符串
     ) -> AsyncIterator[str]:
         """流式产出一段角色回复。
 
         界面上只会看到角色说的话：工具下单被就地剥掉，执行过程完全静默，
         结果只补进送给模型的消息列表。生成器结束时，日志与反思抽取已提交后台。
+
+        `images` 走原生多模态通道：模型是真的在看，不是在读一段别人的转述。
         """
         session = self._sessions.get(user_id) or await self.open_session(user_id)
         if session.busy:
@@ -387,7 +399,10 @@ class MySoulBot:
         registry = self.registry(user_id)
         mode = self._tool_mode(session, registry)
         params = session.merged_params(self._settings)
+        refs, problems = await self._ingest(user_id, images)
         presence, rapport = await self._pulse(session, persist=True)
+        can_see = self._can_see(session)
+        vision_on = can_see and bool(refs)
         guard = StreamGuard(trim_closers=self._settings.trim_stock_closers)
         visible: list[str] = []
         groups: list[list[Message]] = []  # 每组=一次「下单+结果」，永不拆开，避免留下无主的 tool 消息
@@ -407,6 +422,9 @@ class MySoulBot:
                         speakers=speakers,
                         presence=presence,
                         rapport=rapport,
+                        images=refs,
+                        vision_on=vision_on,
+                        media_extra=problems,
                     )
                     rebuild = False
                 sink: dict[str, Any] = {"tool_calls": []}
@@ -430,6 +448,14 @@ class MySoulBot:
                         rebuild = True
                         logger.info("接口不认原生工具调用，本轮改用行内暗号继续")
                         continue
+                    if self._should_degrade_vision(exc, vision_on, groups, visible):
+                        vision_on = False
+                        can_see = False
+                        session.vision_mode = "off"
+                        groups = []
+                        rebuild = True
+                        logger.info("接口不认多模态内容，本轮退回：只承认收到图，不假装看见")
+                        continue
                     if groups or "".join(visible).strip():
                         # 工具结果回填被拒或中途出错：已有内容照旧收尾，不甩机械错误
                         logger.info("工具往返中断，用已有内容收尾：%s", exc.message)
@@ -449,11 +475,18 @@ class MySoulBot:
                     break
                 rounds += 1
                 session.tool_calls += len(calls)
-                groups = await self._run_tools(calls, groups, registry, mode)
+                groups = await self._run_tools(calls, groups, registry, mode, can_see)
             completed = True
         finally:
             try:
-                await self._finalize(session, user_text, "".join(visible), not completed, day)
+                await self._finalize(
+                    session,
+                    user_text,
+                    "".join(visible),
+                    not completed,
+                    day,
+                    [ref.label() for ref in refs],
+                )
             finally:
                 session.busy = False
         if completed and not "".join(visible).strip():
@@ -464,8 +497,51 @@ class MySoulBot:
                     "reasoning_content 里），或该网关模型已下线。请先调高 MAX_TOKENS，"
                     "或用 tests/probe_models.py 换一个模型。若刚才有工具下单，"
                     "也可能是接口拒绝了回填——可用 /panel tools 关掉工具再试。"
+                    "带图发的话，还可能是这个模型看不了图：设 VISION_ENABLED=false 让它直说看不到。"
                 ),
             )
+
+    # ------------------------------------------------------------ 视觉
+    async def _ingest(self, user_id: str, images: Sequence[Any]) -> tuple[list[ImageRef], str]:
+        """把来路收成能递给模型的图；收不下的那些变成一句明白话，不静默吞掉。"""
+        refs: list[ImageRef] = []
+        problems: list[str] = []
+        for item in images:
+            if isinstance(item, ImageRef):
+                refs.append(item)
+                continue
+            try:
+                refs.append(
+                    await asyncio.to_thread(
+                        ingest, str(item), self._settings, self._storage, user_id
+                    )
+                )
+            except VisionError as exc:
+                problems.append(f"（他递来的东西收不下：{exc}）")
+            except Exception as exc:  # noqa: BLE001 - 读盘故障不阻断对话
+                logger.warning("%s 图像摄取失败: %s", user_id, exc)
+                problems.append(f"（他递来的东西读不出来：{type(exc).__name__}）")
+        limit = self._settings.vision_max_images
+        if len(refs) > limit:
+            problems.append(f"（一次最多看 {limit} 张，多出来的 {len(refs) - limit} 张我没接）")
+        return refs[:limit], "\n".join(problems)
+
+    def _can_see(self, session: Session) -> bool:
+        """这个会话此刻看不看得见：配置开着，且接口没退回过。
+
+        与「这一轮有没有图」分开判——工具拍来、画来的图同样要进眼睛。
+        """
+        return self._settings.vision_enabled and session.vision_mode != "off"
+
+    @staticmethod
+    def _should_degrade_vision(
+        exc: BotError, vision_on: bool, groups: list[list[Message]], visible: list[str]
+    ) -> bool:
+        """只在第一趟、还没吐出任何正文时退回：中途改视神经会让已经说出口的话和证据脱节。"""
+        if not vision_on or groups or "".join(visible).strip():
+            return False
+        cause = exc.cause
+        return isinstance(cause, APIStatusError) and cause.status_code in {400, 404, 415, 422, 501}
 
     @staticmethod
     def _should_degrade_native(
@@ -518,13 +594,23 @@ class MySoulBot:
         groups: list[list[Message]],
         registry: ToolRegistry,
         mode: str,
+        can_see: bool,
     ) -> list[list[Message]]:
         """静默执行，然后把「下单 + 结果」补成一组消息。
 
         形态必须跟着降级走：接口刚拒绝了 `tools`，就不能再给它 `tool_calls`/`role:"tool"`
         这种它不认的结构——inline 模式改用普通消息把结果带回去。
+
+        工具产出的图（看来的、拍来的、画来的）挂成一条带图片分段的 user 消息：
+        模型下单要图，就得真的拿到图，而不是拿到一句「图已生成」。
         """
         pairs = await registry.call_many((name, call_args) for _, name, call_args in calls)
+        taken, _ = trim(
+            [ref for (_, _, _), (_, result) in zip(calls, pairs, strict=True)
+             for ref in (result.meta.get("images") or [])],
+            self._settings.vision_max_images,
+        )
+        eyes = can_see
         if mode == "native":
             announced = [
                 {
@@ -542,12 +628,33 @@ class MySoulBot:
                 {"role": "tool", "tool_call_id": call["id"], "content": result.content}
                 for call, (_, result) in zip(announced, pairs, strict=True)
             ]
+            if taken and eyes:
+                group.append(
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": vision_note(taken, seen=True)},
+                            *content_parts(taken),
+                        ],
+                    }
+                )
         else:
             notes = "\n\n".join(
                 f"（内部结果，不是对方说的话）{name}：{result.content}"
                 for (_, name, _), (_, result) in zip(calls, pairs, strict=True)
             )
-            group = [{"role": "user", "content": notes}]
+            if taken and eyes:
+                group = [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": f"{notes}\n\n{vision_note(taken, seen=True)}"},
+                            *content_parts(taken),
+                        ],
+                    }
+                ]
+            else:
+                group = [{"role": "user", "content": notes}]
         # 整组进出：绝不留下没有下单头的 tool 消息，那会让严格网关直接 400
         return (groups + [group])[-TOOL_TRAIL_ROUNDS:]
 
@@ -653,8 +760,13 @@ class MySoulBot:
         reply: str,
         interrupted: bool,
         day: dt.date,
+        attachments: list[str] | None = None,
     ) -> None:
-        """把这一轮写入历史/日志，并提交后台抽取。"""
+        """把这一轮写入历史/日志，并提交后台抽取。
+
+        落盘的只有字：图片记一个名字，不把 base64 塞进日志——上下文恢复时
+        角色读到「他给看过一张 cat.png」，比重新吞 2MB 像素更像想起过这件事。
+        """
         text = reply.strip()
         if not text:
             if interrupted:
@@ -668,10 +780,13 @@ class MySoulBot:
         session.append("assistant", text + suffix, self._settings.context_max_turns)
         session.turns += 1
 
+        user_entry: dict[str, Any] = {"role": "user", "content": user_text}
+        if attachments:
+            user_entry["attachments"] = attachments
         await self._storage.append_transcript(
             session.user_id,
             [
-                {"role": "user", "content": user_text},
+                user_entry,
                 {"role": "assistant", "content": text + suffix, "interrupted": interrupted},
             ],
         )

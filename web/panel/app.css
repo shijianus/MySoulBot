@@ -1,0 +1,82 @@
+/* 一块可以盯着看的暗色界面：没有滚动条噪音，没有调试栅格。
+   全部用系统字体，零外链——手机上离线打开也该是这样。 */
+:root {
+  --ink: #e8e2d8;
+  --dim: #9b9285;
+  --faint: #6e675e;
+  --bg: #14120f;
+  --card: #1d1a16;
+  --line: #2b2721;
+  --heat: #d08a5c;
+  --cool: #6f8b8f;
+}
+* { box-sizing: border-box; }
+html { -webkit-text-size-adjust: 100%; }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--ink);
+  font: 16px/1.65 "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", system-ui, sans-serif;
+  padding: 0 0 3rem;
+}
+#stage { max-width: 34rem; margin: 0 auto; padding: 0 1.15rem; }
+.top { display: flex; align-items: flex-end; justify-content: space-between; gap: 1rem; padding: 2rem 0 1.2rem; }
+.who h1 { margin: 0; font-size: 1.55rem; font-weight: 600; letter-spacing: .02em; }
+.sub { margin: .2rem 0 0; color: var(--dim); font-size: .85rem; }
+.clock { text-align: right; color: var(--dim); font-size: .85rem; }
+.time { display: block; font-variant-numeric: tabular-nums; font-size: 1.1rem; color: var(--ink); }
+.slot { display: block; }
+.card {
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  padding: 1.05rem 1.15rem 1.15rem;
+  margin-bottom: .9rem;
+}
+.card-head { display: flex; justify-content: space-between; align-items: center; }
+.label { font-size: .78rem; letter-spacing: .18em; color: var(--faint); }
+.lock { font-size: .7rem; color: var(--faint); border: 1px solid var(--line); border-radius: 999px; padding: .15rem .55rem; }
+.heat-main { display: flex; align-items: baseline; gap: .6rem; margin: .55rem 0 .7rem; }
+.heat-main strong { font-size: 1.3rem; font-weight: 600; }
+.score { color: var(--heat); font-variant-numeric: tabular-nums; font-size: .9rem; }
+.bar { height: 3px; background: var(--line); border-radius: 3px; overflow: hidden; }
+.bar i { display: block; height: 100%; width: 0; background: linear-gradient(90deg, var(--cool), var(--heat)); transition: width .8s ease; }
+.conduct { margin: .85rem 0 0; color: var(--dim); font-size: .9rem; }
+.evidence { margin: .5rem 0 0; color: var(--faint); font-size: .8rem; }
+.gauges { display: grid; grid-template-columns: repeat(3, 1fr); gap: .7rem; margin: .8rem 0 .3rem; }
+.gauge { display: flex; flex-direction: column; gap: .1rem; }
+.g-label { font-size: .74rem; letter-spacing: .12em; color: var(--faint); }
+.gauge strong { font-size: 1.15rem; font-weight: 600; }
+.g-note { font-size: .74rem; color: var(--dim); }
+.body-line { margin: .8rem 0 0; color: var(--dim); font-size: .88rem; }
+.gap-line { margin: .4rem 0 0; color: var(--heat); font-size: .85rem; }
+.tabs { display: flex; gap: .4rem; margin: 1.4rem 0 .9rem; }
+.tab {
+  flex: 1; background: none; border: 1px solid var(--line); border-radius: 999px;
+  color: var(--dim); font: inherit; font-size: .85rem; padding: .5rem 0; cursor: pointer;
+}
+.tab.on { color: var(--ink); border-color: var(--heat); background: rgba(208, 138, 92, .07); }
+.view { display: none; }
+.view.on { display: block; }
+.strip { display: flex; align-items: flex-end; gap: 3px; height: 42px; margin-bottom: 1.2rem; }
+.strip i { flex: 1; background: var(--line); border-radius: 2px; min-height: 2px; }
+.strip i.today { background: var(--heat); }
+.strip i.recent { background: var(--cool); }
+.track-title { font-size: .78rem; letter-spacing: .16em; color: var(--faint); font-weight: 500; margin: 1.5rem 0 .6rem; }
+.list { list-style: none; margin: 0; padding: 0; }
+.list li { border-bottom: 1px solid var(--line); padding: .6rem 0; font-size: .92rem; }
+.list li:last-child { border-bottom: none; }
+.list time { display: block; font-size: .72rem; color: var(--faint); font-variant-numeric: tabular-nums; }
+.doc { white-space: pre-wrap; word-break: break-word; font-size: .88rem; color: var(--dim); background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 1rem; }
+.doc-pick { display: flex; flex-wrap: wrap; gap: .4rem; margin-bottom: .8rem; }
+.doc-pick button {
+  background: none; border: none; color: var(--faint); font: inherit; font-size: .82rem;
+  border-bottom: 1px solid transparent; cursor: pointer; padding: .1rem 0;
+}
+.doc-pick button.on { color: var(--ink); border-bottom-color: var(--heat); }
+.note { color: var(--faint); font-size: .76rem; margin: 1.2rem 0 0; text-align: center; }
+.err { color: var(--heat); }
+@media (max-width: 30rem) {
+  .gauges { grid-template-columns: 1fr 1fr; }
+  .gauge:last-child { grid-column: span 2; }
+}

@@ -15,9 +15,13 @@
 命令：
     /help            看能做什么
     /panel <子命令>   控制台（人格、参数、Prompt、记忆、工具、状态都在这里）
+    /panel web       沉浸面板地址：手机或浏览器里看她此刻与记忆时光机
     /mode <模式>      solo（1V1）/ group（群聊，锁死控制台）
     /sync remote     把灵魂与记忆推到远端仓库
     /quit            退出
+
+发一句话时带上图片路径、图片链接或 base64，她就会真的看见那张图（VISION_ENABLED）。
+常驻与优雅停机：bash scripts/daemon.sh start|stop|restart（酒馆端点与面板共用 11555）。
 """
 
 from __future__ import annotations
@@ -56,6 +60,7 @@ from core.storage_manager import (
     parse_facts,
 )
 from core.sync import run_sync
+from core.vision import find_sources
 
 logger: Final = logging.getLogger("mysoulbot.cli")
 
@@ -288,9 +293,13 @@ class App:
     # ------------------------------------------------------------ 一轮对话
     async def turn(self, text: str) -> None:
         speakers = _speakers_of(text) if self._settings.group_mode else None
+        words, shots = find_sources(text)
+        if shots:
+            # 递图这件事要点一下，但只点一行灰字——角色的气泡里不夹附件回显
+            self.ui.line(f"  递过去 {len(shots)} 样东西", style="dim")
         self.ui.begin_stream()
         stream: AsyncGenerator[str, None] = self.bot.stream_reply(
-            self.user_id, text, today=dt.date.today(), speakers=speakers
+            self.user_id, words, today=dt.date.today(), speakers=speakers, images=shots
         )
         try:
             async for delta in stream:
@@ -465,6 +474,8 @@ class App:
             "archive": self._panel_archive,
             "rapport": self._panel_rapport,
             "温度": self._panel_rapport,
+            "web": self._panel_web,
+            "面板": self._panel_web,
             "rhythm": self._panel_rhythm,
             "体温": self._panel_rhythm,
             "audit": self._panel_audit,
@@ -502,6 +513,7 @@ class App:
             ("/panel log", "这段时间后台默默记下了什么"),
             ("/panel archive", "立刻滚动归档日志、下沉超限记忆"),
             ("/panel audit", "工具调用记录"),
+            ("/panel web", "沉浸面板的地址（手机或浏览器里看，只读）"),
             ("/panel sync", "等待后台抽取排空"),
             ("/panel clear", "清空近期上下文（人格与记忆不动）"),
             ("/panel debug on|off", "显示错误细节与同步步骤"),
@@ -689,6 +701,18 @@ class App:
             self.ui.warn(f"{editor} 退出码 {code}，文件可能未保存")
         content = await self.storage.read_doc(self.user_id, doc)
         self.ui.line(f"  {doc}.md {'已更新（%d 字符）' % len(content) if content.strip() else '现在是空的，下一轮会退回模板'}")
+        return True
+
+    async def _panel_web(self) -> bool:
+        """沉浸面板的入口：只报地址，不碰状态。"""
+        host = self._settings.server_host if self._settings.server_host not in {"0.0.0.0", ""} else "127.0.0.1"
+        link = f"http://{host}:{self._settings.server_port}/panel?user={self.user_id}"
+        if not self._settings.panel_enabled:
+            self.ui.line("  面板被 PANEL_ENABLED=false 关着，起了服务也打不开")
+            return True
+        self.ui.line(f"  沉浸面板： {link}")
+        self.ui.line("  要它常驻：bash scripts/daemon.sh start（酒馆端点与面板同一个端口）", style="dim")
+        self.ui.line("  面板只许看：熟络度在上面是一根不能拖的条，温度只能由相处攒出来。", style="dim")
         return True
 
     async def _panel_rapport(self, arg: str) -> bool:

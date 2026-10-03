@@ -21,16 +21,24 @@ from __future__ import annotations
 import asyncio
 import datetime as dt
 import logging
+from collections.abc import Sequence
 from dataclasses import dataclass, field
-from typing import Any, Final
+from typing import Any, Final, TypeAlias
 
 from config import Settings
 from core.clawd_soul import ClawdSoul
 from core.storage_manager import StorageManager
+from core.vision import ImageRef, content_parts, note as vision_note
 
 logger: Final = logging.getLogger("mysoulbot.prompt")
 
-Message = dict[str, str]
+# content 可以是纯文本，也可以是多模态分段（图 + 字）。历史里只存文本，
+# 图像只在它所属的那一轮真实请求里出现——落盘的日志与上下文恢复都是字。
+ContentPart: TypeAlias = dict[str, Any]
+MessageContent: TypeAlias = "str | list[ContentPart]"
+Message: TypeAlias = dict[str, Any]
+
+NO_TEXT: Final[str] = "（他没写字，只把东西递到你眼前。）"
 
 TRIM_MARK: Final[str] = "\n……（本层内容超长，已截断）\n"
 
@@ -194,15 +202,35 @@ class PromptBuilder:
         speakers: list[str] | None = None,
         presence: Any = None,  # noqa: ANN001 - core.presence.Presence
         rapport: Any = None,  # noqa: ANN001 - core.rapport.Rapport
+        images: Sequence[ImageRef] = (),
+        vision_on: bool = True,
+        media_extra: str = "",
     ) -> tuple[list[Message], PromptLayers]:
-        """返回可直接送入 Chat Completions 的完整消息列表，以及本次的分层明细。"""
+        """返回可直接送入 Chat Completions 的完整消息列表，以及本次的分层明细。
+
+        看得了图就把图片本体挂在最后一条 user 消息里——模型是真的在看，
+        不是读一段别人的转述；看不了就一个字都不挂，让语境层那句「看不了」生效。
+        """
         system_prompt, layers = await self.build_system_prompt(
             user_id, history, today=today, tool_mode=tool_mode, tools=tools,
             speakers=speakers, presence=presence, rapport=rapport,
+            images=images, vision_on=vision_on, media_extra=media_extra,
         )
         messages: list[Message] = [{"role": "system", "content": system_prompt}]
         messages.extend(self._normalize_history(history or []))
-        messages.append({"role": "user", "content": user_text})
+        take = list(images)[: self._settings.vision_max_images] if vision_on else []
+        if take:
+            messages.append(
+                {
+                    "role": "user",
+                    "content": [
+                        *content_parts(take),
+                        {"type": "text", "text": user_text.strip() or NO_TEXT},
+                    ],
+                }
+            )
+        else:
+            messages.append({"role": "user", "content": user_text})
         return messages, layers
 
     async def build_system_prompt(
@@ -216,6 +244,9 @@ class PromptBuilder:
         speakers: list[str] | None = None,
         presence: Any = None,  # noqa: ANN001
         rapport: Any = None,  # noqa: ANN001
+        images: Sequence[ImageRef] = (),
+        vision_on: bool = True,
+        media_extra: str = "",
     ) -> tuple[str, PromptLayers]:
         """组装 system prompt，同时返回分层明细。"""
         day = today or dt.date.today()
@@ -269,7 +300,8 @@ class PromptBuilder:
             self._section(
                 "context",
                 self._render_context(
-                    user_id, day, layers.recent_turns, mode, active, speakers, presence, rapport
+                    user_id, day, layers.recent_turns, mode, active, speakers, presence, rapport,
+                    "\n".join(line for line in (vision_note(list(images), seen=vision_on), media_extra) if line),
                 ),
             )
         )
@@ -327,6 +359,7 @@ class PromptBuilder:
         speakers: list[str] | None,
         presence: Any = None,
         rapport: Any = None,
+        media_note: str = "",
     ) -> str:
         lines = [
             f"当前日期：{day.isoformat()}（新增记忆条目使用这个日期，不要臆测别的日子）",
@@ -344,6 +377,8 @@ class PromptBuilder:
             lines.append("你现在能使上劲的手段：" + tools.summary())
         if rapport is not None:
             lines.append(rapport.line())
+        if media_note:
+            lines.append(media_note)
         if presence is not None:
             lines.extend(presence.lines())
         lines.append("你的回复只写角色的话，写完就停，等待对方接话。")
@@ -383,12 +418,18 @@ class PromptBuilder:
             return "", "", [], []
 
     def _normalize_history(self, history: list[Message]) -> list[Message]:
-        """只保留 user/assistant 文本，并按配置裁剪到最近 N 条。"""
-        cleaned = [
-            {"role": item["role"], "content": str(item["content"]).strip()}
-            for item in history
-            if item.get("role") in {"user", "assistant"} and str(item.get("content", "")).strip()
-        ]
+        """只保留 user/assistant，并按配置裁剪到最近 N 条。
+
+        历史里可能出现带图的分段（同一会话内回放的请求消息）：图片不进上下文，
+        只把其中的字面文本留下——图看过了就是看过了，不必每轮重新上传一遍。
+        """
+        cleaned: list[Message] = []
+        for item in history:
+            if item.get("role") not in {"user", "assistant"}:
+                continue
+            content = _plain_text(item.get("content"))
+            if content:
+                cleaned.append({"role": item["role"], "content": content})
         limit = self._settings.context_max_turns
         return cleaned[-limit:] if len(cleaned) > limit else cleaned
 
@@ -405,6 +446,23 @@ class PromptBuilder:
             return text[:budget].rstrip() + TRIM_MARK, True
         half = budget // 2
         return text[:half].rstrip() + TRIM_MARK + text[-(budget - half):], True
+
+
+def _plain_text(content: Any) -> str:  # noqa: ANN401 - 文本或多模态分段都要能吃
+    """把 str 或分段内容压成一句字面文本；图片段落成一个不撒谎的占位。"""
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        pieces: list[str] = []
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            if part.get("type") == "text":
+                pieces.append(str(part.get("text", "")))
+            elif part.get("type") == "image_url":
+                pieces.append("（这里本来是一张图）")
+        return " ".join(piece for piece in pieces if piece).strip()
+    return str(content or "").strip()
 
 
 def history_from_log_records(records: list[dict[str, Any]]) -> list[Message]:

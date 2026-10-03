@@ -110,6 +110,20 @@ class Settings(BaseSettings):
         default="auto", description="auto | playwright | binary | text | none"
     )
 
+    # ---------------- 视觉与多模态 ----------------
+    vision_enabled: bool = Field(
+        default=True, description="把图片本体送进模型：它看见什么就按什么说话"
+    )
+    vision_model: str = Field(default="", description="能看图的多模态模型名，留空复用 MODEL")
+    vision_max_images: int = Field(default=2, ge=1, le=8, description="一轮最多看几张")
+    vision_max_bytes: int = Field(default=4_000_000, ge=1024, description="单张图片的字节上限")
+
+    # ---------------- 沉浸面板与守护 ----------------
+    panel_enabled: bool = Field(default=True, description="在服务上挂只读 Web 面板")
+    drain_timeout_seconds: float = Field(
+        default=30.0, gt=0, description="退出前等在途记忆落盘的天花板秒数"
+    )
+
     # ---------------- 存储体积与远端同步（GitHub 单文件 100MB 硬线） ----------------
     log_keep_days: int = Field(default=7, ge=1, description="明文日志保留天数，更早的 gzip 归档")
     log_max_file_bytes: int = Field(default=4_194_304, ge=65536, description="单个日志文件上限（4MB）")
