@@ -20,6 +20,7 @@ storage/soul/*.key
 # 记忆资产里「可重建 / 体积大」的部分：逐轮日志、人格备份、工具产物
 # 长期记忆（SOUL.md / USER.md / MEMORY.md / RELATIONS.md / CLAWD.md / persona.json / presets）照旧跟踪
 storage/data/users/*/logs/
+storage/data/users/*/state.json
 storage/data/users/*/backups/
 storage/data/users/*/artifacts/
 storage/logs/

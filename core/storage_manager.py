@@ -172,6 +172,29 @@ class StorageManager:
     def logs_dir(self, user_id: str) -> Path:
         return self.user_dir(user_id) / "logs"
 
+    def state_path(self, user_id: str) -> Path:
+        """运行时体温（情绪余温、耐心、熟络度计数）；不是长期记忆资产，不进版本库。"""
+        return self.user_dir(user_id) / "state.json"
+
+    async def read_state(self, user_id: str) -> dict[str, Any]:
+        path = self.state_path(user_id)
+        async with self._critical(path):
+            if not await asyncio.to_thread(path.is_file):
+                return {}
+            raw = await asyncio.to_thread(path.read_text, encoding="utf-8")
+        try:
+            loaded = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            logger.warning("state.json 损坏（%s）：%s，按空状态处理", path, exc)
+            return {}
+        return loaded if isinstance(loaded, dict) else {}
+
+    async def write_state(self, user_id: str, state: dict[str, Any]) -> None:
+        path = self.state_path(user_id)
+        payload = json.dumps(state, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+        async with self._critical(path):
+            await asyncio.to_thread(atomic_write, path, payload)
+
     def artifacts_dir(self, user_id: str) -> Path:
         """工具产物（图片、快照）落这里；默认不入 git。"""
         return self.user_dir(user_id) / "artifacts"

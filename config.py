@@ -75,6 +75,21 @@ class Settings(BaseSettings):
         default=True, description="切掉角色在句尾挂的套话反问（「你想聊什么」「还有什么我能帮」）"
     )
 
+    # ---------------- 真人体感：熟络度 / 节律 / 情绪惰性 ----------------
+    rapport_enabled: bool = Field(default=True, description="熟络度演进引擎（引擎独占写入，不接受指令调温）")
+    rapport_floor_ratio: float = Field(default=0.4, ge=0.0, le=1.0, description="久不联系的降温下限（相对峰值）")
+    rhythm_enabled: bool = Field(default=True, description="按当地时区注入生理与时间感")
+    user_timezone: str = Field(default="", description="IANA 时区名，留空用系统时区；例 Asia/Shanghai")
+    night_start: int = Field(default=1, ge=0, le=23, description="深夜时段起点（整点，可跨零点）")
+    night_end: int = Field(default=5, ge=0, le=23, description="深夜时段终点（不含）")
+    mood_half_life_minutes: int = Field(default=120, ge=5, le=1440, description="情绪余温的半衰期")
+    patience_turn_limit: int = Field(default=14, ge=3, description="一天内聊到这个数就该懒得说")
+    patience_refill_per_hour: float = Field(default=0.06, ge=0.0, le=1.0)
+
+    # ---------------- 本地酒馆兼容服务 ----------------
+    server_host: str = Field(default="127.0.0.1", description="只绑回环：这套灵魂与记忆不该裸露在局域网里")
+    server_port: int = Field(default=11555, ge=1, le=65535)
+
     # ---------------- 工具层 ----------------
     tools_enabled: bool = True
     tool_native_calling: bool = Field(default=True, description="优先用接口的 function calling")
@@ -149,6 +164,19 @@ class Settings(BaseSettings):
             raise ValueError(f"未知 CHAT_MODE: {value}（只能是 solo 或 group）")
         return mode
 
+    @field_validator("user_timezone")
+    @classmethod
+    def _validate_timezone(cls, value: str) -> str:
+        if not value:
+            return value
+        try:
+            from zoneinfo import ZoneInfo
+
+            ZoneInfo(value)
+        except Exception as exc:  # noqa: BLE001 - 时区名写错就明确报错，不要静默按系统时区跑
+            raise ValueError(f"未知 USER_TIMEZONE: {value}（要 IANA 名，如 Asia/Shanghai）") from exc
+        return value
+
     @field_validator("image_provider", "snapshot_provider", mode="before")
     @classmethod
     def _normalize_provider(cls, value: object) -> object:
@@ -189,6 +217,11 @@ class Settings(BaseSettings):
     @property
     def group_mode(self) -> bool:
         return self.chat_mode == "group"
+
+    @property
+    def night_hours(self) -> tuple[int, int]:
+        """深夜区间 (start, end)，支持跨零点；写成两个标量字段是为了让 .env 能用 23,5 这种直觉写法。"""
+        return (self.night_start, self.night_end)
 
     @property
     def effective_extractor_model(self) -> str:
