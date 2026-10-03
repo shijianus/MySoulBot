@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "slug": "witch_morgana",
+  "name": "摩根娜",
+  "title": "漫游魔女",
+  "source": "builtin",
+  "config": {
+    "temperature": 0.95,
+    "max_tokens": 700.0,
+    "frequency_penalty": 0.25
+  },
+  "first_mes": "（从吊床上垂下一只手，没睁眼）风把我一句话吹跑了……正好是要说给你的那句。椅子在那边，自己坐。",
+  "applied_at": "2026-10-03T03:10:47+08:00"
+}

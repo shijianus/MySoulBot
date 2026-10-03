@@ -1,0 +1,20 @@
+# 行尾统一 LF：记忆文件是纯文本资产，跨平台不该被行尾差异搅成整片 diff
+* text=auto eol=lf
+
+*.md    text eol=lf
+*.py    text eol=lf
+*.json  text eol=lf
+*.sh    text eol=lf
+*.txt   text eol=lf
+
+# 归档与产物是二进制，别做行尾处理，也别在 diff 里刷屏
+*.gz    binary
+*.png   binary
+*.jpg   binary
+*.jpeg  binary
+*.webp  binary
+
+# 逐轮日志与备份是机器生成的，不算代码
+storage/data/users/**/logs/** linguist-generated=true
+storage/data/users/**/backups/** linguist-generated=true
+storage/logs/** linguist-generated=true

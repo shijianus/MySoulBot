@@ -1,0 +1,25 @@
+# 运行时与虚拟环境
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+*.tmp
+.*.swp
+
+# flock 锁文件（`.MEMORY.md.lock`）是运行时垃圾，不该进版本库
+.*.lock
+
+# 凭据：里面有真实 API_KEY，永远不进仓库
+.env
+.env.local
+*.env.secret
+storage/soul/*.key
+**/credentials*
+
+# 记忆资产里「可重建 / 体积大」的部分：逐轮日志、人格备份、工具产物
+# 长期记忆（SOUL.md / USER.md / MEMORY.md / RELATIONS.md / CLAWD.md / persona.json / presets）照旧跟踪
+storage/data/users/*/logs/
+storage/data/users/*/backups/
+storage/data/users/*/artifacts/
+storage/logs/
