@@ -14,7 +14,9 @@ from core.card_loader import (
 )
 from core.clawd_soul import ClawdSoul
 from core.memory_extractor import ExtractionOutcome, MemoryExtractor
+from core.presence import Mood, Patience, Presence, build_presence, slot_for
 from core.prompt_builder import PromptBuilder, PromptLayers
+from core.rapport import Rapport, RapportEngine, parse_temperature, stage_for
 from core.storage_manager import (
     PathSafetyError,
     StorageError,
@@ -41,6 +43,11 @@ __all__ = [
     "PromptBuilder",
     "PromptLayers",
     "Session",
+    "Mood",
+    "Patience",
+    "Presence",
+    "Rapport",
+    "RapportEngine",
     "StorageError",
     "StorageManager",
     "StreamGuard",
@@ -55,4 +62,8 @@ __all__ = [
     "parse_facts",
     "scan_size_gate",
     "slugify",
+    "build_presence",
+    "parse_temperature",
+    "slot_for",
+    "stage_for",
 ]

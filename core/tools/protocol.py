@@ -135,6 +135,10 @@ _CLOSER_STEMS: Final[tuple[str, ...]] = (
 _LEAD_ACTION: Final[re.Pattern[str]] = re.compile(r"^\s*[（(][^）)]*[）)]\s*")
 _SENTENCE_END: Final[re.Pattern[str]] = re.compile(r"(?<=[。！？!?…])")
 _MAX_CLOSER_CHARS: Final[int] = 16
+# 套话可能只有一行，所以放行的时候故意落后一个「未完结的尾句」：
+# 每块只放到最后一个句读为止，尾巴留到下一块或流末再判。
+_MAX_HELD_TAIL: Final[int] = 24
+_SENT_SPLIT_ANY: Final[re.Pattern[str]] = re.compile(r"[。！？!?…]")
 # 尾句观望用的开头：命中就先不放行，等流结束再决定切不切。
 # 只影响「最后一行」的显示时机（流一结束就放出），打字机手感不受影响。
 _CLOSER_HEADS: Final[tuple[str, ...]] = (
@@ -202,6 +206,7 @@ class StreamGuard:
         self._trim = trim_closers
         self._dropping = False  # 本行已判定为机器声，到换行之前继续丢
         self._in_span = False  # ⟦ 开了没关，跨行残骸继续吞
+        self.visible_chars = 0  # 已经放出去多少正文：一条都没有时不许把话吞成空气泡
         self.swallowed: list[str] = []
 
     # ------------------------------------------------------------ 主入口
@@ -235,10 +240,13 @@ class StreamGuard:
                 break
             line, buffer = buffer[:index], buffer[index + 1 :]
             shown, found = self._finish_line(line)
-            out.append(shown)
+            # 整行被吞掉（机器声或套话）时连换行一起不留，免得气泡里挂空行
+            if shown or not line.strip():
+                out.append(shown)
+                out.append("\n")
             directives.extend(found)
-            out.append("\n")
             self._line_start = True
+            self.visible_chars += len(shown)
 
         self._pending = ""
 
@@ -271,9 +279,33 @@ class StreamGuard:
             if mixed:
                 self.swallowed.extend(item.line for item in mixed)
                 directives.extend(mixed)
-            out.append(strip_markers(buffer, self.swallowed))
+            shown = strip_markers(buffer, self.swallowed)
+            release, held = self._split_tail(shown)
+            self.visible_chars += len(release)
+            out.append(release)
+            self._pending = held
             self._line_start = False
         return "".join(out), directives
+
+    def _split_tail(self, shown: str) -> tuple[str, str]:
+        """把结尾那个带句读的短尾句留着，等流末再判。
+
+        套话几乎都是最后一句，所以每次只落后一个短句（≤24 字），
+        下一个分片一到就立刻补发，打字机手感只是推后半句。
+        """
+        if not shown or not self._trim:
+            return shown, ""
+        parts = [piece for piece in _SENTENCE_END.split(shown) if piece]
+        if not parts:
+            return shown, ""
+        tail = parts[-1]
+        if len(tail) > _MAX_HELD_TAIL:
+            return shown, ""
+        head = "".join(parts[:-1])
+        if not head:
+            # 这一片只有一句话：已经发过正文才扣留，否则原样放出——绝不留空气泡
+            return ("", tail) if self.visible_chars > 0 else (shown, "")
+        return head, tail
 
     def flush(self) -> tuple[str, list[Directive]]:
         """流结束：结算最后一段（可能没有换行），并顺手切掉结尾的套话反问。"""
@@ -287,6 +319,10 @@ class StreamGuard:
             shown, directives = self._finish_line(buffer)
         else:
             shown, directives = strip_markers(buffer, self.swallowed), []
+        if self._trim and self.visible_chars > 0 and _is_stock_closer(shown):
+            # 扣留到最后的整段尾巴就是一句套话：不进气泡
+            self.swallowed.append(shown.strip())
+            return "", directives
         if self._trim:
             trimmed = trim_stock_closer(shown)
             if trimmed != shown:
@@ -307,8 +343,8 @@ class StreamGuard:
         if is_mechanical_line(line):
             self.swallowed.append(line.strip())
             return "", []
-        if self._trim and _is_stock_closer(line):
-            # 整行就是一句套话反问：没有别的 content 可保留，直接不收进气泡
+        if self._trim and self.visible_chars > 0 and _is_stock_closer(line):
+            # 整行就是一句套话反问，且前面已经有话：不再进气泡
             self.swallowed.append(line.strip())
             return "", []
         shown = strip_markers(line, self.swallowed)

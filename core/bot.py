@@ -31,6 +31,16 @@ from core.card_loader import PersonaLibrary, Preset
 from core.clawd_soul import ClawdSoul
 from core.memory_extractor import MemoryExtractor
 from core.prompt_builder import Message, PromptBuilder, PromptLayers, history_from_log_records
+from core.presence import (
+    SLOTS,
+    Mood,
+    Patience,
+    Presence,
+    assess_mood,
+    build_presence,
+    resolve_now,
+)
+from core.rapport import Rapport, RapportEngine
 from core.storage_manager import StorageManager, StorageError
 from core.tools.base import ToolContext
 from core.tools.protocol import Directive, StreamGuard
@@ -69,6 +79,13 @@ class Session:
     gen_params: dict[str, Any] = field(default_factory=dict)
     tool_mode: str = ""  # ""=自动；接口不认原生工具时被降级成 "inline"
     tool_calls: int = 0
+    # 体温与温度：一次刷新，整轮复用（保证同一轮内重复组装 prompt 结果一致）
+    stamp: dt.datetime = field(default_factory=lambda: dt.datetime.now().astimezone())
+    presence: Any = None  # noqa: ANN401 - core.presence.Presence
+    rapport: Any = None  # noqa: ANN401 - core.rapport.Rapport
+    state: dict[str, Any] = field(default_factory=dict)
+    facts_seen: int = 0
+    dynamics_seen: int = 0
 
     def append(self, role: str, content: str, cap: int) -> None:
         self.history.append({"role": role, "content": content})
@@ -120,6 +137,7 @@ class MySoulBot:
         self._extractor = extractor
         self.library = library or PersonaLibrary(settings)
         self.clawd = clawd or ClawdSoul(settings)
+        self.rapport = RapportEngine(settings, storage)
         self._client: AsyncOpenAI | None = None
         self._sessions: dict[str, Session] = {}
         self._today = dt.date.today()
@@ -191,6 +209,12 @@ class MySoulBot:
             session.history = history_from_log_records(records)[-limit:]
             if session.history:
                 logger.info("已为 %s 恢复 %d 条上下文", user_id, len(session.history))
+        session.stamp = resolve_now(None, self._settings.user_timezone)
+        try:
+            session.state = await self._storage.read_state(user_id)
+        except Exception as exc:  # noqa: BLE001 - 体温读不出来就当刚醒，别挡住对话
+            logger.warning("%s 状态读取失败: %s", user_id, exc)
+            session.state = {}
         meta = await self._storage.read_persona_meta(user_id)
         session.persona_slug = str(meta.get("slug") or "")
         session.persona_name = str(meta.get("name") or "")
@@ -273,13 +297,70 @@ class MySoulBot:
         """返回当前将用于对话的 system prompt 与分层明细。"""
         session = self._sessions.get(user_id) or await self.open_session(user_id)
         registry = tools if tools is not None else self.registry(user_id)
+        presence, rapport = await self._pulse(session, persist=False)
         return await self._prompts.build_system_prompt(
             user_id,
             session.history,
             today=today or self._today,
             tool_mode=self._tool_mode(session, registry),
             tools=registry,
+            presence=presence,
+            rapport=rapport,
         )
+
+    # ------------------------------------------------------------ 体温与温度
+    async def _pulse(self, session: Session, *, persist: bool) -> tuple[Presence, Any]:
+        """刷新这一轮的「此刻」与「我们之间」。
+
+        温度只在**真实回合**里结算（`persist=True`）：上一轮后台攒下的事实与分寸
+        此时才看得见，增量是真的。预览走只读路径，绝不累积——否则 `/panel prompt`
+        连查两次就会凭空攒出 0.35 度，破坏同轮组装的一致性。
+        """
+        stale = Presence(stamp=session.stamp, slot=SLOTS[6], patience=Patience())
+        published = await self.rapport.read(session.user_id)
+        try:
+            presence = build_presence(self._settings, session.state, session.stamp)
+            if not persist:
+                session.presence, session.rapport = presence, published
+                return presence, published
+            facts, dynamics = await asyncio.gather(
+                self._storage.read_facts(session.user_id),
+                self._storage.read_relations(session.user_id),
+            )
+            counters = dict(session.state.get("rapport") or {})
+            rapport, counters = self.rapport.advance(
+                published,
+                counters,
+                now=session.stamp,
+                gap_days=presence.gap_days,
+                late_night=presence.deep_night,
+                repair=bool(session.state.get("pending_repair")),
+                disclosure_delta=max(0, len(facts) - session.facts_seen),
+                dynamic_delta=max(0, len(dynamics) - session.dynamics_seen),
+            )
+            session.facts_seen = max(session.facts_seen, len(facts))
+            session.dynamics_seen = max(session.dynamics_seen, len(dynamics))
+            session.state["rapport"] = counters
+            session.state["pending_repair"] = False
+            session.state.update(presence.to_state())
+            await self._storage.write_state(session.user_id, session.state)
+            await self.rapport.publish(session.user_id, rapport)
+            session.presence, session.rapport = presence, rapport
+            return presence, rapport
+        except Exception as exc:  # noqa: BLE001 - 体温故障绝不打断回复
+            logger.warning("%s 体温刷新失败: %s", session.user_id, exc)
+            session.presence, session.rapport = stale, published
+            return stale, published
+
+    def presence_of(self, user_id: str) -> Presence | None:
+        """当前体温快照（未对话过时为 None）。"""
+        session = self._sessions.get(user_id)
+        return session.presence if session else None
+
+    def rapport_of(self, user_id: str) -> Any:  # noqa: ANN401 - Rapport
+        session = self._sessions.get(user_id)
+        return session.rapport if session else None
+
 
     # ------------------------------------------------------------ 对话
     async def stream_reply(
@@ -289,6 +370,7 @@ class MySoulBot:
         *,
         today: dt.date | None = None,
         speakers: list[str] | None = None,
+        now: dt.datetime | None = None,
     ) -> AsyncIterator[str]:
         """流式产出一段角色回复。
 
@@ -301,9 +383,11 @@ class MySoulBot:
         session.busy = True
 
         day = today or self._today
+        session.stamp = resolve_now(now, self._settings.user_timezone)
         registry = self.registry(user_id)
         mode = self._tool_mode(session, registry)
         params = session.merged_params(self._settings)
+        presence, rapport = await self._pulse(session, persist=True)
         guard = StreamGuard(trim_closers=self._settings.trim_stock_closers)
         visible: list[str] = []
         groups: list[list[Message]] = []  # 每组=一次「下单+结果」，永不拆开，避免留下无主的 tool 消息
@@ -321,6 +405,8 @@ class MySoulBot:
                         tool_mode=mode,
                         tools=registry,
                         speakers=speakers,
+                        presence=presence,
+                        rapport=rapport,
                     )
                     rebuild = False
                 sink: dict[str, Any] = {"tool_calls": []}
@@ -589,9 +675,40 @@ class MySoulBot:
                 {"role": "assistant", "content": text + suffix, "interrupted": interrupted},
             ],
         )
+        await self._settle_emotion(session, user_text, text, interrupted)
 
         window = session.history[-self._settings.extractor_lookback_turns :]
         self._extractor.submit(session.user_id, window, today=day)
+
+    async def _settle_emotion(
+        self, session: Session, user_text: str, reply: str, interrupted: bool
+    ) -> None:
+        """把这一轮的情绪沉淀成「余温」，并按半衰期留着，不许下一轮立刻晴转多云。
+
+        同时判定 repair（上一轮还不痛快、这一轮他软下来）——和好是要攒进温度的。
+        """
+        try:
+            presence = session.presence or Presence(stamp=session.stamp, slot=SLOTS[6], patience=Patience())
+            valence, cause = assess_mood(user_text, reply)
+            before = presence.mood.current(session.stamp, self._settings.mood_half_life_minutes)
+            repair = before <= -0.15 and valence >= 0.15
+            mood = Mood(valence, cause or presence.mood.cause, session.stamp) if abs(valence) >= 0.05 else Mood()
+            patience = presence.patience.spend(self._settings.patience_turn_limit)
+            session.state.update(
+                {
+                    "mood": mood.to_dict(),
+                    "patience": patience.to_dict(),
+                    "last_seen": session.stamp.isoformat(timespec="seconds"),
+                    "pending_repair": repair,
+                }
+            )
+            if interrupted:
+                session.state.setdefault("mood", mood.to_dict())
+            await self._storage.write_state(session.user_id, session.state)
+            if repair:
+                logger.info("%s 争执后缓和：温度按和好计", session.user_id)
+        except Exception as exc:  # noqa: BLE001 - 情绪沉淀失败不影响回复落盘
+            logger.warning("%s 情绪沉淀失败: %s", session.user_id, exc)
 
     # ------------------------------------------------------------ 维护
     async def flush_extractions(self, timeout: float = 60.0) -> int:
