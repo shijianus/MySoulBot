@@ -118,6 +118,18 @@ class Settings(BaseSettings):
     vision_max_images: int = Field(default=2, ge=1, le=8, description="一轮最多看几张")
     vision_max_bytes: int = Field(default=4_000_000, ge=1024, description="单张图片的字节上限")
 
+    # ---------------- 拟人语音 ----------------
+    tts_enabled: bool = Field(
+        default=True, description="总开关：false 时整条语音链静默，界面一根播放条都不挂"
+    )
+    tts_provider: str = Field(
+        default="auto", description="auto=装了 edge-tts 就用真人声，否则标准库合成 | edge | stub | none"
+    )
+    tts_voice_day: str = Field(default="zh-CN-XiaoxiaoNeural", description="常态音色名（edge 用）")
+    tts_voice_night: str = Field(default="zh-CN-XiaoxiaoNeural", description="深夜音色名（edge 用）")
+    tts_max_chars: int = Field(default=600, ge=20, description="一次最多念这么多字，超了就截")
+    tts_timeout: float = Field(default=20.0, gt=0, description="外部 TTS 的天花板秒数")
+
     # ---------------- 沉浸面板与守护 ----------------
     panel_enabled: bool = Field(default=True, description="在服务上挂只读 Web 面板")
     drain_timeout_seconds: float = Field(
@@ -191,7 +203,7 @@ class Settings(BaseSettings):
             raise ValueError(f"未知 USER_TIMEZONE: {value}（要 IANA 名，如 Asia/Shanghai）") from exc
         return value
 
-    @field_validator("image_provider", "snapshot_provider", mode="before")
+    @field_validator("image_provider", "snapshot_provider", "tts_provider", mode="before")
     @classmethod
     def _normalize_provider(cls, value: object) -> object:
         return value.strip().lower() if isinstance(value, str) else value

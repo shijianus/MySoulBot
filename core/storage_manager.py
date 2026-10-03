@@ -199,6 +199,10 @@ class StorageManager:
         """工具产物（图片、快照）落这里；默认不入 git。"""
         return self.user_dir(user_id) / "artifacts"
 
+    def audio_dir(self, user_id: str) -> Path:
+        """念出来的声音落这里——同样是产物，不该进版本库。"""
+        return self.artifacts_dir(user_id) / "audio"
+
     def memory_archive_dir(self, user_id: str) -> Path:
         """被下沉的记忆条目落这里。它是记忆资产的一部分，跟着仓库一起走。"""
         return self.user_dir(user_id) / "archive"
