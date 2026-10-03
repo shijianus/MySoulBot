@@ -26,3 +26,6 @@ storage/data/users/*/artifacts/
 storage/logs/
 # 守护进程的运行痕迹（pidfile 与 server.out）——机器本地状态，不该进版本库
 storage/run/
+
+# 裸机协议端的工作目录（含鉴权串与主程序软链，机器本地状态）
+onebot/
