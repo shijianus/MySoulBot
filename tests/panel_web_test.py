@@ -21,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import datetime as dt
 import json
+import re
 import shutil
 import subprocess
 import sys
@@ -501,7 +502,10 @@ async def panel_http_checks(check: Checker, settings: Any) -> None:
         check.ok("页面无外链资源", "http://" not in html.replace("http://127.0.0.1", "") and "cdn." not in html)
         check.ok("页面引用同目录资源", 'href="app.css"' in html and 'src="app.js"' in html)
         check.ok("页面把只读写在脸上", "只读 · 不可调节" in html, html[:120])
-        check.ok("页面没有可调温度的控件", 'type="range"' not in html and "<input" not in html)
+        check.ok("页面没有可调温度的控件", 'type="range"' not in html and 'type="number"' not in html and "step=" not in html)
+        heat = html.split('<section class="card heat"')[1].split("</section>")[0] if '<section class="card heat"' in html else ""
+        check.ok("温度卡里连一个可操作的控件都不长", bool(heat) and not any(
+            tag in heat for tag in ("<button", "<input", "<select", "onclick", "onchange", "contenteditable")), heat[:80])
         check.ok("根路径也进面板", (await asyncio.to_thread(http_get, base + "/"))[0] == 200)
 
         for asset in ("app.css", "app.js"):
@@ -607,14 +611,26 @@ async def panel_http_checks(check: Checker, settings: Any) -> None:
 
 
 # ================================================================ 5. 前端脚本与安全底线
+def strip_js_comments(text: str) -> str:
+    """把注释剥掉再谈「代码里有没有」——注释里写着「不显示 token」不该算成在显示 token。"""
+    return re.sub(r"(?m)^\s*//.*$", " ", re.sub(r"/\*.*?\*/", " ", text, flags=re.S))
+
+
 def frontend_checks(check: Checker) -> None:
     folder = PROJECT_ROOT / "web" / "panel"
     html = (folder / "index.html").read_text(encoding="utf-8")
     script = (folder / "app.js").read_text(encoding="utf-8")
     style = (folder / "app.css").read_text(encoding="utf-8")
+    code = strip_js_comments(script)
 
     check.ok("脚本只读接口", "/api/state" in script and "/api/timeline" in script)
-    check.ok("脚本不发 POST/PUT", "POST" not in script.upper() and "PUT" not in script.upper())
+    methods = re.findall(r'method:\s*"([A-Za-z]+)"', code)
+    check.ok("脚本只发 GET 与 POST", set(methods) <= {"POST"}, str(methods))
+    posts = re.findall(r'\bpost\("(/[^"]+)"', code)
+    check.ok("POST 只对着对话与语音两个口", set(posts) <= {"/v1/chat/completions", "/voice/say"}, str(posts))
+    check.ok("语音与对话之外没有写入口", not re.search(r"\b(PUT|PATCH|DELETE)\b", code))
+    check.ok("只读接口只有读一条路", not re.search(r'\bpost\("/api', code))
+    check.ok("界面不显示 token 与采样参数", not re.search(r"\b(tokens?|usage|logprobs|temperature|max_tokens)\b", code))
     check.ok("记忆正文走 textContent", "textContent" in script)
     check.ok("脚本不拼 innerHTML", "innerHTML" not in script)
     check.ok("只用一个 fetch 封装", script.count("fetch(") == 1, str(script.count("fetch(")))

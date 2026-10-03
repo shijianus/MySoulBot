@@ -76,7 +76,54 @@ body {
 .doc-pick button.on { color: var(--ink); border-bottom-color: var(--heat); }
 .note { color: var(--faint); font-size: .76rem; margin: 1.2rem 0 0; text-align: center; }
 .err { color: var(--heat); }
+
+/* 对话视窗：只有气泡、图和一个输入条。
+   没有气泡时间戳、没有 token 计数、没有任何「正在调用…」的位置——
+   这一页是拿来相处的，不是拿来观测的。 */
+.thread { list-style: none; margin: 0 0 .8rem; padding: 0; display: flex; flex-direction: column; gap: .55rem; }
+.thread:empty { margin-bottom: .3rem; }
+.bubble {
+  max-width: 88%;
+  padding: .62rem .85rem;
+  border-radius: 14px;
+  font-size: .95rem;
+  line-height: 1.7;
+  white-space: pre-wrap;
+  word-break: break-word;
+  overflow-wrap: anywhere;
+}
+.bubble.her { align-self: flex-start; background: var(--card); border: 1px solid var(--line); border-bottom-left-radius: 5px; }
+.bubble.me { align-self: flex-end; background: #241d17; border: 1px solid #3a2c20; border-bottom-right-radius: 5px; color: #ded6c9; }
+.bubble .thumb { display: block; width: 100%; max-width: 13rem; border-radius: 9px; margin-top: .5rem; }
+.bubble.pending-line { color: var(--faint); font-style: normal; }
+.say { display: flex; align-items: center; gap: .5rem; margin-top: .55rem; }
+.say audio { flex: 1; height: 2rem; min-width: 0; }
+.say span { font-size: .7rem; color: var(--faint); font-variant-numeric: tabular-nums; }
+.caret { display: inline-block; width: .5em; color: var(--heat); }
+.hint { margin: 0 0 .9rem; color: var(--faint); font-size: .8rem; }
+.pending { display: flex; flex-wrap: wrap; gap: .4rem; margin-bottom: .5rem; }
+.pending:empty { margin-bottom: 0; }
+.pending button { background: none; border: 1px solid var(--line); border-radius: 9px; padding: 0; cursor: pointer; }
+.pending img { display: block; width: 3.6rem; height: 3.6rem; object-fit: cover; border-radius: 8px; }
+.composer { display: flex; gap: .4rem; align-items: stretch; }
+.draft {
+  flex: 1; min-width: 0;
+  background: var(--card); border: 1px solid var(--line); border-radius: 12px;
+  color: var(--ink); font: inherit; font-size: .95rem; padding: .6rem .8rem;
+}
+.draft:focus { outline: none; border-color: var(--heat); }
+.draft[disabled] { opacity: .5; }
+.icon, .send {
+  background: none; border: 1px solid var(--line); border-radius: 12px;
+  color: var(--dim); font: inherit; font-size: .85rem; padding: 0 .8rem; cursor: pointer;
+}
+.icon { min-width: 2.4rem; }
+.send { border-color: var(--heat); color: var(--ink); background: rgba(208, 138, 92, .1); min-width: 3rem; }
+.send[disabled] { opacity: .45; cursor: default; }
+.hidden { position: absolute; width: 1px; height: 1px; opacity: 0; pointer-events: none; }
 @media (max-width: 30rem) {
   .gauges { grid-template-columns: 1fr 1fr; }
   .gauge:last-child { grid-column: span 2; }
+  .bubble { max-width: 94%; }
+  .icon { min-width: 2.1rem; padding: 0 .5rem; }
 }

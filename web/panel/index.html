@@ -5,6 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="referrer" content="no-referrer">
 <title>此刻</title>
+<base href="/panel/">
 <link rel="stylesheet" href="app.css">
 </head>
 <body>
@@ -58,11 +59,26 @@
   </section>
 
   <nav class="tabs" role="tablist">
-    <button class="tab on" data-view="machine" role="tab">记忆时光机</button>
+    <button class="tab on" data-view="chat" role="tab">和她说话</button>
+    <button class="tab" data-view="machine" role="tab">记忆时光机</button>
     <button class="tab" data-view="docs" role="tab">她写的原话</button>
   </nav>
 
-  <section id="view-machine" class="view on">
+  <section id="view-chat" class="view on">
+    <ul id="thread" class="thread"></ul>
+    <p id="thread-hint" class="hint"></p>
+    <div id="pending" class="pending" aria-label="随这条消息一起发出的图"></div>
+    <form id="composer" class="composer">
+      <input id="draft" class="draft" type="text" autocomplete="off" enterkeyhint="send" placeholder="说点什么…" aria-label="要对她说的话">
+      <button class="icon" type="button" id="pick-file" aria-label="从相册选一张图">图</button>
+      <button class="icon" type="button" id="pick-shot" aria-label="拍一张">拍</button>
+      <button class="send" type="submit" id="send">说</button>
+      <input id="file-image" class="hidden" type="file" accept="image/*" tabindex="-1" aria-hidden="true">
+      <input id="shot-image" class="hidden" type="file" accept="image/*" capture="environment" tabindex="-1" aria-hidden="true">
+    </form>
+  </section>
+
+  <section id="view-machine" class="view">
     <div class="strip" id="activity" aria-hidden="true"></div>
     <div class="track">
       <h2 class="track-title">他交代过的事</h2>
@@ -79,7 +95,7 @@
   </section>
 
   <p id="quiet" class="quiet"></p>
-  <noscript><p class="quiet">这页需要一点 JavaScript 才能读到实时状态。</p></noscript>
+  <noscript><p class="quiet">这页需要一点 JavaScript 才能读到实时状态、也才能跟她说话。</p></noscript>
 </main>
 <script src="app.js"></script>
 </body>

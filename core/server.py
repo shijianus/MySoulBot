@@ -548,6 +548,7 @@ class SoulServer:
             "extractor_enabled": self._settings.extractor_enabled,
             "vision_enabled": self._settings.vision_enabled,
             "vision_model": self._settings.effective_vision_model,
+            "vision_max_images": self._settings.vision_max_images,
             "tts_enabled": self._settings.tts_enabled,
             "tts_provider": provider_of(self._settings),
             "panel_enabled": self._settings.panel_enabled,
