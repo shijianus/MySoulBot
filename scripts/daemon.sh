@@ -2,10 +2,15 @@
 # MySoulBot 本地酒馆服务：常驻、优雅停止、平滑重启。
 #
 #   bash scripts/daemon.sh start        # 后台起来（默认 127.0.0.1:11555）
-#   bash scripts/daemon.sh status       # 在不在、端口、积压多少条没落盘的记忆
+#   bash scripts/daemon.sh status       # 在不在、端口、积压多少条没落盘的记忆、QQ 网桥的连接与心跳
 #   bash scripts/daemon.sh logs         # 追服务日志
 #   bash scripts/daemon.sh restart      # 平滑重启：等旧进程排空再起新的
 #   bash scripts/daemon.sh stop         # 优雅停止（SIGTERM，最多等 GRACE 秒）
+#
+# QQ 那一侧的协议端（LLOneBot / NapCat）不是另一个进程管家：ONEBOT_ENABLED=true 时
+# 网桥就长在这个服务里，反向 WS 监听 ONEBOT_PORT（默认 11556）。所以 status/healthz
+# 一套读数就够，不再单独起一个 pidfile——两套进程互相不知道对方死活是最难查的故障。
+# 裸机协议端自己的安装与扫码登录：bash scripts/qq/setup_onebot.sh。
 #
 # 为什么不是 `kill -9`：记忆抽取是后台 fire-and-forget 的，硬杀会丢掉刚攒下的
 # 那几事实。server 收到 SIGTERM 会先停止接单、等在途回合说完、再等队列排空——
@@ -45,15 +50,63 @@ PY
 
 port_of() { "$PYTHON_BIN" -c "from config import get_settings; print(get_settings().server_port)" 2>/dev/null || echo 11555; }
 
+onebot_line() {
+  # 网桥的读数就藏在 /healthz 的 onebot 字段里：它不是独立进程，不该另开一个口子去问。
+  # JSON 走参数不走管道——`python - <<PY` 已经把这个函数的 stdin 用作脚本本身了。
+  "$PYTHON_BIN" - "$1" <<'PY'
+import json, sys
+
+try:
+    health = json.loads(sys.argv[1] or "{}")
+except Exception:
+    print("· OneBot 网桥：/healthz 的读数读不出")
+    sys.exit(0)
+bridge = health.get("onebot") or {}
+if not bridge.get("enabled"):
+    print("· OneBot 网桥：没开（ONEBOT_ENABLED=false，QQ 进不来）")
+    sys.exit(0)
+bound = bridge.get("bound") or {}
+counts = bridge.get("counts") or {}
+age = bridge.get("heartbeat_seconds_ago")
+heart = f"{age}s 前" if isinstance(age, (int, float)) else "还没收到心跳"
+print(
+    "· OneBot 网桥：ws://{}:{}  ·  协议端 {} 个  ·  心跳 {}  ·  对面在线 {}".format(
+        bound.get("host", "?"), bound.get("port", "?"), bridge.get("connections", 0),
+        heart, bridge.get("peer_online"),
+    )
+)
+print(
+    "  事件 {} · 回复 {} · 没点名不接 {} · 防刷屏挡下 {} · 重复 {} · 出错 {}".format(
+        counts.get("events", 0), counts.get("replies", 0), counts.get("not_woken", 0),
+        counts.get("flood", 0), counts.get("duplicate", 0), counts.get("errors", 0),
+    )
+)
+PY
+}
+
+onebot_hint() {
+  "$PYTHON_BIN" - <<'PY' 2>/dev/null || true
+from config import get_settings
+
+settings = get_settings()
+if not settings.onebot_enabled:
+    print("· OneBot 网桥没开：协议端要接进来时把 .env 里 ONEBOT_ENABLED 改成 true 再 restart")
+else:
+    token = "已配（见 .env 的 ONEBOT_ACCESS_TOKEN）" if settings.onebot_access_token.strip() else "未配"
+    print("· OneBot 网桥开着：协议端反向连 ws://{}:{}  ·  鉴权 {}".format(
+        settings.onebot_host, settings.onebot_port, token))
+PY
+}
+
 cmd_start() {
-  if alive; then echo "· 已经在跑了（pid $(cat "$PID_FILE")）"; return 0; fi
+  if alive; then echo "· 已经在跑了（pid $(cat "$PID_FILE")）"; onebot_hint; return 0; fi
   local port; port="$(port_of)"
   setsid nohup "$PYTHON_BIN" server.py >>"$OUT_FILE" 2>&1 &
   local pid=$!
   echo "$pid" > "$PID_FILE"
   for _ in $(seq 1 40); do
     probe "http://127.0.0.1:${port}/healthz" >/dev/null 2>&1 && {
-      echo "✓ 起来了（pid ${pid}） http://127.0.0.1:${port}/v1"; return 0; }
+      echo "✓ 起来了（pid ${pid}） http://127.0.0.1:${port}/v1"; onebot_hint; return 0; }
     alive || { echo "✗ 进程退了，最后几行：" >&2; tail -20 "$OUT_FILE" >&2; return 1; }
     sleep 0.25
   done
@@ -80,7 +133,13 @@ cmd_status() {
   local port; port="$(port_of)"
   if ! alive; then echo "· 未运行"; return 1; fi
   echo "· pid $(cat "$PID_FILE") · 日志 $OUT_FILE"
-  probe "http://127.0.0.1:${port}/healthz" || echo "· 进程在，但 /healthz 没答话"
+  local body
+  if ! body="$(probe "http://127.0.0.1:${port}/healthz")"; then
+    echo "· 进程在，但 /healthz 没答话"
+    return 1
+  fi
+  echo "$body"
+  onebot_line "$body"
 }
 
 cmd_logs() { tail -n "${LINES:-80}" -f "$OUT_FILE"; }

@@ -14,6 +14,9 @@
 - `GET  /media/<用户>/<文件>` —— 工具产物（生成的图、拍下的屏）的静态查看链接
 - `GET  /media/audio/<用户>/<文件>` —— 念出来的声音
 
+外加一条**非 HTTP** 的入口：`ONEBOT_ENABLED=true` 时另开 `ONEBOT_PORT`，
+QQ 那侧的协议端反向连进来（`core/adapters/qq_onebot.py`），用的是同一具灵魂、同一份记忆。
+
 **面板只读**：`/api/*` 与 `/panel*` 只接 GET，其余一律 405。熟络度没有写入口——
 温度只能由引擎在真实回合里攒，网页上一个 PATCH 按钮都不长。`/voice/say` 能收 POST，
 是因为它只出声不记事：不建会话、不进上下文、不碰 `state.json`。
@@ -43,6 +46,7 @@ from urllib.parse import parse_qs, unquote, urlparse
 
 from config import Settings
 from core import panel
+from core.adapters.qq_onebot import OneBotBridge
 from core.bot import BotError, MySoulBot
 from core.card_loader import PersonaLibrary
 from core.clawd_soul import ClawdSoul
@@ -112,6 +116,8 @@ class SoulServer:
         self._opening: dict[str, asyncio.Lock] = {}
         self._server: asyncio.Server | None = None
         self._opened: set[str] = set()
+        # QQ 那侧的入口：只有 ONEBOT_ENABLED=true 才存在，存在就与酒馆共用同一个 bot 实例
+        self.onebot: OneBotBridge | None = None
         self._assets: dict[str, tuple[bytes, str]] = {}
         self.requests = 0
         self.active = 0  # 正在出话的回合数：停机前要等它归零
@@ -132,9 +138,18 @@ class SoulServer:
         self._server = await asyncio.start_server(self._handle, host, port)
         bound = self._server.sockets[0].getsockname() if self._server.sockets else (host, port)
         logger.info("酒馆兼容端点已监听 http://%s:%s/v1", bound[0], bound[1])
+        if self._settings.onebot_enabled:
+            bridge = OneBotBridge(self._settings, self.bot)
+            qq_host, qq_port = await bridge.start()
+            self.onebot = bridge
+            logger.info("QQ 网桥已就绪：协议端反向连 ws://%s:%s", qq_host, qq_port)
         return str(bound[0]), int(bound[1])
 
     async def stop(self) -> None:
+        if self.onebot is not None:
+            # 先跟协议端挥手，再关抽取与模型客户端：话说一半被掐断是最难看的收场
+            await self.onebot.stop()
+            self.onebot = None
         if self._server is not None:
             self._server.close()
             await self._server.wait_closed()
@@ -555,11 +570,18 @@ class SoulServer:
             "requests": self.requests,
             "active_turns": self.active,
             "memory_backlog": self.bot.extractor.backlog,
+            "onebot": (
+                self.onebot.status()
+                if self.onebot is not None
+                else {"enabled": self._settings.onebot_enabled, "listening": False}
+            ),
         }
 
     # ------------------------------------------------------------ 停机
     async def close_listener(self) -> None:
         """先停止接单，让在途的回合自己说完。"""
+        if self.onebot is not None:
+            await self.onebot.close_listener()
         if self._server is not None:
             self._server.close()
             with contextlib.suppress(Exception):
@@ -571,14 +593,19 @@ class SoulServer:
 
         后台抽取是 fire-and-forget 的——进程被直接掐掉就会丢掉那一口「刚攒下的事实」。
         这里等到队列空为止；超时就如实报出还欠多少，让守护层把数字留在日志里。
+        QQ 那头的回合也算回合：酒馆空闲不代表网桥也空闲。
         """
         grace = timeout if timeout is not None else self._settings.drain_timeout_seconds
         deadline = time.monotonic() + grace
-        while self.active > 0 and time.monotonic() < deadline:
+        while self._in_flight() > 0 and time.monotonic() < deadline:
             await asyncio.sleep(0.1)
-        turns_left = self.active
+        turns_left = self._in_flight()
         backlog = await self.bot.flush_extractions(max(1.0, deadline - time.monotonic()))
         return {"turns_left": turns_left, "backlog": backlog}
+
+    def _in_flight(self) -> int:
+        """正在出话的回合数，两个入口一起算：只盯酒馆会把 QQ 那一半漏在停机之外。"""
+        return self.active + (self.onebot.active_turns if self.onebot is not None else 0)
 
 
 # ---------------------------------------------------------------- 传输细节
@@ -776,6 +803,14 @@ async def _serve(server: SoulServer, host: str, port: int, grace: float) -> None
     print(f"  模型名（酒馆里填这个）： {server.settings.model}")
     print("  酒馆 → API 连接：Chat Completion，客户端 = OpenAI，兼容 = 本地")
     serve_task = asyncio.create_task(server.serve_forever())
+    if server.onebot is not None:
+        state = server.onebot.status()
+        bound = state.get("bound") or {}
+        print(f"  QQ 网桥（反向 WS，等协议端连进来）： ws://{bound.get('host')}:{bound.get('port')}")
+        print(
+            "    鉴权："
+            + ("已配 ONEBOT_ACCESS_TOKEN" if state.get("authenticated") else "未配 token（只绑了回环）")
+        )
     stop = asyncio.Event()
     _install_stop_handlers(stop)
     try:
