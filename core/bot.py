@@ -13,6 +13,7 @@ import asyncio
 import datetime as dt
 import json
 import logging
+import re
 from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -43,7 +44,7 @@ from core.presence import (
 from core.rapport import Rapport, RapportEngine
 from core.storage_manager import StorageManager, StorageError
 from core.tools.base import ToolContext
-from core.tools.protocol import Directive, StreamGuard
+from core.tools.protocol import Directive, StreamGuard, extract_directives
 from core.tools.registry import ToolRegistry
 from core.vision import (
     ImageRef,
@@ -58,6 +59,11 @@ logger: Final = logging.getLogger("mysoulbot.bot")
 
 HISTORY_MULTIPLIER: Final[int] = 4
 TOOL_TRAIL_ROUNDS: Final[int] = 3
+
+
+def _flatten_line(text: str) -> str:
+    """比「同一行」之前先抹平差异：换行、连续空格与大小写都不算两个样子。"""
+    return re.sub(r"\s+", " ", text or "").strip().casefold()
 
 
 class BotError(RuntimeError):
@@ -467,7 +473,7 @@ class MySoulBot:
                     visible.append(tail)
                     yield tail
 
-                calls = self._collect_calls(mode, sink, ordered, registry)
+                calls = self._collect_calls(mode, sink, ordered, registry, echo_of=user_text)
                 if not calls:
                     break
                 if rounds >= self._settings.tool_max_rounds:
@@ -568,10 +574,31 @@ class MySoulBot:
         return "native" if self._settings.tool_native_calling else "inline"
 
     @staticmethod
+    def _echoed_by_user(directive: Directive, user_text: str) -> bool:
+        """这单子来自他贴在对话框里的暗号，不是她想干活。
+
+        两条判据：他原话里出现过的**整行**暗号（模型照搬），以及他原话里用暗号语法
+        点过名的**同一个工具**（模型改了空格照样算）。他自己说「帮我同步一下」、
+        模型据此下单是正当行为——这里只挡机器的语法被搬运回来的那一种。
+        """
+        if not user_text:
+            return False
+        if directive.name.casefold() in {
+            item.name.casefold() for item in extract_directives(user_text)
+        }:
+            return True
+        return _flatten_line(directive.line) in _flatten_line(user_text)
+
+    @classmethod
     def _collect_calls(
-        mode: str, sink: dict[str, Any], ordered: list[Directive], registry: ToolRegistry
+        cls,
+        mode: str,
+        sink: dict[str, Any],
+        ordered: list[Directive],
+        registry: ToolRegistry,
+        echo_of: str = "",
     ) -> list[tuple[str, str, dict[str, Any]]]:
-        """把这一趟的下单整理成 (call_id, 工具名, 参数)。"""
+        """把这一趟的下单整理成 (call_id, 工具名, 参数)；复读来的单子不执行。"""
         if mode == "native" and sink.get("tool_calls"):
             calls: list[tuple[str, str, dict[str, Any]]] = []
             for call in sink["tool_calls"]:
@@ -582,10 +609,13 @@ class MySoulBot:
                 calls.append((str(call["id"] or f"call-{len(calls) + 1}"), str(call["name"]), args))
             return calls
         out: list[tuple[str, str, dict[str, Any]]] = []
-        for index, directive in enumerate(ordered, start=1):
+        for directive in ordered:
+            if cls._echoed_by_user(directive, echo_of):
+                logger.info("挡下来自对方原话的暗号复读：%s", directive.name)
+                continue
             tool = registry.resolve(directive.name)
             args = directive.args or (tool.from_bare(directive.raw_args) if tool else {})
-            out.append((f"inline-{index}", directive.name, dict(args)))
+            out.append((f"inline-{len(out) + 1}", directive.name, dict(args)))
         return out
 
     async def _run_tools(
