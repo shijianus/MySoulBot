@@ -193,7 +193,7 @@ def pairing_checks(check: Checker) -> None:
     made_p = d_perm.start(channel="cli", phrase="三点的水族箱")
     path = s_perm.pairing_dir / f"{made_p.id}.json"
     mode = path.stat().st_mode & 0o777
-    check.ok("挑战文件锁到 0600（口令与码在盘上不能给别人读）", mode == 0o600, oct(mode))
+    check.ok("挑战文件锁到 0600（口令与主密钥在盘上不能给别人读）", mode == 0o600, oct(mode))
     d_perm.void(made_p.id)
     check.ok("作废即删，不留一个废口令在盘上", not path.exists(), str(path))
 
@@ -239,7 +239,58 @@ def pairing_checks(check: Checker) -> None:
     c6 = d6.start(channel="cli", phrase="逆流的珊瑚")
     d6._save(dataclasses.replace(d6.get(c6.id), expires_at=time.time() - 1))
     check.ok("过期挑战不再算活跃", d6.active() is None)
+    check.ok("过期即从盘上抹掉（明文口令不留过夜）", not list(s6.pairing_dir.glob("PAIR-*.json")),
+             [f.name for f in s6.pairing_dir.glob("PAIR-*.json")])
     check.ok("过期后口令不截", ID.consume_pairing(d6, "逆流的珊瑚", source="cli") is None)
+
+    # 码绑人：同一场挑战，两个来源算出两个码——抄来的码在别人身上不成立
+    s_b = tier_settings(owner_enabled=True)
+    d_b = ID.PairingDesk(s_b)
+    made_b = d_b.start(channel="cli", phrase="灯塔留着那盏")
+    raw = json.loads((s_b.pairing_dir / f"{made_b.id}.json").read_text("utf8"))
+    check.ok("盘上没有现成的码可抄（只躺着一把主密钥）",
+             "code" not in raw and "code_hash" not in raw, sorted(raw))
+    mine = ID.derive_code(made_b.salt, challenge_id=made_b.id, key="qq_private|1937490685", chars=6)
+    theirs = ID.derive_code(made_b.salt, challenge_id=made_b.id, key="cli|anon", chars=6)
+    check.ok("两个来源两份码，互不通用", mine != theirs, f"{mine} vs {theirs}")
+    check.ok("同一来源每次算出同一串（码是函数，不是抽签）",
+             mine == ID.derive_code(made_b.salt, challenge_id=made_b.id,
+                                    key="qq_private|1937490685", chars=6), mine)
+    check.ok("派生的码也避开易混字符", not set(mine + theirs) & set("OI01"), mine + theirs)
+    ID.consume_pairing(d_b, "灯塔留着那盏", source="qq_private", qq="1937490685")
+    seen = d_b.plaintext_code(d_b.active())
+    check.ok("手机上看到的码，就是按那个号算出来的那一份", seen == mine, f"{seen} vs {mine}")
+    stolen = ID.consume_pairing(d_b, seen, source="cli")
+    check.ok("把这条码拿到别的来源去回填，不认",
+             stolen is not None and "不是报口令那一个号" in stolen, stolen)
+    check.ok("抄码未遂之后这场已经作废，没留半条活路", d_b.active() is None, "")
+
+    # 同一来源但码不对（他抄错了一位）：也是整场作废，不许试第二次
+    s_c = tier_settings(owner_enabled=True)
+    d_c = ID.PairingDesk(s_c)
+    d_c.start(channel="cli", phrase="夜潮涨到台阶")
+    ID.consume_pairing(d_c, "夜潮涨到台阶", source="cli")
+    wrong = ID.consume_pairing(d_c, "ZZZ-ZZZ", source="cli")
+    check.ok("码不对即整场作废", wrong and "码不对" in wrong, wrong)
+
+    # 一次只许有一场：旧挑战 shadow 新的是真实事故（对着不作数的口令白喊 120 秒）
+    s_d = tier_settings(owner_enabled=True)
+    d_d = ID.PairingDesk(s_d)
+    d_d.start(channel="cli", phrase="第一盏灯")
+    newer = d_d.start(channel="cli", phrase="第二盏灯")
+    check.ok("新发起的一场把旧的清干净",
+             d_d.active().id == newer.id
+             and [f.stem for f in s_d.pairing_dir.glob("PAIR-*.json")] == [newer.id],
+             [f.stem for f in s_d.pairing_dir.glob("PAIR-*.json")])
+    check.ok("旧口令从此不作数", ID.consume_pairing(d_d, "第一盏灯", source="cli") is None, "")
+    forced = dataclasses.replace(newer, id=f"PAIR-{int(time.time()) + 60}-zzzz", phrase="第三盏灯")
+    d_d._save(forced)          # 绕过发起这一步，硬造两张同时开着
+    picked = d_d.active()
+    check.ok("两张同时开着时认最新的那张", picked.id == forced.id and picked.phrase == "第三盏灯",
+             f"{picked.id} / {picked.phrase}")
+    check.ok("认最新的顺带把旧那张作废（盘上只剩一张）",
+             [f.stem for f in s_d.pairing_dir.glob("PAIR-*.json")] == [forced.id],
+             [f.stem for f in s_d.pairing_dir.glob("PAIR-*.json")])
 
     # 一个机器人只有一个管理者：换号顶替必须被拒
     s7 = tier_settings(owner_enabled=True, owner_qq="")
@@ -248,10 +299,10 @@ def pairing_checks(check: Checker) -> None:
     ID.consume_pairing(d7, "没写完的潜水钟", source="cli")
     c7 = d7.active()
     ID.consume_pairing(d7, d7.plaintext_code(c7), source="cli")
-    again = d7.start(channel="cli", phrase="赖床的深海灯")
+    d7.start(channel="cli", phrase="赖床的深海灯")
     ID.consume_pairing(d7, "赖床的深海灯", source="cli", qq="888888")
     c7 = d7.active()
-    blocked = ID.consume_pairing(d7, d7.plaintext_code(c7), source="cli")
+    blocked = ID.consume_pairing(d7, d7.plaintext_code(c7), source="cli", qq="888888")
     check.ok("已绑定时另一个号来顶替被拒", blocked and "已经绑过管理者" in blocked, blocked)
     check.ok("顶替失败后原绑定没变", ID.read_owner(s7).binding_key() == "cli|anon",
              ID.read_owner(s7).binding_key())

@@ -12,8 +12,10 @@
    从头再来：宁可让人多试一次，也不给「谁喊得响谁当主人」留缝。
 3. **群聊不配对。** 群里喊这句话的人可以有一百个，而且那头的真人并不知道自己
    被一个模型审核过。配对只认一对一的来源。
-4. **码只存哈希。** 明文码留在内存里、只活这一次挑战；落盘的是 HMAC。
-   2 分钟自动过期，答错即作废，没有半成品状态可续。
+4. **码是从「谁来认」算出来的，不是抽出来的。** 一场挑战只有一把主密钥，
+   回填码 = `HMAC(主密钥, 挑战 id | 来源 key)`：同一个来源每次算出同一个码，
+   不同来源算出不同的码。所以别人即使看见了这条码，从他那个来源也填不进来——
+   码本身就是身份的函数。主密钥以 0600 落盘（跨进程要能算），2 分钟过期即删。
 
 分层落到目录上就是两棵树：`storage/data/owner/` 与 `storage/data/users/`。
 交互者那条路径上的任何工具、检索、白名单都够不到另一棵——越界与否由路径本身决定，
@@ -44,7 +46,8 @@ logger: Final = logging.getLogger("mysoulbot.identity")
 
 __all__ = [
     "Tier", "Identity", "Challenge", "OwnerRecord", "PairingError", "PairingDesk",
-    "OWNER_USER_ID", "phrase_matches", "format_code", "consume_pairing",
+    "OWNER_USER_ID", "phrase_matches", "format_code", "derive_code", "candidate_key",
+    "consume_pairing",
     "owner_user_ids",
     "normalize_code", "read_owner", "resolve_identity", "unpair",
 ]
@@ -110,8 +113,22 @@ def format_code(raw: str) -> str:
     return f"{clean[:3]}-{clean[3:]}" if len(clean) > 3 else clean
 
 
-def _hash_code(code: str, salt: str) -> str:
-    return hmac.new(salt.encode("utf-8"), code.encode("utf-8"), hashlib.sha256).hexdigest()
+def candidate_key(source: str, qq: str = "") -> str:
+    """「哪一个来源在认」。空 qq 记成 anon，
+    这样「本机命令行上敲的」和「某个 QQ 号发进来的」天然是两个键。"""
+    return f"{source}|{str(qq or '').strip() or 'anon'}"
+
+
+def derive_code(secret: str, *, challenge_id: str, key: str, chars: int = 6) -> str:
+    """从「哪一个来源来认」算出这一场给他的码。
+
+    `_ALPHABET` 正好 32 个符号，一个字节的高 5 位刚好均匀落在上面——
+    不取模，就没有偏置。同一把主密钥、同一个来源，永远算出同一个码；
+    换一个来源就是另一个码，所以码抄不走。
+    """
+    digest = hmac.new(secret.encode("utf-8"), f"{challenge_id}|{key}".encode("utf-8"),
+                      hashlib.sha256).digest()
+    return "".join(_ALPHABET[byte >> 3] for byte in digest[:max(1, chars)])
 
 
 # ---------------------------------------------------------------- 身份判定
@@ -178,9 +195,9 @@ class OwnerRecord:
         return [str(item.get("source") or "") for item in self.history]
 
     def binding_key(self) -> str:
-        """当初是把管理者认作「哪个来源上的哪个号」。空 qq 记成 anon，
-        这样「本机命令行绑的」和「某个 QQ 号来认」天然是两个不同的键。"""
-        return f"{self.source}|{self.qq or 'anon'}"
+        """当初是把管理者认作「哪个来源上的哪个号」——与 `candidate_key` 同一个形状，
+        所以「CLI 上绑过的」和「某个 QQ 号来认」是两个键，顶替不了。"""
+        return candidate_key(self.source, self.qq)
 
 
 def read_owner(settings: Settings) -> OwnerRecord | None:
@@ -251,7 +268,7 @@ def consume_pairing(desk: "PairingDesk", text: str, *, source: str,
     # 不然她随便回一句「ABC-123」也可能把谁的话误当成码
     if challenge.stage == "unique" and _CODE_LIKE.fullmatch(body):
         try:
-            record = desk.submit_code(challenge, body, source=source)
+            record = desk.submit_code(challenge, body, source=source, qq=qq)
         except PairingError as exc:
             return f"✗ {exc}"
         # 招呼语不在这一层生成：安全模块不该依赖大模型调用。
@@ -264,18 +281,19 @@ def consume_pairing(desk: "PairingDesk", text: str, *, source: str,
 # ---------------------------------------------------------------- 挑战
 @dataclass
 class Challenge:
-    """一场配对。口令与回填码都以明文落盘，但文件权限锁到 0600。
+    """一场配对。口令与主密钥以明文落盘，但文件权限锁到 0600。
 
     为什么把明文写进文件而不是只留在内存：守护进程和 CLI 是**两个进程**，
     只活在内存里就意味着「CLI 发起、手机上回填」这条路永远走不通——
     而管理者真正会说话的地方就是他的手机。落盘 + 0600 + 2 分钟过期 +
     完成即删，换来的是跨进程可完成，代价是可控的。
+
+    盘上没有现成的码，只有算码的那把主密钥：读文件的人能为任意来源算出码，
+    但拿到聊天里那条码的人反过来推不出别的来源的码——抄来的码在别人身上不成立。
     """
 
     id: str = ""
     phrase: str = ""
-    code: str = ""
-    code_hash: str = ""
     salt: str = ""
     created_at: float = 0.0
     expires_at: float = 0.0
@@ -318,19 +336,18 @@ class PairingDesk:
 
     # ------------------------------------------------------------ 发起
     def start(self, *, channel: str = "cli", phrase: str = "") -> Challenge:
-        """人在控制台敲下配对命令才走到这里。`phrase` 是这一场现生成的口令。"""
-        current = self.active()
-        if current is not None:
-            self.void(current.id)
-        code = "".join(secrets.choice(_ALPHABET) for _ in range(self._settings.pairing_code_chars))
-        salt = secrets.token_hex(16)
+        """人在控制台敲下配对命令才走到这里。`phrase` 是这一场现生成的口令。
+
+        开新的之前把盘上**所有**还开着的都作废。只 void `active()` 那一张是不够的：
+        剩下一张会按文件名先被撞上，于是新配的口令对着旧算的码干活——
+        「一次只有一场」得由发起这一步保证，不能靠运气。
+        """
+        self.sweep()
         now = _now()
         challenge = Challenge(
             id=f"PAIR-{int(now)}-{secrets.token_hex(2)}",
             phrase=(phrase or "").strip(),
-            code=code,
-            code_hash=_hash_code(code, salt),
-            salt=salt,
+            salt=secrets.token_hex(16),
             created_at=now,
             expires_at=now + self._settings.pairing_ttl_seconds,
             channel=channel,
@@ -340,10 +357,15 @@ class PairingDesk:
         return challenge
 
     def plaintext_code(self, challenge: Challenge) -> str:
-        """把码念给控制台。唯一来源没确认之前，一个字都不给看。"""
+        """把码念给**这一个来源**。唯一来源没确认之前一个字都不给看；
+        确认之后给的也是按那一个来源算出来的码——换个人来认，就不是这串。"""
         if challenge.stage != "unique" or not challenge.alive():
             return ""
-        return challenge.code
+        key = challenge.source_key
+        if not key:
+            return ""
+        return derive_code(challenge.salt, challenge_id=challenge.id, key=key,
+                           chars=self._settings.pairing_code_chars)
 
     # ------------------------------------------------------------ 读写
     def _path(self, challenge_id: str) -> Path:
@@ -354,7 +376,7 @@ class PairingDesk:
         self.directory.mkdir(parents=True, exist_ok=True)
         path = self._path(challenge.id)
         atomic_write(path, json.dumps(asdict(challenge), ensure_ascii=False, indent=2) + "\n")
-        # 里面躺着这一场的口令与回填码：只许本人读写。
+        # 里面躺着这一场的口令与算码的主密钥：只许本人读写。
         # 原子写是先建临时文件再 rename，所以权限要在 rename 之后落到正式路径上。
         with contextlib.suppress(OSError):
             path.chmod(0o600)
@@ -374,19 +396,45 @@ class PairingDesk:
         challenge = self._load(challenge_id)
         if challenge is None:
             return None
-        if not challenge.alive() and challenge.open:
+        # `open` 里已经带了 alive()，所以「过期但仍算活跃」这个判断永远不成立，
+        # 过期的文件于是从来没被清过。这里比的是阶段：过期即删——
+        # 口令是明文写的，过期了还留在盘上，只是多一个可撞的东西
+        if not challenge.alive() and challenge.stage in _STAGE_OPEN:
             challenge.stage = "expired"
-            self._save(challenge)
+            with contextlib.suppress(OSError):
+                self._path(challenge_id).unlink()
         return challenge
 
     def active(self) -> Challenge | None:
+        """当前这一场。取**最新**的那张，其余还开着的一律作废。
+
+        按文件名升序取第一张是出过事故的：一张没人回填的旧挑战能活 120 秒，
+        足够把刚发起的那一场 shadow 掉——人对着一句已经不作数的口令白喊。
+        """
         if not self.directory.is_dir():
             return None
+        found: Challenge | None = None
+        for path in sorted(self.directory.glob("PAIR-*.json"), reverse=True):
+            challenge = self.get(path.stem)
+            if challenge is None or not challenge.open:
+                continue
+            if found is None:
+                found = challenge
+            else:
+                self.void(challenge.id)
+        return found
+
+    def sweep(self) -> int:
+        """清场：作废所有还开着的挑战（过期的由 `get()` 顺手抹掉）。返回清了几张。"""
+        if not self.directory.is_dir():
+            return 0
+        cleared = 0
         for path in sorted(self.directory.glob("PAIR-*.json")):
             challenge = self.get(path.stem)
             if challenge is not None and challenge.open:
-                return challenge
-        return None
+                self.void(challenge.id)
+                cleared += 1
+        return cleared
 
     def void(self, challenge_id: str) -> Challenge | None:
         challenge = self._load(challenge_id)
@@ -405,8 +453,7 @@ class PairingDesk:
         challenge = self.active()
         if challenge is None or group:
             return challenge
-        key = f"{source}|{qq or 'anon'}"
-        challenge.candidates.setdefault(key, _stamp())
+        challenge.candidates.setdefault(candidate_key(source, qq), _stamp())
         self._save(challenge)
         return challenge
 
@@ -423,7 +470,8 @@ class PairingDesk:
         return True, keys
 
     # ------------------------------------------------------------ 第二步：回填码
-    def submit_code(self, challenge: Challenge, code: str, *, source: str) -> OwnerRecord:
+    def submit_code(self, challenge: Challenge, code: str, *, source: str,
+                    qq: str = "") -> OwnerRecord:
         """码对了才升级成管理者。答错即作废，必须从头再来。"""
         if challenge.stage not in ("waiting", "unique"):
             raise PairingError("这场配对已经结束了，重新发起一次")
@@ -435,27 +483,33 @@ class PairingDesk:
         if not unique:
             raise PairingError(
                 f"报激活语的来源有 {len(keys)} 个，这场作废了"
-                if keys else "还没人报激活语，先说那句「你好溟汐，我是管理员」")
+                if keys else "还没人报激活语——控制台上的那句口令，原样发进来")
 
-        expected_source = keys[0].split("|", 1)[0]
-        if expected_source != source:
+        key = keys[0]
+        # 比的是**整把键**，不是只比通道名：同是 qq_private，换一个号就不是同一个人。
+        # 原来只比 `source` 前缀，等于「A 号报了口令，B 号抄到码就能认领」
+        if key != candidate_key(source, qq):
             self.void(challenge.id)
-            raise PairingError("回填码的来源和报激活语的不是同一个，作废重发")
+            raise PairingError("回填的不是报口令那一个号，这场作废了——从头再来")
 
         attempt = normalize_code(code)
         challenge.attempts += 1
-        right = bool(attempt) and hmac.compare_digest(challenge.code_hash, _hash_code(attempt, challenge.salt))
+        # 码是**按 key 算出来的**：只有当初报激活语的那一个来源算得出他这一份。
+        # 别人抄到这条码，从他自己的来源回填也对不上
+        expected = derive_code(challenge.salt, challenge_id=challenge.id, key=key,
+                               chars=self._settings.pairing_code_chars)
+        right = bool(attempt) and hmac.compare_digest(expected, attempt)
         if not right:
             self.void(challenge.id)
             raise PairingError("码不对，这场作废了——从头再来")
 
         record = read_owner(self._settings) or OwnerRecord()
-        qq = keys[0].partition("|")[2]
+        qq = key.partition("|")[2]
         qq = "" if qq == "anon" else qq
         # 「一个机器人只有一个管理者」要比来源，不能只比 QQ 号：
         # 先在本机命令行上绑过（qq 为空）再拿某个 QQ 号来，是同一场顶替——
         # 只查 `record.qq` 的话那条判断永远不成立，等于没闸。
-        claimed = keys[0]
+        claimed = key
         if record.paired_at and record.binding_key() != claimed:
             raise PairingError(f"已经绑过管理者（{record.binding_key()}）。一个机器人只有一个，"
                                "要换先在命令行上解绑")

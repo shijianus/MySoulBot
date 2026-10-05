@@ -450,7 +450,8 @@ class App:
         current = self.pairing.active()
         if current is not None and current.stage == "unique":
             code = self.pairing.plaintext_code(current)
-            self.ui.line(f"配对进行中：唯一来源 {current.source_key}，回填码 {format_code(code)}")
+            self.ui.line(f"配对进行中：唯一来源 {current.source_key}，他那份回填码 {format_code(code)}")
+            self.ui.line(f"  （码是按来源算的：{current.source_key} 回填才对得上，别人的号填不进来）")
             self.ui.line(f"  （这一场的口令是「{current.phrase}」，{current.seconds_left()} 秒后作废）")
             return True
         if current is not None:
@@ -470,7 +471,8 @@ class App:
         self.ui.line(f"  下一步：把下面这句当**普通消息**发进来（一次生成，只此一场）")
         self.ui.line(f"    【{challenge.phrase}】")
         self.ui.line(f"  来源必须唯一：同一时间只让一个通道在配（当前 {challenge.channel}）")
-        self.ui.line("  也可以从他手机上完成：同一句口令发进私聊即可，回填码在手机上回。")
+        self.ui.line("  也可以从他手机上完成：同一句口令发进私聊即可，回填码会直接回到那个号。")
+        self.ui.line("  回填码是**按报口令的那个号算出来的**：换个号来填，填不进这一场。")
         return True
 
     async def _sync(self, arg: str) -> bool:

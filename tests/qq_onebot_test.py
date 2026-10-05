@@ -3080,6 +3080,100 @@ async def server_checks(check: Checker) -> None:
         shutil.rmtree(root_bad, ignore_errors=True)
 
 
+# ---------------------------------------------------------------- 11. 配对握手（真 socket）
+async def pairing_checks(check: Checker) -> None:
+    """管理者配对走网桥那一路：口令进来、**码真发得出去**、回填后他先被招呼一句。
+
+    这里验的就是那次事故本身：回填码长成 `JKH-5FL` 那个形状，出站那道锁把这个
+    形状整个吃掉，于是手机上永远等不到码。锁该拦的是模型把秘密说出去，
+    不是安全模块自己发出去的回执。
+    """
+    from core.identity import PairingDesk, candidate_key, derive_code, format_code, read_owner
+
+    rig = Rig(owner_enabled=True)
+    port = await rig.start()
+    desk = PairingDesk(rig.settings)
+    phrase = "塔尖那点光还没灭"
+    admin = 1937490685
+    stranger = 20002
+
+    def _exchange(steps: list[tuple[str, int, int]]) -> list[list[dict[str, Any]]]:
+        """一条连接上走几步：[(文本, 谁的 qq, 消息 id)]，每一步收回来的动作。"""
+        client = QQ(port, timeout=30.0)
+        try:
+            client.handshake("qq-test-token")
+            out: list[list[dict[str, Any]]] = []
+            for text, who, mid in steps:
+                client.event(**private_event(text, user_id=who, message_id=mid))
+                out.append(client.pump(15.0))
+            return out
+        finally:
+            client.closes()
+
+    try:
+        reset_model()
+        quiet_before = model_calls()
+        challenge = desk.start(channel="cli", phrase=phrase)
+        code = derive_code(challenge.salt, challenge_id=challenge.id,
+                           key=candidate_key("qq_private", str(admin)), chars=6)
+        first, second = await asyncio.to_thread(
+            _exchange, [(phrase, admin, 9001), (phrase, stranger, 9002)])
+        joined = "\n".join(texts(first))
+        check.ok("口令从私聊被截走，回执里的码原样到了手机上",
+                 "唯一来源确认" in joined and format_code(code) in joined, joined)
+        check.ok("回执没被出站的锁吃掉（这条就是那次事故）",
+                 "已上锁" not in joined and "〔" not in joined, joined)
+        check.ok("认领这两句一个字都没送进模型", model_calls() == quiet_before,
+                 f"{quiet_before} -> {model_calls()}")
+        check.ok("第二个号来报口令，整场作废（唯一来源这条不是摆设）",
+                 "作废" in "\n".join(texts(second)), texts(second))
+        check.ok("作废后挑战文件从盘上没了",
+                 not list(rig.settings.pairing_dir.glob("PAIR-*.json")),
+                 [f.name for f in rig.settings.pairing_dir.glob("PAIR-*.json")])
+
+        # 同一场里两个号两份码：抄来的那份在别人身上不成立
+        challenge = desk.start(channel="cli", phrase=phrase)
+        mine = derive_code(challenge.salt, challenge_id=challenge.id,
+                           key=candidate_key("qq_private", str(admin)), chars=6)
+        theirs = derive_code(challenge.salt, challenge_id=challenge.id,
+                             key=candidate_key("qq_private", str(stranger)), chars=6)
+        check.ok("同一场里两个号两份码，抄来的不通用", mine != theirs, f"{mine} vs {theirs}")
+        got, hijack = await asyncio.to_thread(
+            _exchange, [(phrase, admin, 9003), (format_code(theirs), stranger, 9004)])
+        check.ok("只有他那一个号看得到他那一份码",
+                 format_code(mine) in "\n".join(texts(got)), texts(got))
+        check.ok("别人拿自己的那份码来插这一场，插不进来",
+                 "配对完成" not in "\n".join(texts(hijack)), texts(hijack))
+        check.ok("插进来失败的这一场已经作废，没留半条活路",
+                 not list(rig.settings.pairing_dir.glob("PAIR-*.json")),
+                 [f.name for f in rig.settings.pairing_dir.glob("PAIR-*.json")])
+
+        # 管理者自己回填：码对了才成，成完之后先招呼一句
+        challenge = desk.start(channel="cli", phrase=phrase)
+        mine = derive_code(challenge.salt, challenge_id=challenge.id,
+                           key=candidate_key("qq_private", str(admin)), chars=6)
+        first, done = await asyncio.to_thread(                      # 空格与大小写都不算输错
+            _exchange, [(phrase, admin, 9005), (f"{mine[:3]} {mine[3:]}".lower(), admin, 9006)])
+        lines = texts(done)
+        check.ok("管理者回填自己那份码，配对完成",
+                 any("配对完成" in line for line in lines), lines)
+        check.ok("配完之后主动招呼了一句（回执之外还有别的气泡）",
+                 len([line for line in lines if "配对完成" not in line]) >= 1, lines)
+        record = read_owner(rig.settings)
+        check.ok("落盘的管理者就是他那个号", record is not None and record.qq == str(admin),
+                 record.binding_key() if record else None)
+        check.ok("配对结束后挑战文件被删（不在盘上留凭据）",
+                 not list(rig.settings.pairing_dir.glob("PAIR-*.json")),
+                 [f.name for f in rig.settings.pairing_dir.glob("PAIR-*.json")])
+        chat_before = model_calls()
+        chatted = await asyncio.to_thread(_exchange, [("今天吃米饭", admin, 9007)])
+        flat = [frame for round_ in chatted for frame in round_]
+        check.ok("配完之后他说的话正常进对话（不再被截走）",
+                 model_calls() == chat_before + 1 and one_turn(flat),
+                 f"{chat_before} -> {model_calls()} / {texts(flat)}")
+    finally:
+        await rig.stop()
+
 # ---------------------------------------------------------------- 主流程
 async def main() -> int:
     global ORIGIN
@@ -3118,6 +3212,7 @@ async def main() -> int:
         await group_tier_checks(check)
         await hedge_checks(check)
         await delivery_checks(check)
+        await pairing_checks(check)
         await server_checks(check)
     finally:
         fake.shutdown()

@@ -1763,7 +1763,8 @@ class OneBotBridge:
         if note is not None:
             self._bump("paired_handled")
             logger.info("配对握手（%s）：%s", inbound.sender_id, note.splitlines()[0])
-            await self._send_bubble(connection, inbound, note)
+            # 回执锁外放行：回填码就长在那个形状上，锁不认识「这是发给机器主人的回执」
+            await self._send_bubble(connection, inbound, note, lock=False)
             if "配对完成" in note:
                 # 认出来之后先打招呼，再报她能干什么——这是「我认出你了」的实测证据。
                 # 话是现生成的，不是模板；生成不出来就随机取一句人话兜底。
@@ -2261,14 +2262,19 @@ class OneBotBridge:
         self._bump("typing_miss")
         return False
 
-    def _outbound_filter(self, piece: str) -> str:
+    def _outbound_filter(self, piece: str, *, lock: bool = True) -> str:
         """出站统一闸口：擦舞台提示 → 洗 markdown → 缴械假 CQ 码 → **上锁**。
 
         锁放在这一层而不是只写在提示词里，是因为提示词能被绕、这道不能：
         她现在能向一群好友公开广播，「模型自觉不说不该说的」不再是足够保证。
+
+        `lock=False` 只给配对握手用：那条回执里必须出现回填码，而锁把
+        「三位-三位」这个形状整个吃掉——真实事故：手机上永远收不到码，
+        日志里躺着一条 `block/pairing_code`。放行的是**这段话的来源**而不是内容：
+        回执整句由 core/identity 拼出来，没有一个字来自模型。
         """
         cleaned = neutralize_cq(strip_stage_directions(piece)).strip()
-        if self._settings.secrecy_guard_enabled:
+        if lock and self._settings.secrecy_guard_enabled:
             guarded, findings = guard_secrecy(cleaned)
             if findings:
                 self._bump("secrecy_hits")
@@ -2278,9 +2284,10 @@ class OneBotBridge:
             cleaned = guarded
         return cleaned
 
-    async def _send_bubble(self, connection: _Connection, inbound: Inbound, piece: str) -> bool:
+    async def _send_bubble(self, connection: _Connection, inbound: Inbound, piece: str,
+                           *, lock: bool = True) -> bool:
         """发一条气泡：先擦小说腔动作（红线），再洗掉 markdown，再缴械假 CQ 码，最后换表情图。"""
-        cleaned = self._outbound_filter(piece).strip()
+        cleaned = self._outbound_filter(piece, lock=lock).strip()
         if self._settings.reply_plain_text:
             cleaned = plain_text(cleaned)
         if self._settings.onebot_emoji_enabled:
