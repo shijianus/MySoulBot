@@ -34,8 +34,9 @@ _ALIASES: Final[dict[str, str]] = {
     "说胖": "fat", "大肥鱼": "fat", "被说胖": "fat", "破防": "fat",
     "不是鱼": "notfish", "我不是鱼": "notfish", "否认": "notfish",
     "卖惨": "sea", "认怂": "sea", "求放过": "sea",
-    "想想": "think", "思考": "think", "让我想想": "think",
-    "睡了": "sleep", "睡觉": "sleep", "下线": "sleep", "晚安": "sleep",
+    "想想": "think", "思考": "think", "让我想想": "think", "在想": "think", "琢磨": "think",
+    "睡了": "sleep", "睡觉": "sleep", "下线": "sleep", "晚安": "sleep", "困": "sleep",
+    "困了": "sleep", "犯困": "sleep", "哈欠": "sleep",
     "行吧": "ok", "收到": "ok", "勉强": "ok", "敷衍": "ok",
 }
 

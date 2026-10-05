@@ -263,6 +263,10 @@ class MySoulBot:
             qq=self.qq,
         )
 
+    def bind_vector_index(self, index: Any) -> None:  # noqa: ANN401 - VectorIndex
+        """把检索端接到同一份索引上。没绑就是按最近 N 条取记忆——旧行为，不是坏了。"""
+        self._prompts.bind_vector(index)
+
     def bind_qq_port(self, port: Any) -> None:  # noqa: ANN401 - OneBotBridge，引它会循环
         """把网桥交给引擎，账号级工具才有手可以伸。
 

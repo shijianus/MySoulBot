@@ -61,6 +61,7 @@ from core.storage_manager import (
     parse_facts,
 )
 from core.sync import run_sync
+from core.vector_index import VectorIndex
 from core.vision import find_sources
 
 logger: Final = logging.getLogger("mysoulbot.cli")
@@ -227,8 +228,13 @@ class App:
         self.clawd = ClawdSoul(settings)
         self.prompts = PromptBuilder(settings, self.storage, self.clawd)
         self.library = PersonaLibrary(settings)
-        self.extractor = MemoryExtractor(settings, self.storage, on_outcome=self._on_outcome)
+        # 一份向量索引，写入端（抽取器）和检索端（提示词装配）共用：
+        # 两边各开一个就会出现「写了但查的是另一个库」这种丢召回
+        self.vector = VectorIndex(settings)
+        self.extractor = MemoryExtractor(settings, self.storage, on_outcome=self._on_outcome,
+                                         index=self.vector)
         self.bot = MySoulBot(settings, self.storage, self.prompts, self.extractor, self.library, self.clawd)
+        self.prompts.bind_vector(self.vector)
         # 配对台账：只有人在命令行上敲 /pair 才会开挑战，她没有任何路径能自己开
         self.pairing = PairingDesk(settings)
         self._quiet_events: list[str] = []  # 后台抽取完成的通知，只进 /panel log，不打扰对话

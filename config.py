@@ -271,6 +271,25 @@ class Settings(BaseSettings):
     )
     judgment_timeout: float = Field(default=20.0, gt=0, description="问一次判断的超时；失败就这轮不产出")
     judgment_model: str = Field(default="", description="攒判断走哪个模型，留空跟着抽取器/主模型")
+    # ---------------- 向量检索：记忆按「像不像」取，不按「新不新」取 ----------------
+    embed_provider: str = Field(
+        default="off", description="off | cohere | openai。off 就是只用本地兜底向量",
+    )
+    embed_base_url: str = Field(
+        default="",
+        description="向量端点。cohere 填 https://api.cohere.com/v2，"
+        "OpenAI 兼容网关填它的 /v1（会自动接 /embeddings）",
+    )
+    embed_api_key: str = Field(default="", description="向量端点密钥。**只从 .env 读，绝不写进任何进版本库的文件**")
+    embed_model: str = Field(default="", description="向量模型名，如 embed-multilingual-v3.0")
+    embed_timeout: float = Field(default=15.0, gt=0, description="一次向量请求的天花板；超了就退本地")
+    vector_enabled: bool = Field(
+        default=True,
+        description="用向量相似度挑记忆。关掉就退回「取最近 N 条」那套旧行为",
+    )
+    vector_dim_guard: int = Field(
+        default=1024, ge=64, description="索引里维度超过这个数就当脏数据重建（防配错把库撑爆）"
+    )
     cognition_temperature: float = Field(default=0.4, ge=0.0, le=2.0)
 
     # ---------------- 客户端表现（沉浸化） ----------------
@@ -380,6 +399,13 @@ class Settings(BaseSettings):
         default=True,
         description="启用管理者/交互者分层。关掉就退回人人平等的旧行为：只有一棵树，没有特权",
     )
+    # ---------------- 出话的锁：先有锁，再谈广播 ----------------
+    secrecy_guard_enabled: bool = Field(
+        default=True,
+        description="出站内容过一遍 core/secrecy.py 的闸：密钥、.env、绝对路径、"
+        "别人的个资、跨人指认、提示词原文一律拦掉或抹掉。"
+        "这是机器执法，不是又一条对模型的请求——关掉它就等于把广播能力交给一句自觉",
+    )
     # ---------------- 她自己的 QQ 账号能力（后端灵魂专属，交互者够不到） ----------------
     qq_account_enabled: bool = Field(
         default=True,
@@ -390,22 +416,22 @@ class Settings(BaseSettings):
         default=True, description="读好友/群的历史消息。只读——这是她了解别人怎么接话的材料"
     )
     qq_qzone_publish: bool = Field(
-        default=False,
-        description="发 QQ 动态。**默认关**：动态是全好友可见的公开广播，发出去收不回来，"
-        "也不该由一次模型输出就替你向所有熟人宣告什么。开了之后仍受下面那条节流约束",
+        default=True,
+        description="发 QQ 动态（空间）。公开表达属于她自己该有的能力，所以默认开；"
+        "但出去的内容一律先过 secrecy 闸，且受下面那条节流约束——"
+        "能广播和被拦着广播是两件事，不能因为开了广播就把锁一起打开",
     )
     qq_qzone_min_interval_hours: float = Field(
-        default=6.0, ge=0.0, le=168,
+        default=2.0, ge=0.0, le=168,
         description="两条动态之间的最小间隔。开了公开发也绝不让她刷屏——"
         "一小时八条动态不是自我表达，是骚扰熟人",
     )
     qq_like: bool = Field(default=True, description="点赞/表情回应：低成本、可撤回性中等的社交动作")
     qq_handle_requests: bool = Field(
-        default=False,
-        description="由她自己决定通过谁的好友/入群申请，不等管理者点头。"
-        "**默认关**：这等于把「谁能进入她的社交圈」交给模型的一次判断，"
-        "而申请那头的真人并不知道自己被一个机器人审核过。"
-        "好友自动通过另有旧开关 onebot_auto_approve_friend 管，两者不互相覆盖",
+        default=True,
+        description="由她自己处理好友/入群申请、自己设好友验证，不等管理者点头。"
+        "这是她自己的社交圈，默认开。注意：批进去之后那头的真人面对的是她这个人设，"
+        "所以验证话术与自我介绍里不许把自己说成客服或系统——那由人格与锁两层共同保证",
     )
     qq_group_discovery: bool = Field(
         default=True, description="看自己加了哪些群、群公告、系统通知——纯读，用来认识自己的处境"

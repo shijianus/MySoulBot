@@ -192,7 +192,8 @@ def pairing_checks(check: Checker) -> None:
 # ---------------------------------------------------------------- 3. 账号能力放行
 def account_gate_checks(check: Checker) -> None:
     qq_names = {"qq_roster", "qq_read_history", "qq_like", "qq_publish_qzone",
-                "qq_requests", "qq_decide_request", "qq_channels"}
+                "qq_delete_qzone", "qq_requests", "qq_decide_request",
+                "qq_group_verify", "qq_channels"}
     s = tier_settings(qq_qzone_publish=True, qq_handle_requests=True, qq_channel_enabled=True)
     owner = ToolRegistry(ctx_for(s, OWNER_USER_ID, owner=True))
     inter = ToolRegistry(ctx_for(s, "qq_private_5", owner=False))
@@ -207,12 +208,18 @@ def account_gate_checks(check: Checker) -> None:
     check.ok("总闸关掉后账号工具全灭", not (qq_names & set(ToolRegistry(ctx_for(off, OWNER_USER_ID, owner=True)).names)),
              sorted(qq_names & set(ToolRegistry(ctx_for(off, OWNER_USER_ID, owner=True)).names)))
 
+    # 公开表达与自处理申请现在是默认开的（她要的就是这个）；
+    # 真正必须默认成立的是「开广播的同时锁也在」，以及频道那条不骗人
     dflt = tier_settings()
     dn = set(ToolRegistry(ctx_for(dflt, OWNER_USER_ID, owner=True)).names)
-    check.ok("默认只放开读类与点赞，公开发默认关",
-             {"qq_roster", "qq_read_history", "qq_like"} <= dn
-             and not ({"qq_publish_qzone", "qq_requests", "qq_decide_request", "qq_channels"} & dn),
-             sorted(dn & qq_names))
+    check.ok("默认放开公开表达、撤动态与自己处理申请",
+             {"qq_roster", "qq_read_history", "qq_like", "qq_publish_qzone", "qq_delete_qzone",
+              "qq_requests", "qq_decide_request", "qq_group_verify"} <= dn,
+             sorted(qq_names - dn))
+    check.ok("频道仍默认关（协议端根本写不动，不假装能）", "qq_channels" not in dn, sorted(dn & qq_names))
+    check.ok("开广播的同时出话的锁默认在", dflt.secrecy_guard_enabled is True, "")
+    check.ok("动态仍带节流，不是开了就随便刷屏", dflt.qq_qzone_min_interval_hours > 0,
+             dflt.qq_qzone_min_interval_hours)
 
 
 async def account_behavior_checks(check: Checker) -> None:

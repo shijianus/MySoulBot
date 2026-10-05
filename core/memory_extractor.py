@@ -119,10 +119,14 @@ class MemoryExtractor:
         storage: StorageManager,
         *,
         on_outcome: OutcomeCallback | None = None,
+        index: Any = None,  # noqa: ANN401 - core.vector_index.VectorIndex，引它会绕循环
     ) -> None:
         self._settings = settings
         self._storage = storage
         self._on_outcome = on_outcome
+        # 向量索引：新记下来的事顺手进索引，下次这句才勾得起它。
+        # 它是加速器——传不进、写失败都不许影响记忆本身落盘。
+        self._index = index
         self._client: AsyncOpenAI | None = None
         self._queue: asyncio.Queue[tuple[str, list[Message], dt.date]] = asyncio.Queue(
             maxsize=QUEUE_LIMIT
@@ -291,6 +295,7 @@ class MemoryExtractor:
                 if dynamics and self._settings.reflection_enabled
                 else []
             )
+            await self._index_writes(user_id, outcome, today)
         except Exception as exc:  # noqa: BLE001 - 写盘失败不影响对话
             self._stats["failed"] += 1
             outcome.error = f"写入记忆失败：{type(exc).__name__}: {exc}"
@@ -307,6 +312,25 @@ class MemoryExtractor:
         return outcome
 
     # ------------------------------------------------------------ LLM
+    async def _index_writes(self, user_id: str, outcome: ExtractionOutcome,
+                            today: dt.date) -> None:
+        """把这一轮真正落盘的记忆喂进向量索引。
+
+        失败只是「下次这句勾不起它」，不是记忆丢了——md 文件才是真相来源，
+        索引只是那条让人想起东西的路。所以这里吞掉一切异常，绝不带崩抽取。
+        """
+        index = getattr(self, "_index", None)
+        if index is None or not getattr(index, "enabled", False):
+            return
+        day = today.isoformat()
+        try:
+            if outcome.facts:
+                await index.upsert(user_id, "fact", [(day, text) for text in outcome.facts])
+            if outcome.dynamics:
+                await index.upsert(user_id, "relation", [(day, text) for text in outcome.dynamics])
+        except Exception as exc:  # noqa: BLE001 - 加速器坏了不许连累记忆写入
+            logger.debug("记忆进向量索引失败（忽略）：%s", exc)
+
     def _get_client(self) -> AsyncOpenAI:
         if self._client is None:
             api_key, base_url = self._settings.extractor_credentials()

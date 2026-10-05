@@ -46,6 +46,7 @@ from urllib.parse import parse_qs, unquote, urlparse
 from config import PROJECT_ROOT, Settings
 from core.bot import BotError, MySoulBot
 from core.identity import PairingDesk, consume_pairing
+from core.secrecy import Leak, guard as guard_secrecy
 from core.stickers import StickerBook
 from core.storage_manager import PathSafetyError
 from core.tools.protocol import trim_stock_closer
@@ -2237,9 +2238,26 @@ class OneBotBridge:
         self._bump("typing_miss")
         return False
 
+    def _outbound_filter(self, piece: str) -> str:
+        """出站统一闸口：擦舞台提示 → 洗 markdown → 缴械假 CQ 码 → **上锁**。
+
+        锁放在这一层而不是只写在提示词里，是因为提示词能被绕、这道不能：
+        她现在能向一群好友公开广播，「模型自觉不说不该说的」不再是足够保证。
+        """
+        cleaned = neutralize_cq(strip_stage_directions(piece)).strip()
+        if self._settings.secrecy_guard_enabled:
+            guarded, findings = guard_secrecy(cleaned)
+            if findings:
+                self._bump("secrecy_hits")
+                worst = max(findings, key=lambda f: list(Leak).index(f.action))
+                logger.warning("出站内容被锁拦下（%s/%s）：%s",
+                               worst.action.value, worst.rule, worst.matched[:70])
+            cleaned = guarded
+        return cleaned
+
     async def _send_bubble(self, connection: _Connection, inbound: Inbound, piece: str) -> bool:
         """发一条气泡：先擦小说腔动作（红线），再洗掉 markdown，再缴械假 CQ 码，最后换表情图。"""
-        cleaned = neutralize_cq(strip_stage_directions(piece)).strip()
+        cleaned = self._outbound_filter(piece).strip()
         if self._settings.reply_plain_text:
             cleaned = plain_text(cleaned)
         if self._settings.onebot_emoji_enabled:
@@ -2270,7 +2288,7 @@ class OneBotBridge:
 
     async def _deliver(self, connection: _Connection, inbound: Inbound, text: str) -> None:
         """整段投递：非流式调用方走这条，与流式共用同一套发气泡规则。"""
-        cleaned = neutralize_cq(strip_stage_directions(text))
+        cleaned = self._outbound_filter(text)
         if self._settings.onebot_bubble_enabled:
             pieces = split_bubbles(
                 cleaned,

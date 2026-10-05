@@ -54,6 +54,7 @@ from core.memory_extractor import MemoryExtractor
 from core.prompt_builder import PromptBuilder
 from core.storage_manager import PathSafetyError, StorageManager
 from core.tools.voice import VoiceError, audio_sniff, provider_of, synthesize
+from core.vector_index import VectorIndex
 from core.vision import sniff
 
 logger: Final = logging.getLogger("mysoulbot.server")
@@ -108,7 +109,9 @@ class SoulServer:
         self.clawd = ClawdSoul(settings)
         self.prompts = PromptBuilder(settings, self.storage, self.clawd)
         self.library = PersonaLibrary(settings)
-        self.extractor = MemoryExtractor(settings, self.storage)
+        # 一份索引，写入端与检索端共用（外部传进 bot 时也走这条，不各开一个库）
+        self.vector_index = VectorIndex(settings)
+        self.extractor = MemoryExtractor(settings, self.storage, index=self.vector_index)
         self.bot = bot or MySoulBot(
             settings, self.storage, self.prompts, self.extractor, self.library, self.clawd
         )
@@ -144,6 +147,9 @@ class SoulServer:
             self.onebot = bridge
             # 把网桥交给引擎：账号级工具（翻记录/发动态/点赞）才有手可以伸
             self.bot.bind_qq_port(bridge)
+            # 检索端接同一份索引：写入端（抽取器）和读取端（提示词装配）
+            # 各开一个库就会出现「写了但查的是另一个」这种丢召回
+            self.bot.bind_vector_index(self.vector_index)
             logger.info("QQ 网桥已就绪：协议端反向连 ws://%s:%s", qq_host, qq_port)
         return str(bound[0]), int(bound[1])
 

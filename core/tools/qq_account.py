@@ -19,17 +19,24 @@
 from __future__ import annotations
 
 import json
+import logging
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Final
 
+from core.secrecy import Leak, guard as guard_secrecy
 from core.storage_manager import atomic_write
 from core.tools.base import Tool, ToolContext, ToolParam, ToolResult
 
 # 一条记录里最多念给她看多少条消息：够判断「这人平时怎么接话」，不够她把通讯录抄走
 _HISTORY_CAP: Final[int] = 40
+# 协议端 add_type 的取值：0=默认(需审批) 1=不需同意 2=回答问题 3=邀请 4=邀请+管理员审
+# 这里只暴露她真能用得上、且语义明确的三种，别把五个数字原样丢给模型去猜
+_ADD_TYPES: Final[dict[str, int]] = {"need": 0, "answer": 2, "deny": 3, "ok": 1}
 _ROSTER_CAP: Final[int] = 60
+
+logger = logging.getLogger("mysoulbot.tools.qq_account")
 
 
 def _qq_gate(ctx: ToolContext, switch: str) -> bool:
@@ -43,6 +50,22 @@ async def _call(ctx: ToolContext, action: str, params: dict[str, Any]) -> tuple[
     if port is None:
         return None, "QQ 那头的通道没开"
     return await port.account_call(action, params)
+
+
+def _locked(ctx: ToolContext, text: str) -> tuple[str, str]:
+    """广播出去的每一句先过锁。
+
+    动态和入群验证话术**不走**网桥那条气泡口，所以那边上的锁管不到它们——
+    这两条路必须自己过一遍，否则「开了广播却漏了锁」就是这么发生的。
+    返回（能发的那句, 拦下说明）。拦到空就交回空串，让调用方干脆不发。
+    """
+    if not ctx.settings.secrecy_guard_enabled:
+        return text, ""
+    guarded, findings = guard_secrecy(text)
+    if not findings:
+        return guarded, ""
+    worst = max(findings, key=lambda f: [Leak.BLOCK, Leak.SCRUB, Leak.WATCH].index(f.action))
+    return guarded, f"{worst.action.value}/{worst.rule}"
 
 
 def _as_list(data: Any) -> list[dict[str, Any]]:
@@ -217,6 +240,12 @@ class QQPublishQZone(Tool):
             return ToolResult.failure(
                 f"上一条动态才过了 {(int(wait) // 60)} 分钟，节流中",
                 say=f"（刚发过一条，{int(wait // 3600)} 小时后再说。天天刷动态是营销号。）")
+        content, hit = _locked(ctx, content)
+        if not content.strip():
+            return ToolResult.failure("这条动态整句都是不该公开的内容，被锁拦下了",
+                                      say="（这条我忍住了没发——里头有不该对所有人说的话。）")
+        if hit:
+            logger.info("动态内容出站前被锁改过：%s", hit)
         if len(content) > 500:
             content = content[:500]
         data, err = await _call(ctx, "send_qzone_msg",
@@ -295,6 +324,76 @@ class QQDecideRequest(Tool):
         return ToolResult.success(f"{'批了' if approve else '拒了'}一条申请。")
 
 
+class QQDeleteQZone(Tool):
+    name = "qq_delete_qzone"
+    description = "撤掉自己发过的一条 QQ 空间动态（tid 从发动态那次的返回里拿）。"
+    hint = "能删自己发过的动态"
+    params = (ToolParam("tid", "string", "要撤掉的那条动态 id"),)
+    primary_arg = "tid"
+    sensitive = True
+
+    def available(self, ctx: ToolContext) -> bool:
+        return _qq_gate(ctx, "qq_qzone_publish")
+
+    async def run(self, ctx: ToolContext, args: dict[str, Any]) -> ToolResult:
+        tid = str(args.get("tid") or "").strip()
+        if not tid:
+            return ToolResult.failure("没给 tid", say="（要撤哪条，得先有那条的编号。）")
+        _, err = await _call(ctx, "delete_qzone_msg", {"tid": tid})
+        if err:
+            return ToolResult.failure(err, say="（这条没撤掉，就说没弄动。）")
+        return ToolResult.success(f"撤掉了那条动态（{tid}）。")
+
+
+class QQGroupVerify(Tool):
+    name = "qq_group_verify"
+    description = (
+        "设置自己群里的入群验证：要不要审批、问什么问题、答案是什么。"
+        "这是把「谁能进我的地盘」的规则交给你自己定，不是替别人定。"
+    )
+    hint = "能设入群验证"
+    params = (
+        ToolParam("group_id", "string", "群号"),
+        ToolParam("mode", "string", "need=要审批 / deny=不让加 / ok=随便加"),
+        ToolParam("question", "string", "验证问题，留空表示不设问题", required=False),
+        ToolParam("answer", "string", "问题答案", required=False),
+    )
+    primary_arg = "group_id"
+    sensitive = True
+
+    def available(self, ctx: ToolContext) -> bool:
+        return _qq_gate(ctx, "qq_handle_requests")
+
+    async def run(self, ctx: ToolContext, args: dict[str, Any]) -> ToolResult:
+        group = str(args.get("group_id") or "").strip()
+        mode = str(args.get("mode") or "").strip().lower()
+        if not group.isdigit() or mode not in ("need", "deny", "ok"):
+            return ToolResult.failure("群号或模式不对",
+                                      say="（要说清哪个群、要改成哪种：要审批、不让加、还是随便加。）")
+        question = str(args.get("question") or "").strip()
+        answer = str(args.get("answer") or "").strip()
+        # 验证话术是**公开给陌生人的**，比动态更要过锁：它等于替她向门口排队的人说话
+        for label, value in (("问题", question), ("答案", answer)):
+            locked, hit = _locked(ctx, value)
+            if hit and label == "问题":
+                logger.info("入群验证%s被锁改过：%s", label, hit)
+            if label == "问题":
+                question = locked
+            else:
+                answer = locked
+        params: dict[str, Any] = {"group_id": int(group), "add_type": _ADD_TYPES[mode]}
+        if question:
+            params["question"] = question[:60]
+        if answer:
+            params["answer"] = answer[:60]
+        _, err = await _call(ctx, "set_group_add_option", params)
+        if err:
+            return ToolResult.failure(err, say="（这个验证没改成，就说没弄动。）")
+        word = {"need": "要审批", "deny": "不允许加群", "ok": "谁都能加"}[mode]
+        return ToolResult.success(f"群 {group} 的入群验证改成了「{word}」"
+                                  + (f"，问题：{question}" if question else ""))
+
+
 class QQChannels(Tool):
     name = "qq_channels"
     description = (
@@ -350,5 +449,6 @@ def _mark_qzone_sent(ctx: ToolContext) -> None:
 
 
 ACCOUNT_TOOLS: Final[tuple[type[Tool], ...]] = (
-    QQRoster, QQReadHistory, QQLike, QQPublishQZone, QQRequests, QQDecideRequest, QQChannels,
+    QQRoster, QQReadHistory, QQLike, QQPublishQZone, QQDeleteQZone, QQRequests,
+    QQDecideRequest, QQGroupVerify, QQChannels,
 )
