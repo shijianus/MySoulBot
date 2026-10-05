@@ -18,6 +18,9 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 PROJECT_ROOT = Path(__file__).resolve().parent
 RUNTIME_LOG: str = "runtime.log"
 RUNTIME_LOG_MAX_BYTES: int = 2_000_000
+# 引擎侧管理者的固定 user_id。放这儿是因为 storage_manager 与 identity 都要用，
+# 从对方那边引会绕成循环导入。
+OWNER_USER_ID: str = "owner"
 
 # ---------------------------------------------------------------- 人格信号表
 # PERSONA_LOAD 是压缩过的人格：一行一个信号，token 是给上游看的**定名**，
@@ -254,6 +257,20 @@ class Settings(BaseSettings):
     cognition_every_turns: int = Field(default=6, ge=2, le=60, description="每攒够几轮跑一趟复盘")
     cognition_lookback: int = Field(default=12, ge=2, le=60, description="复盘时回看多少行对话")
     cognition_timeout: float = Field(default=25.0, gt=0, description="复盘请求的天花板；超时只丢这一趟")
+    # ---------------- 判断回路：后端灵魂根据真实结果改写前端的取舍标准 ----------------
+    judgment_enabled: bool = Field(
+        default=True,
+        description="开启「观测结果 → 判断标准」这条回路。关掉之后 JUDGMENT.md 就冻结了，"
+        "人格还在说话，但永远不会变得更会说话",
+    )
+    judgment_every_turns: int = Field(
+        default=10, ge=3, le=60, description="攒够几轮观测跑一趟判断更新",
+    )
+    judgment_lookback: int = Field(
+        default=30, ge=5, le=200, description="统计窗口：只看最近这么多轮的接话结果",
+    )
+    judgment_timeout: float = Field(default=20.0, gt=0, description="问一次判断的超时；失败就这轮不产出")
+    judgment_model: str = Field(default="", description="攒判断走哪个模型，留空跟着抽取器/主模型")
     cognition_temperature: float = Field(default=0.4, ge=0.0, le=2.0)
 
     # ---------------- 客户端表现（沉浸化） ----------------
@@ -352,6 +369,51 @@ class Settings(BaseSettings):
         default=False,
         description="协议一连上就自动把上面的昵称/头像推过去。默认关：这是改账号本体的动作，"
         "每次改都该是人明确要的那一次，不静悄悄替她换脸",
+    )
+    # ---------------- 管理者配对：一个机器人只有一个管理者 ----------------
+    pairing_ttl_seconds: int = Field(
+        default=120, ge=30, le=600,
+        description="配对挑战的有效期。到点自动作废，必须重新发起——不留长期有效的门",
+    )
+    pairing_code_chars: int = Field(default=6, ge=4, le=10, description="一次性数字字母密码长度（分组显示）")
+    owner_enabled: bool = Field(
+        default=True,
+        description="启用管理者/交互者分层。关掉就退回人人平等的旧行为：只有一棵树，没有特权",
+    )
+    # ---------------- 她自己的 QQ 账号能力（后端灵魂专属，交互者够不到） ----------------
+    qq_account_enabled: bool = Field(
+        default=True,
+        description="总闸：允许她以账号主人的身份操作 QQ（翻记录、发动态、点赞、处理申请）。"
+        "关掉后下面每一条单独开着也不生效",
+    )
+    qq_read_history: bool = Field(
+        default=True, description="读好友/群的历史消息。只读——这是她了解别人怎么接话的材料"
+    )
+    qq_qzone_publish: bool = Field(
+        default=False,
+        description="发 QQ 动态。**默认关**：动态是全好友可见的公开广播，发出去收不回来，"
+        "也不该由一次模型输出就替你向所有熟人宣告什么。开了之后仍受下面那条节流约束",
+    )
+    qq_qzone_min_interval_hours: float = Field(
+        default=6.0, ge=0.0, le=168,
+        description="两条动态之间的最小间隔。开了公开发也绝不让她刷屏——"
+        "一小时八条动态不是自我表达，是骚扰熟人",
+    )
+    qq_like: bool = Field(default=True, description="点赞/表情回应：低成本、可撤回性中等的社交动作")
+    qq_handle_requests: bool = Field(
+        default=False,
+        description="由她自己决定通过谁的好友/入群申请，不等管理者点头。"
+        "**默认关**：这等于把「谁能进入她的社交圈」交给模型的一次判断，"
+        "而申请那头的真人并不知道自己被一个机器人审核过。"
+        "好友自动通过另有旧开关 onebot_auto_approve_friend 管，两者不互相覆盖",
+    )
+    qq_group_discovery: bool = Field(
+        default=True, description="看自己加了哪些群、群公告、系统通知——纯读，用来认识自己的处境"
+    )
+    qq_channel_enabled: bool = Field(
+        default=False,
+        description="QQ 频道（guild）操作。协议端目前只给两个只读动作，"
+        "发不了评论也点不了赞，所以这条开着也只能看——见 core/tools/qq_account.py 的说明",
     )
     onebot_debounce_seconds: float = Field(
         default=3.0, ge=0.0, le=15.0,
@@ -563,6 +625,30 @@ class Settings(BaseSettings):
     @property
     def users_dir(self) -> Path:
         return self.storage_dir / "data" / "users"
+
+    @property
+    def owner_dir(self) -> Path:
+        """管理者专属资料夹。和 `users_dir` 是两棵树，不是 users 下的一个子目录——
+        交互者的工具、检索、白名单永远够不到这里，越界与否由路径本身决定，
+        不靠调用方自觉。"""
+        return self.storage_dir / "data" / "owner"
+
+    @property
+    def owner_record_path(self) -> Path:
+        """唯一管理者的绑定记录：谁、从哪个来源配对、什么时候。"""
+        return self.owner_dir / "OWNER.json"
+
+    @property
+    def pairing_dir(self) -> Path:
+        """进行中的配对挑战，一次一张，过期即废。"""
+        return self.storage_dir / "run" / "pairing"
+
+    @property
+    def judgment_path(self) -> Path:
+        """后端灵魂写给人格的「怎么说话」判断册。
+        人格决定说什么，这一册决定怎么说——它由相处结果攒出来，会改，且直接
+        改写前端的标准，所以它不是日志，是活的。"""
+        return self.soul_dir / "JUDGMENT.md"
 
     @property
     def soul_dir(self) -> Path:

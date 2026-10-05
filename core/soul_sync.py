@@ -85,6 +85,18 @@ def _collect(settings: Settings, staging: Path) -> list[str]:
                         shutil.rmtree(dst)
                     shutil.copytree(src, dst)
                     copied.append(f"users/{user.name}/{folder}/")
+    # 管理者那棵树单独收：它是另一棵，不是 users 下的一个子目录，
+    # 漏了它就会出现「交互者的灵魂资产天天同步、管理者自己的反而不备」这种荒唐结果
+    owner_root = settings.owner_dir
+    if owner_root.is_dir():
+        for user in sorted(path for path in owner_root.iterdir() if path.is_dir()):
+            for name in _USER_DOCS:
+                src = user / name
+                if src.is_file():
+                    dst = staging / "owner" / user.name / name
+                    dst.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(src, dst)
+                    copied.append(f"owner/{user.name}/{name}")
     presets = settings.presets_dir
     if presets.is_dir():
         dst = staging / "presets"

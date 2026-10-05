@@ -142,6 +142,8 @@ class SoulServer:
             bridge = OneBotBridge(self._settings, self.bot)
             qq_host, qq_port = await bridge.start()
             self.onebot = bridge
+            # 把网桥交给引擎：账号级工具（翻记录/发动态/点赞）才有手可以伸
+            self.bot.bind_qq_port(bridge)
             logger.info("QQ 网桥已就绪：协议端反向连 ws://%s:%s", qq_host, qq_port)
         return str(bound[0]), int(bound[1])
 

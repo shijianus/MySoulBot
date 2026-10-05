@@ -32,7 +32,7 @@ try:  # POSIX 跨进程锁；缺失时退化为仅进程内锁
 except ImportError:  # pragma: no cover
     fcntl = None  # type: ignore[assignment]
 
-from config import Settings
+from config import OWNER_USER_ID, Settings
 
 logger: Final = logging.getLogger("mysoulbot.storage")
 
@@ -154,16 +154,27 @@ class StorageManager:
     def template_dir(self) -> Path:
         return self._settings.template_dir
 
+    def tree_root(self, user_id: str) -> Path:
+        """这个 id 属于哪棵树。管理者单独一棵，和交互者物理分开。
+
+        不是 `users/` 下多一个子目录那种「分开」——那样任何拼路径的地方都能走进去。
+        两棵树的根不同，越界由 `user_dir` 最后那道 parent 比对挡死。
+        """
+        settings = self._settings
+        if settings.owner_enabled and user_id == OWNER_USER_ID:
+            return settings.owner_dir
+        return settings.users_dir
+
     def user_dir(self, user_id: str) -> Path:
         candidate = unquote(user_id).strip()
         if not _USER_ID.fullmatch(candidate) or ".." in candidate:
             raise PathSafetyError(
                 f"非法 user_id: {user_id!r}（允许字母数字开头，可含 _ . - ，长度 1-64）"
             )
-        path = (self._settings.users_dir / candidate).resolve()
-        users_root = self._settings.users_dir.resolve()
-        if path.parent != users_root:
-            raise PathSafetyError(f"user_id {candidate!r} 解析越出了用户目录")
+        root = self.tree_root(candidate)
+        path = (root / candidate).resolve()
+        if path.parent != root.resolve():
+            raise PathSafetyError(f"user_id {candidate!r} 解析越出了它该在的那棵树")
         return path
 
     def doc_path(self, user_id: str, doc: DocName) -> Path:

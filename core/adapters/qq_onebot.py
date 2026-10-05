@@ -45,6 +45,7 @@ from urllib.parse import parse_qs, unquote, urlparse
 
 from config import PROJECT_ROOT, Settings
 from core.bot import BotError, MySoulBot
+from core.identity import PairingDesk, consume_pairing
 from core.stickers import StickerBook
 from core.storage_manager import PathSafetyError
 from core.tools.protocol import trim_stock_closer
@@ -1471,6 +1472,8 @@ class OneBotBridge:
         self._whoami_tries = 0
         # 开机下发一次就够：每次重连都覆盖一遍资料，会把人手改的东西冲掉
         self._profile_pushed = False
+        # 配对台账：网桥只负责把激活语/回填码截走，开挑战仍然只能在命令行上
+        self._pairing = PairingDesk(settings)
 
     # ------------------------------------------------------------ 生命周期
     async def start(self, host: str = "", port: int | None = None) -> tuple[str, int]:
@@ -1625,6 +1628,34 @@ class OneBotBridge:
                 return connection
         return None
 
+    # ------------------------------------------------------------ 账号操作口
+    @property
+    def qq_online(self) -> bool:
+        return self._live_connection() is not None
+
+    async def account_call(self, action: str, params: Mapping[str, Any],
+                           *, timeout: float = _API_TIMEOUT) -> Any:
+        """工具层调这条走 QQ 账号级动作。返回 (data, 错误说明)，错误说明为空表示成功。
+
+        刻意不抛异常：工具拿到的是「这次没办成，原因是 X」，
+        由它决定怎么说，而不是把栈掀到对话界面上。
+        """
+        connection = self._live_connection()
+        if connection is None:
+            return None, "QQ 那头现在没连着"
+        answered, reply = await self._request(connection, action, dict(params), timeout=timeout)
+        if not answered or reply is None:
+            return None, f"协议端对 {action} 没应答"
+        try:
+            retcode = int(reply.get("retcode") or 0)
+        except (TypeError, ValueError):
+            retcode = 0
+        status = str(reply.get("status") or "")
+        if status == "failed" or retcode:
+            self._bump("errors")
+            return None, f"协议端回了 retcode={retcode} {str(reply.get('message') or status)[:100]}"
+        return reply.get("data"), ""
+
     async def _profile_call(self, connection: _Connection, action: str, params: Mapping[str, Any]) -> str:
         """资料类动作的专用调用：成功时 `data` 也是空的，只能看 status/retcode。
 
@@ -1710,6 +1741,15 @@ class OneBotBridge:
             return
         if self._is_duplicate(inbound.message_id):
             self._bump("duplicate")
+            return
+        # 配对挂起时，激活语和回填码从 QQ 对话里截走，直接回给控制台那条私聊：
+        # 这是人在认领这台机器，不是她在跟人聊天。群聊一律不截——群里喊这句的人太多
+        note = consume_pairing(self._pairing, inbound.text, source="qq_private",
+                               qq=inbound.sender_id, group=inbound.is_group)
+        if note is not None:
+            self._bump("paired_handled")
+            logger.info("配对握手（%s）：%s", inbound.sender_id, note.splitlines()[0])
+            connection.track(self._send_bubble(connection, inbound, note))
             return
         if not inbound.is_group:
             # 私聊这一句她必定要接：先把「正在输入」挂上。等防抖窗口走完再挂，

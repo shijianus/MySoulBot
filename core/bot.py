@@ -32,8 +32,10 @@ from config import Settings
 from core.card_loader import PersonaLibrary, Preset
 from core.clawd_soul import ClawdSoul
 from core.mood_soul import MoodSoul
+from core.identity import resolve_identity
 from core.recap import SessionRecap
 from core.cognition import CognitionLoop
+from core.judgment import JudgmentLoop, observe
 from core.memory_extractor import MemoryExtractor
 from core.prompt_builder import (
     TIER_FULL,
@@ -134,6 +136,11 @@ class Session:
     persona_name: str = ""
     gen_params: dict[str, Any] = field(default_factory=dict)
     tool_mode: str = ""  # ""=自动；接口不认原生工具时被降级成 "inline"
+    # 上一句我们说完的时间与原文：判断回路要量的「他隔多久回的、回了多长」
+    # 只有下一回合开头才知道，所以得在这儿留个底
+    last_reply_at: float = 0.0
+    last_reply_text: str = ""
+    last_bubbles: int = 1
     vision_mode: str = ""  # ""=自动；接口不认多模态内容时被降级成 "off"
     tool_calls: int = 0
     # 体温与温度：一次刷新，整轮复用（保证同一轮内重复组装 prompt 结果一致）
@@ -196,11 +203,16 @@ class MySoulBot:
         self.library = library or PersonaLibrary(settings)
         self.clawd = clawd or ClawdSoul(settings)
         self.mood = MoodSoul(settings)
+        # QQ 账号操作口：网桥在服务起来之后才建好，只能事后 bind
+        self.qq: Any = None
         # 回看只有一个实例：写的人（引擎）和读的人（提示词装配）必须共用同一份后台队列，
         # 各开各的就会出现「写了但等的是自己那队」这种丢要点
         self.recap = recap or SessionRecap(settings, storage)
         self._prompts.bind_recap(self.recap)
         self.cognition = CognitionLoop(settings, storage, self.mood)
+        # 判断回路：后端根据真实结果攒「怎么说」，写进 JUDGMENT.md，下一轮直接改前端取舍
+        self.judgment = JudgmentLoop(settings, storage)
+        self._prompts.bind_judgment(self.judgment.ledger)
         self.rapport = RapportEngine(settings, storage)
         self._client: AsyncOpenAI | None = None
         self._client_hook: Any = None   # 探针接管位：scripts 用它按线路包一层记账壳
@@ -245,8 +257,19 @@ class MySoulBot:
     def _context(self, user_id: str, group_mode: bool | None = None) -> ToolContext:
         return ToolContext(
             settings=self._scene(group_mode), storage=self._storage, user_id=user_id,
-            clawd=self.clawd, mood=self.mood
+            clawd=self.clawd, mood=self.mood,
+            identity=resolve_identity(self._settings, user_id,
+                                      source="group" if group_mode else "solo"),
+            qq=self.qq,
         )
+
+    def bind_qq_port(self, port: Any) -> None:  # noqa: ANN401 - OneBotBridge，引它会循环
+        """把网桥交给引擎，账号级工具才有手可以伸。
+
+        网桥是在服务起来之后才建好的，所以只能事后绑，不在构造参数里传。
+        没绑上就是 None——那些工具直接不可用，而不是拿个空壳去假装能发。
+        """
+        self.qq = port
 
     def _scene(self, group_mode: bool | None) -> Settings:
         """把「这一句话的场合」换成一份只在这一回合生效的配置副本。
@@ -649,6 +672,7 @@ class MySoulBot:
                     not completed,
                     day,
                     [ref.label() for ref in refs],
+                    group_mode=bool(group_mode),
                 )
             finally:
                 session.busy = False
@@ -1219,6 +1243,7 @@ class MySoulBot:
         interrupted: bool,
         day: dt.date,
         attachments: list[str] | None = None,
+        group_mode: bool = False,
     ) -> None:
         """把这一轮写入历史/日志，并提交后台抽取。
 
@@ -1255,6 +1280,23 @@ class MySoulBot:
         self._extractor.submit(session.user_id, window, today=day)
         # 慢环：攒够几轮就在后台复盘一次，把心得落进 MOOD.md，下一轮的提示词自然带上
         self.cognition.note_turn(session.user_id)
+        # 判断回路：这一句用户消息就是上一句我们那话的「结果」——
+        # 隔多久回的、回了多长、有没有反问，全在这儿量得出来，不交给模型回忆
+        if session.last_reply_at:
+            self.judgment.note(observe(
+                user_id=session.user_id,
+                our_text=session.last_reply_text,
+                our_bubbles=session.last_bubbles,
+                their_text=user_text,
+                gap_seconds=max(0.0, time.time() - session.last_reply_at),
+                replied=bool((user_text or "").strip()),
+                group=group_mode,
+            ))
+        session.last_reply_at = time.time()
+        session.last_reply_text = text
+        # 气泡条数由网桥切完才知道，这里先按「一条长话」估：
+        # 判断回路只关心「我们说多了没有」，字数那个信号已经够硬
+        session.last_bubbles = 1
 
     async def _settle_emotion(
         self, session: Session, user_text: str, reply: str, interrupted: bool

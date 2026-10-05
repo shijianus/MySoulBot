@@ -27,6 +27,7 @@ from core.tools.git import GitSync
 from core.tools.host import HostStats, ScratchList, ScratchRead, ScratchWrite
 from core.tools.media import ImageGen, SeeImage, Snapshot
 from core.tools.protocol import Directive
+from core.tools.qq_account import ACCOUNT_TOOLS
 from core.tools.query import QUERY_TOOLS
 from core.tools.soul import Reflect
 from core.tools.web import WebBrowse, WebSearch
@@ -46,6 +47,7 @@ DEFAULT_TOOLS: Final[tuple[type[Tool], ...]] = (
     ScratchWrite,
     ScratchRead,
     ScratchList,
+    *ACCOUNT_TOOLS,
 )
 ALIASES: Final[dict[str, str]] = {
     "browse": "web_browse",
@@ -77,6 +79,14 @@ ALIASES: Final[dict[str, str]] = {
     "磁盘": "host_stats",
     "卡不卡": "host_stats",
     "草稿": "scratch_write",
+    "通讯录": "qq_roster",
+    "我的群": "qq_roster",
+    "翻记录": "qq_read_history",
+    "点赞": "qq_like",
+    "动态": "qq_publish_qzone",
+    "发动态": "qq_publish_qzone",
+    "申请": "qq_requests",
+    "入群申请": "qq_requests",
     "记一下": "scratch_write",
     "翻草稿": "scratch_read",
     "draw": "image_gen",

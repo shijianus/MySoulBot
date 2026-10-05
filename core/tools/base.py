@@ -137,13 +137,25 @@ class Tool(ABC):
 
 @dataclass
 class ToolContext:
-    """工具运行需要的东西：配置、存储、当前用户、灵魂层。"""
+    """工具运行需要的东西：配置、存储、当前用户、灵魂层、身份层级。
+
+    `identity` 是这一回合判定出来的身份，不是对方自称出来的。账号级动作
+    （发动态、翻记录、处理申请）全发生在管理者自己的 QQ 号上，必须由它放行——
+    否则任何一个交互者都能逼她向管理者的熟人广播，或把管理者的私聊翻出来当素材。
+    留 None 是给不分层的旧部署与测试的：那时她按交互者对待，账号级工具一律不可用。
+    """
 
     settings: Settings
     storage: StorageManager
     user_id: str
     clawd: ClawdSoul | None = None
     mood: Any = None  # noqa: ANN401 - core.mood_soul.MoodSoul，工具可选挂载
+    identity: Any = None  # noqa: ANN401 - core.identity.Identity，引它会造成循环导入
+    qq: Any = None  # noqa: ANN401 - QQ 账号操作口（就是网桥本身），没起网桥就是 None
+
+    @property
+    def is_owner(self) -> bool:
+        return bool(getattr(self.identity, "is_owner", False))
 
     def artifact_path(self, name: str) -> Path:
         path = self.storage.artifacts_dir(self.user_id) / name

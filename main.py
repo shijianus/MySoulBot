@@ -50,6 +50,7 @@ from config import Settings, get_settings
 from core.bot import BotError, MySoulBot
 from core.card_loader import CardError, PersonaLibrary, PresetError
 from core.clawd_soul import ClawdSoul
+from core.identity import PairingDesk, consume_pairing, format_code, read_owner, unpair
 from core.memory_extractor import MemoryExtractor
 from core.prompt_builder import PromptBuilder
 from core.storage_manager import (
@@ -228,6 +229,8 @@ class App:
         self.library = PersonaLibrary(settings)
         self.extractor = MemoryExtractor(settings, self.storage, on_outcome=self._on_outcome)
         self.bot = MySoulBot(settings, self.storage, self.prompts, self.extractor, self.library, self.clawd)
+        # 配对台账：只有人在命令行上敲 /pair 才会开挑战，她没有任何路径能自己开
+        self.pairing = PairingDesk(settings)
         self._quiet_events: list[str] = []  # 后台抽取完成的通知，只进 /panel log，不打扰对话
 
     # ------------------------------------------------------------ 生命周期
@@ -269,6 +272,12 @@ class App:
                 if not await self.handle_command(line[1:]):
                     break
             else:
+                # 配对挂起时，激活语与回填码从对话里截走——它们是说给控制台听的，
+                # 不是说给她听的。没有挑战在跑就一句也截不动，闲聊照旧
+                note = consume_pairing(self.pairing, line, source="cli")
+                if note is not None:
+                    self.ui.line(note)
+                    continue
                 await self.turn(line)
 
     async def _read_line(self) -> str | None:
@@ -361,6 +370,8 @@ class App:
             return await self._mode(rest)
         if name == "sync":
             return await self._sync(rest)
+        if name in {"pair", "unpair", "whoami-owner"}:
+            return await self._pairing(name, rest)
         if name in MOVED:
             self.ui.line(f"  这个现在在 {MOVED[name]} 里", style="dim")
             return True
@@ -374,6 +385,8 @@ class App:
             ("/mode solo|group [名字…]", "切 1V1 / 群聊"),
             ("/sync remote", "把灵魂与记忆推到 shijianus/MySoulBot"),
             ("/sync check", "同步前自查：体积闸门、忽略规则、凭据扫描"),
+            ("/pair", "发起管理者配对（2 分钟有效）：一个机器人只能有一个管理者"),
+            ("/unpair", "解绑管理者。改的是谁能管这台机器，想清楚再敲"),
             ("/quit", "退出"),
         ]
         if self._settings.group_mode:
@@ -407,6 +420,43 @@ class App:
         return True
 
     # ------------------------------------------------------------ /sync
+    async def _pairing(self, command: str, rest: str) -> bool:
+        """管理者配对：发起、看进度、解绑。"""
+        settings = self._settings
+        if command == "unpair":
+            record = read_owner(settings)
+            if record is None:
+                self.ui.warn("现在没有绑定的管理者，不用解。")
+                return True
+            self.ui.warn(f"要解绑的是：{record.binding_key()}（{record.paired_at}）")
+            answer = await self._read_line()
+            if (answer or "").strip().lower() not in {"y", "yes", "确认"}:
+                self.ui.line("  没确认，解绑取消。", style="dim")
+                return True
+            unpair(settings)
+            self.ui.warn("已解绑。在重新配对之前，账号级能力一律不可用。")
+            return True
+        current = self.pairing.active()
+        if current is not None and current.stage == "unique":
+            code = self.pairing.plaintext_code(current)
+            self.ui.line(f"配对进行中：唯一来源 {current.source_key}，回填码 {format_code(code)}")
+            return True
+        if current is not None:
+            self.ui.line(f"已有一场配对在跑（{current.seconds_left()} 秒后作废）。"
+                         "把这句发给对方：你好溟汐，我是管理员")
+            return True
+        if not settings.owner_enabled:
+            self.ui.warn("OWNER_ENABLED=false，分层没开。要配对先在 .env 里打开。")
+            return True
+        if read_owner(settings) is not None:
+            self.ui.warn("已经绑过管理者了。一个机器人只有一个——要换先 /unpair")
+            return True
+        challenge = self.pairing.start(channel="cli")
+        self.ui.line(f"配对已开始，{self.pairing.ttl} 秒内有效，到点自动作废。")
+        self.ui.line(f"  下一步：把这一句当**普通消息**发进来 → 你好溟汐，我是管理员")
+        self.ui.line(f"  来源必须唯一：同一时间只让一个通道在配（当前 {challenge.channel}）")
+        return True
+
     async def _sync(self, arg: str) -> bool:
         action = (arg or "").strip().lower()
         if action in {"", "flush", "抽取"}:
