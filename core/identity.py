@@ -44,6 +44,7 @@ logger: Final = logging.getLogger("mysoulbot.identity")
 __all__ = [
     "Tier", "Identity", "Challenge", "OwnerRecord", "PairingError", "PairingDesk",
     "OWNER_USER_ID", "ACTIVATION_PHRASE", "phrase_matches", "format_code", "consume_pairing",
+    "owner_user_ids",
     "normalize_code", "read_owner", "resolve_identity", "unpair",
 ]
 
@@ -124,6 +125,24 @@ class Identity:
         return "owner" if self.is_owner else "users"
 
 
+def owner_user_ids(settings: Settings) -> set[str]:
+    """管理者会以哪些 user_id 出现。
+
+    QQ 那侧进来的话一律被折成 `qq_private_<qq号>`（群聊是 `qq_group_<群号>`），
+    所以只认字面量 "owner" 会漏掉他本人——那等于账号级能力在他唯一真正需要它的
+    场景里永远不可用。这里把两种形态都算上。
+    """
+    record = read_owner(settings) if settings.owner_enabled else None
+    if record is None:
+        return set()
+    ids = {record.user_id}
+    for uin in (record.qq, settings.owner_qq):
+        uin = str(uin or "").strip()
+        if uin.isdigit():
+            ids.add(f"qq_private_{uin}")
+    return ids
+
+
 def resolve_identity(settings: Settings, user_id: str, *, source: str = "") -> Identity:
     """这个 user_id 是谁。只读绑定记录，绝不采信对话里的自称。
 
@@ -132,8 +151,11 @@ def resolve_identity(settings: Settings, user_id: str, *, source: str = "") -> I
     """
     if settings.owner_enabled:
         record = read_owner(settings)
-        if record is not None and user_id == record.user_id:
-            return Identity(Tier.OWNER, user_id, source, qq=record.qq)
+        if record is not None and user_id in owner_user_ids(settings):
+            qq = record.qq or settings.owner_qq
+            if user_id.startswith("qq_private_"):
+                qq = user_id[len("qq_private_"):]
+            return Identity(Tier.OWNER, user_id, source, qq=qq)
     return Identity(Tier.INTERACTOR, user_id, source)
 
 

@@ -419,6 +419,12 @@ class Settings(BaseSettings):
         description="配对挑战的有效期。到点自动作废，必须重新发起——不留长期有效的门",
     )
     pairing_code_chars: int = Field(default=6, ge=4, le=10, description="一次性数字字母密码长度（分组显示）")
+    owner_qq: str = Field(
+        default="",
+        description="管理者的 QQ 号。QQ 那侧进来的话会被折成 qq_private_<号>，"
+        "不填这个的话，他从手机上跟她说话时会被判成交互者、账号能力永远不可用。"
+        "**它本身不给权限**：必须先完成过配对（有绑定记录）它才生效",
+    )
     owner_enabled: bool = Field(
         default=True,
         description="启用管理者/交互者分层。关掉就退回人人平等的旧行为：只有一棵树，没有特权",

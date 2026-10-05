@@ -101,6 +101,35 @@ def tree_checks(check: Checker) -> None:
              StorageManager(off).user_dir(OWNER_USER_ID).parent == off.users_dir.resolve())
 
 
+def owner_qq_checks(check: Checker) -> None:
+    """QQ 侧的管理者身份。漏了这一条，账号能力在他唯一需要它的场景里永远不可用。"""
+    s = tier_settings(owner_enabled=True, owner_qq="123456789")
+    check.ok("没配对时 owner_qq 不给任何权限（它不是后门）",
+             ID.resolve_identity(s, "qq_private_123456789").tier is ID.Tier.INTERACTOR, "")
+    ID.write_owner(s, ID.OwnerRecord(user_id=OWNER_USER_ID, qq="", source="cli",
+                                     paired_at="2026-10-06T00:00:00"))
+    check.ok("配对后本机 owner 身份成立", ID.resolve_identity(s, OWNER_USER_ID).is_owner, "")
+    phone = ID.resolve_identity(s, "qq_private_123456789")
+    check.ok("配对后他从自己手机上说话也算管理者", phone.is_owner and phone.qq == "123456789",
+             f"{phone.tier.label}/{phone.qq}")
+    check.ok("别人的号不受影响", ID.resolve_identity(s, "qq_private_999").tier is ID.Tier.INTERACTOR)
+    check.ok("群聊不算管理者", ID.resolve_identity(s, "qq_group_555").tier is ID.Tier.INTERACTOR)
+    check.ok("owner_user_ids 把两种形态都列出来",
+             ID.owner_user_ids(s) == {OWNER_USER_ID, "qq_private_123456789"},
+             ID.owner_user_ids(s))
+    # 绑定记录里自带 qq 时，不必再配 OWNER_QQ
+    s2 = tier_settings(owner_enabled=True)
+    ID.write_owner(s2, ID.OwnerRecord(user_id=OWNER_USER_ID, qq="777", source="cli",
+                                      paired_at="2026-10-06T00:00:00"))
+    check.ok("配对时留下的 qq 也认", ID.resolve_identity(s2, "qq_private_777").is_owner, "")
+    # 两棵树的落盘位置：管理者从手机上进话，资料仍该落在 owner 树
+    st = StorageManager(s)
+    check.ok("管理者手机身份与本机身份共用一棵树",
+             st.tree_root(OWNER_USER_ID) == st.tree_root("qq_private_123456789")
+             or st.user_dir(OWNER_USER_ID).parent == s.owner_dir,
+             f"{st.user_dir(OWNER_USER_ID)} vs {st.user_dir('qq_private_123456789')}")
+
+
 # ---------------------------------------------------------------- 2. 配对握手
 def pairing_checks(check: Checker) -> None:
     s = tier_settings(owner_enabled=True, pairing_ttl_seconds=120)
@@ -417,6 +446,7 @@ async def main() -> int:
     check = Checker()
     try:
         tree_checks(check)
+        owner_qq_checks(check)
         pairing_checks(check)
         account_gate_checks(check)
         await account_behavior_checks(check)
