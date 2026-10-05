@@ -78,6 +78,10 @@ class Tool(ABC):
     def available(self, ctx: "ToolContext") -> bool:  # noqa: ARG002 - 子类按配置判断
         return True
 
+    def brief(self, ctx: "ToolContext") -> str:  # noqa: ARG002 - 子类按配置改口
+        """说给语境层的那一句。后端只是占位时，这句必须实话实说。"""
+        return self.hint
+
     # ------------------------------------------------------------ 声明
     def schema(self) -> dict[str, Any]:
         required = [p.name for p in self.params if p.required]
@@ -139,6 +143,7 @@ class ToolContext:
     storage: StorageManager
     user_id: str
     clawd: ClawdSoul | None = None
+    mood: Any = None  # noqa: ANN401 - core.mood_soul.MoodSoul，工具可选挂载
 
     def artifact_path(self, name: str) -> Path:
         path = self.storage.artifacts_dir(self.user_id) / name

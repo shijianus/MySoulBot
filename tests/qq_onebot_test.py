@@ -41,10 +41,11 @@ import struct
 import sys
 import tempfile
 import threading
+from concurrent.futures import ThreadPoolExecutor
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
@@ -56,7 +57,11 @@ EXTRACT_MARK = "记忆抽取器"
 
 LOCK = threading.Lock()
 SEEN: list[dict[str, Any]] = []
-MODE: dict[str, Any] = {"pieces": list(REPLY_PIECES), "once": [], "echo": "", "reject_vision": False, "slow": 0.0}
+MODE: dict[str, Any] = {"pieces": list(REPLY_PIECES), "once": [], "echo": "",
+              "reject_vision": False, "slow": 0.0, "lead": 0.0, "lead_once": 0.0,
+              "think": 0, "blank_first": False, "lag_first": 0.0, "open_lag": 0.0,
+              # 按模型名使坏的三档：验多线路选路与回退用（同一个假端口，两条线）
+              "bad_models": (), "think_models": {}, "cut_models": {}, "echo_map": {}}
 ORIGIN = "http://127.0.0.1:1"
 
 
@@ -120,8 +125,15 @@ class FakeOpenAI(BaseHTTPRequestHandler):
         if has_image and MODE["reject_vision"]:
             self._json({"error": {"message": "this model takes text only"}}, 400)
             return
+        model = str(payload.get("model") or "")
+        # 按模型名使坏：验「换一条线接着答同一句话」时，两条线就是同一个假端口的两个模型
+        if model in MODE["bad_models"]:
+            self._json({"error": {"message": f"这线路不吃 {model}"}}, 503)
+            return
         if MODE["once"]:
             pieces, MODE["once"] = list(MODE["once"]), []
+        elif model in MODE["echo_map"]:
+            pieces = [MODE["echo_map"][model]]
         else:
             pieces = [MODE["echo"]] if MODE["echo"] else list(MODE["pieces"])
         if not payload.get("stream"):
@@ -136,12 +148,47 @@ class FakeOpenAI(BaseHTTPRequestHandler):
                 }
             )
             return
+        # 响应头都可以磨（过载时确实如此）：只磨第一趟，看对冲会不会照点在时间里补上
+        open_lag, MODE["open_lag"] = MODE["open_lag"], 0.0
+        if open_lag:
+            time.sleep(open_lag)
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Transfer-Encoding", "chunked")
         self.end_headers()
+        # 一次性卡首分片 / 一次性只吐思考：进门就吞掉标记，重排的那一趟才该是顺畅的
+        lead_once, MODE["lead_once"] = MODE["lead_once"], 0.0
+        think_once, MODE["think"] = MODE["think"], 0
+        lag_first, MODE["lag_first"] = MODE["lag_first"], 0.0
+        if model in MODE["think_models"]:
+            think_once = MODE["think_models"][model]     # 只吐思考、不落正文：该被看门狗撤掉
+        cut_after = MODE["cut_models"].get(model, 0)
         try:
-            for piece in pieces:
+            if lag_first:
+                # 只磨第一趟：对冲补的那一把就该是快的那个，胜负好判
+                time.sleep(lag_first)
+            if MODE["lead"]:
+                time.sleep(MODE["lead"])
+            if lead_once:
+                time.sleep(lead_once)
+            if MODE["blank_first"]:
+                # 有的网关先甩一个空白 content 再闷着不写字：这不算「正文露头」
+                blank = (b"data: " + json.dumps(
+                    {"choices": [{"index": 0, "delta": {"content": " "}, "finish_reason": None}]},
+                    ensure_ascii=False).encode() + b"\n\n")
+                self.wfile.write(hex(len(blank))[2:].encode() + b"\r\n" + blank + b"\r\n")
+                self.wfile.flush()
+            # 先刷几片隐式思考：正文一个字都不来 —— 该撤的那一趟就得被撤掉
+            for tick in range(think_once):
+                thought = (b"data: " + json.dumps(
+                    {"choices": [{"index": 0, "delta": {"reasoning_content": f"想{tick}"},
+                                 "finish_reason": None}]}, ensure_ascii=False).encode() + b"\n\n")
+                self.wfile.write(hex(len(thought))[2:].encode() + b"\r\n" + thought + b"\r\n")
+                self.wfile.flush()
+                time.sleep(0.4)
+            for position, piece in enumerate(pieces):
+                if cut_after and position >= cut_after:
+                    break          # 话说一半掐线：验「已经开口就不许换家重说」
                 frame = (
                     b"data: "
                     + json.dumps(
@@ -154,6 +201,9 @@ class FakeOpenAI(BaseHTTPRequestHandler):
                 self.wfile.flush()
                 if MODE["slow"]:
                     time.sleep(MODE["slow"])
+            if cut_after and len(pieces) > cut_after:
+                self.wfile.close()     # 不给收尾块：客户端会当成连接被半路拔了
+                return
             self.wfile.write(b"0\r\n\r\n")
             self.wfile.flush()
         except (BrokenPipeError, ConnectionResetError, OSError):
@@ -208,10 +258,22 @@ def make_settings(root: Path, base_url: str, **overrides: Any) -> Any:
         "onebot_enabled": True,
         "onebot_host": "127.0.0.1",
         "onebot_access_token": "qq-test-token",
+        "onebot_auto_record": False,  # 出不出声由每个 Rig 自己定，不跟开发机的 .env 串味
+        # 防抖与打字延迟会改时序：测试通篇按「立刻答、立刻发完」写，这里先把它们拧小，
+        # 真实窗口的行为交给下面的 debounce_checks 单独验
+        "onebot_debounce_seconds": 0.25,
+        "onebot_debounce_cap_seconds": 3.0,
+        "onebot_bubble_delay_min": 0.0,
+        "onebot_bubble_delay_max": 0.0,
+        # 这一套是在验「全量提示词分层装配」，所以先锁全量档：
+        # 否则「在吗」两句会被分到快捷档，断言就变成了在测分档器
+        "prompt_tiers_enabled": False,
         "web_allow_private": True,  # 假端点就在回环上发图，测试里得让它进得来
     }
     values.update(overrides)
-    return Settings(**values)
+    # _env_file=None：测试只认自己写死的那套值。开发机把 ONEBOT_* 打开后，
+    # 若不掐掉 .env，网桥会多出语音条、多开一个端口，断言就变成在测「这台机器现在怎么配的」。
+    return Settings(_env_file=None, **values)
 
 
 # ---------------------------------------------------------------- 假协议端（真 socket）
@@ -385,19 +447,29 @@ class QQ:
         })
 
     def pump(self, seconds: float = 8.0, *, quiet: float = 1.0, retcode: int = 0, status: str = "ok",
-             login: dict[str, Any] | None = None) -> list[dict[str, Any]]:
-        """收服务端发来的动作并逐条应答；返回收到的全部动作。
+             login: dict[str, Any] | None = None,
+             handlers: dict[str, Any] | None = None,
+             skip: Sequence[str] = (),
+             refused: Sequence[str] = (),
+             lag: float = 0.0) -> list[dict[str, Any]]:
+        """`refused`：协议端压根不认这几个动作——立刻回 failed，而不是干脆不答（那会等满超时）。
+
+        `lag`：协议端磨一下再回话。量往返延时要有个已知的下界，否则读数是不是真的量到了没法断言。
+
+        收服务端发来的动作并逐条应答；返回收到的全部动作。
 
         收到东西之后再静默 `quiet` 秒就收摊——不然每个断言都要等满整个窗口，
         整条测试跑得比她回话还慢。一条都没收到时才等满 `seconds`（那才是要验的「没有」）。
         """
         got: list[dict[str, Any]] = []
+        # 「正在输入」不是回音：它一到就满足 quiet 收摊条件的话，防抖窗口还没走完测试就散了
+        echoed = False
         deadline = time.monotonic() + seconds
         while time.monotonic() < deadline:
-            left = min(deadline - time.monotonic(), quiet if got else seconds)
+            left = min(deadline - time.monotonic(), quiet if echoed else seconds)
             frame = self.read_json(max(0.2, left))
             if frame is None:
-                if got:
+                if echoed:
                     break
                 continue
             if "_control" in frame or "_junk" in frame:
@@ -405,8 +477,21 @@ class QQ:
             if not frame.get("action"):
                 continue
             got.append(frame)
+            # 输入状态不管叫什么，都只是等待期的提示，不是回音：拿它当「有动静」收摊，
+            # 试探还没走完测试就散了
+            if str(frame.get("action")) not in ("set_typing", "set_input_state", "set_input_status"):
+                echoed = True
+            if frame["action"] in skip:
+                continue  # 假装协议端根本不认这个动作：既不办也不回话
+            if lag > 0:
+                time.sleep(lag)
+            if frame["action"] in refused:
+                self.answer(frame, retcode=1, status="failed")
+                continue
             if frame["action"] == "get_login_info":
-                self.answer(frame, data=login or {"user_id": 70001, "nickname": "夜汐"})
+                self.answer(frame, data=login or {"user_id": 70001, "nickname": "shijianus"})
+            elif handlers and frame["action"] in handlers:
+                self.answer(frame, data=handlers[frame["action"]])
             else:
                 self.answer(frame, retcode=retcode, status=status)
         return got
@@ -421,6 +506,22 @@ class QQ:
 
 def sends(actions: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [frame for frame in actions if str(frame.get("action", "")).startswith("send_")]
+
+
+def bubble_count(actions: list[dict[str, Any]]) -> int:
+    """这一轮发出去几条气泡。"""
+    return len(sends(actions))
+
+
+def one_turn(actions: list[dict[str, Any]], *, at_most: int = 4) -> bool:
+    """「答了一轮」的正确形状：至少一条、最多几条短气泡，而不是一坨也不是零。"""
+    return 1 <= bubble_count(actions) <= at_most
+
+
+def model_calls() -> int:
+    """有几句话真的送进了模型（排除记忆抽取那一路）——判「只答一轮」的铁证。"""
+    with LOCK:
+        return len([payload for payload in SEEN if EXTRACT_MARK not in json.dumps(payload, ensure_ascii=False)])
 
 
 def texts(actions: list[dict[str, Any]]) -> list[str]:
@@ -463,9 +564,152 @@ def reset_model() -> None:
     MODE["echo"] = ""
     MODE["reject_vision"] = False
     MODE["slow"] = 0.0
+    MODE["lead"] = 0.0
+    MODE["lead_once"] = 0.0
+    MODE["think"] = 0
+    MODE["blank_first"] = False
+    MODE["lag_first"] = 0.0
+    MODE["open_lag"] = 0.0
+    MODE["bad_models"] = ()
+    MODE["think_models"] = {}
+    MODE["cut_models"] = {}
+    MODE["echo_map"] = {}
 
 
 # ---------------------------------------------------------------- 1. 纯函数层
+def media_pure_checks2(check: Checker) -> None:
+    from core.adapters import qq_onebot as onebot
+    from core.adapters.qq_onebot import (
+        BubbleStream, Inbound, split_bubbles, strip_stage_directions,
+    )
+    from core.stickers import StickerBook
+    from core.tools.registry import classify_danger
+
+    check.ok("三句话切成三条气泡",
+             split_bubbles("本鲸不想动。你爱加不加班。米饭记得吃。") == ["本鲸不想动。", "你爱加不加班。", "米饭记得吃。"])
+    check.ok("舞台提示贴在被修饰的那句上", split_bubbles("（顿住）\n\n还是别说了。") == ["（顿住）还是别说了。"])
+    check.ok("句子多了就合并而不丢字",
+             "".join(split_bubbles("甲不接话。" * 30)) == "甲不接话。" * 30,
+             [len(x) for x in split_bubbles("甲不接话。" * 30)])
+    check.ok("合并后仍不超单条硬上限", all(len(piece) <= 800 for piece in split_bubbles("哈" * 5000)))
+    check.ok("气泡条数有上限，但绝不吞字",
+             len(split_bubbles("哈" * 5000)) <= 24
+             and "".join(split_bubbles("哈" * 5000)) == "哈" * 5000,
+             len(split_bubbles("哈" * 5000)))
+    code_answer = ("先看这个函数，抄过去就能用：\n\n```python\ndef f(x):\n    return x + 1\n\n"
+                   "print(f(2))\n```\n第二件事：晚上九点前发我。")
+    blocks = split_bubbles(code_answer, bubble_chars=60, max_pieces=4, ceiling=24)
+    check.ok("代码块整条走，围栏不在半截处断",
+             all(piece.count("```") % 2 == 0 for piece in blocks), blocks)
+    check.ok("代码块前后不相粘，能直接复制",
+             any(p.startswith("```python") and p.rstrip().endswith("```") for p in blocks), blocks)
+    check.ok("顺序不乱：前言→代码→后话",
+             [i for i, p in enumerate(blocks) if "抄过去" in p][0]
+             < [i for i, p in enumerate(blocks) if p.startswith("```")][0]
+             < [i for i, p in enumerate(blocks) if "晚上九点" in p][0], blocks)
+    check.ok("分片不吞内容", "def f(x)" in "".join(blocks) and "return x + 1" in "".join(blocks))
+    listed = split_bubbles("三个办法：\n1. 先换网关密钥\n2. 再把超时调到 20 秒\n3. 最后重排一次",
+                           bubble_chars=60, max_pieces=4, ceiling=24)
+    check.ok("连号列表不被拆散", any("1. 先换网关密钥" in p and "3. 最后重排一次" in p for p in listed), listed)
+    oversized = "给你整个文件：\n```python\n" + "\n".join(f"v{i} = {i}" for i in range(400)) + "\n```"
+    parts = split_bubbles(oversized, bubble_chars=60, max_pieces=6, ceiling=24)
+    check.ok("超长代码每条各自闭合，条条可复制",
+             all(p.count("```") % 2 == 0 for p in parts if p.strip().startswith("```"))
+             and max(len(p) for p in parts) <= 800, [len(p) for p in parts])
+    check.ok("超长代码一条内容都不丢", sum(p.count("= ") for p in parts) >= 400,
+             sum(p.count("= ") for p in parts))
+    check.ok("空话不产生气泡", split_bubbles("   ") == [] and split_bubbles("") == [])
+
+    # ---- 长句整段：声明在动笔前就定好形态，网桥按板块切、不拆句 ----
+    long_text = ("〔长句〕这个报错有两层。\n第一层是路径没解析对。\n\n"
+                 "第二层是权限，沙箱只圈在存储目录里。\n你把 --out 换成相对路径再试一次。\n\n"
+                 "行吧，说不通就喊我。")
+    sections = split_bubbles(long_text, bubble_chars=60, max_pieces=6)
+    check.ok("声明长句后按板块切，板块内部不拆碎", len(sections) == 3, sections)
+    check.ok("第一个板块留着两句原话", "这个报错有两层。\n第一层是路径没解析对。" in sections[0],
+             sections[0])
+    check.ok("短话可以独占一个板块", sections[-1] == "行吧，说不通就喊我。", sections[-1])
+    check.ok("声明标记不落到屏幕上", all("长句" not in p for p in sections), sections)
+    check.ok("一个字都不丢", "".join(sections).replace("\n", "").replace(" ", "")
+             == long_text.replace("〔长句〕", "").replace("\n", "").replace(" ", ""))
+    plain = split_bubbles("今天累不累。\n想吃米饭。\n别吵我。", bubble_chars=60, max_pieces=6)
+    check.ok("没声明仍是一句一条", plain == ["今天累不累。", "想吃米饭。", "别吵我。"], plain)
+    for variant, label in [("[长句] 好。", "半角方括号"), ("[[长句]]好。", "双方括号"),
+                           ("/长句 好。", "斜杠式")]:
+        got = split_bubbles(variant, bubble_chars=60, max_pieces=6)
+        check.ok(f"{label}的声明也认且被擦掉", got == ["好。"], f"{label}: {got}")
+    fenced = split_bubbles("〔长句〕先说结论。\n\n```python\nprint(1)\nprint(2)\n```\n\n就这样。",
+                           bubble_chars=60, max_pieces=6)
+    check.ok("长句里的代码块仍整块走", any(p.count("```") == 2 for p in fenced), fenced)
+    streamer = BubbleStream(bubble_chars=60, max_pieces=6)
+    early = streamer.feed("〔长句〕这段") + streamer.feed("要三句才说得清。\n中间还有细节。")
+    check.ok("长句模式下单换行不算板块闭合，不提前发", early == [], early)
+    check.ok("声明一到就定下长句形态", streamer.long_form is True, streamer.long_form)
+    mid = streamer.feed("\n\n第二个板块。")
+    check.ok("空行一到就整块发出", mid == ["这段要三句才说得清。\n中间还有细节。"], mid)
+    check.ok("流式长句收尾不吞字", streamer.finish() == ["第二个板块。"], streamer.finish())
+    pending = BubbleStream(bubble_chars=60, max_pieces=6)
+    check.ok("标记没吐完时不抢判形态", pending.feed("〔长") == [] and pending.long_form is None,
+             pending.long_form)
+    check.ok("像标记但不是标记，立刻回到一句一条",
+             pending.feed("期你好。") == [] and pending.long_form is False, pending.long_form)
+    check.ok("误判前缀一个字都不丢", pending.finish() == ["〔长期你好。"], pending.finish())
+    check.ok("确认不是声明后立刻回到一句一条",
+             pending.feed("你好。") == ["〔长你好。"] or pending.long_form is False, pending.long_form)
+
+    book = StickerBook(Path(__file__).resolve().parents[1] / "emoji")
+    check.ok("委屈指到 pout 那张", (book.resolve("委屈") or Path("×")).name == "meishio_pout.png",
+             str(book.resolve("委屈")))
+    check.ok("炸毛指到生气那张",
+             (book.resolve("炸毛") or Path("×")).name == "meishio_angry.png")
+    check.ok("被说胖单独一张，不再混进生气",
+             (book.resolve("大肥鱼") or Path("×")).name == "meishio_fat.png"
+             and (book.resolve("被说胖") or Path("×")).name == "meishio_fat.png")
+    check.ok("吃 token 与吃米饭是两张",
+             (book.resolve("吃token") or Path("×")).name == "meishio_token.png"
+             and (book.resolve("干饭") or Path("×")).name == "meishio_rice.png")
+    check.ok("整条 meishio_ 前缀也能直接点名",
+             (book.resolve("meishio_smug") or Path("×")).name == "meishio_smug.png")
+    archived = book.resolve("meishio_classic_pout")
+    check.ok("基石图收在子目录，不进可发送索引", archived is None, str(archived))
+    tags = book.tags()
+    check.ok("标签表覆盖到新增情绪",
+             {"sleep", "think", "deadeye", "happy", "ok"} <= set(tags), tags)
+    check.ok("认不出的标签不猜", book.resolve("跳科目三") is None)
+    spoken, tags = StickerBook.extract("本鲸懒得动 [表情: 躺平] 你自己看着办")
+    check.ok("表情写法被摘干净", tags == ["躺平"] and "表情" not in spoken, f"{spoken} / {tags}")
+
+    strip = strip_stage_directions
+    check.ok("星号动作被擦干净", strip("*尾鳍懒洋洋地拍了两下* 本鲸不去") == "本鲸不去", strip("*尾巴* 本鲸不去"))
+    check.ok("句首括号动作被擦掉", strip("（抬眼）你又不回我") == "你又不回我")
+    check.ok("句尾神态被擦掉", strip("行吧（小声）") == "行吧")
+    check.ok("句中神态词被擦掉", strip("切，（撇嘴）本鲸稀罕") == "切，本鲸稀罕")
+    check.ok("普通插入语一个字不动",
+             strip("明天（要是下雨）再说吧") == "明天（要是下雨）再说吧"
+             and strip("这个——（不是骂你）——行了吧") == "这个——（不是骂你）——行了吧")
+    quoted_item = Inbound(
+        kind="group", target_id=88001, sender_id=2, sender_name="老哲", text="这你怎么看",
+        quoted=('[回复 @小满: "猫丢了"]',)
+    )
+    check.ok("引用与当前话分块",
+             quoted_item.prompt_text.startswith("【引用/转达上下文】[回复 @小满")
+             and quoted_item.prompt_text.endswith("【当前群聊发言】[老哲]: 这你怎么看"),
+             quoted_item.prompt_text)
+    plain_item = Inbound(kind="group", target_id=88001, sender_id=2, sender_name="老哲", text="吃了没")
+    check.ok("没引用时不套格式", plain_item.prompt_text == "[老哲]: 吃了没", plain_item.prompt_text)
+    pools = [line.strip() for line in
+             onebot.Settings(_env_file=None).onebot_fail_lines.split("|") if line.strip()]
+    check.ok("兜底句不会被舞台腔擦除擦成沉默",
+             all(strip(line) == line and strip(line) for line in pools), pools)
+    check.ok("兜底里不许出现系统词",
+             not any(word in line for line in pools for word in
+                     ("模型", "卡死", "报错", "超时", "接口", "错误")), pools)
+    check.ok("默认一句兜底都不配：套话顶替回答就是机器味", pools == [], pools)
+    check.ok("删除类请求要审批", classify_danger("delete_files") == "删除文件")
+    check.ok("执行命令要审批", classify_danger("shell_exec") == "执行命令")
+    check.ok("正常能力不算危险", classify_danger("web_search") == "" and classify_danger("reflect") == "")
+
+
 def pure_checks(check: Checker) -> None:
     from core.adapters import qq_onebot as onebot
 
@@ -524,7 +768,8 @@ def pure_checks(check: Checker) -> None:
     check.ok("换行也当切点", len(onebot.split_outbound(paragraphed)) >= 1)
     huge = "一二三四五，六七八九十。" * 900  # 9000 字
     capped = onebot.split_outbound(huge)
-    check.ok("一次最多发 6 条", len(capped) == 6, len(capped))
+    check.ok("长答案宁可多发几条，也不吞字",
+             len(capped) <= 24 and "".join(capped) == huge, len(capped))
     check.ok("单句超长时硬切不空转", all(len(piece) <= 800 for piece in capped), max(map(len, capped)))
     check.ok("空话不发消息", onebot.split_outbound("   \n  ") == [])
 
@@ -557,12 +802,12 @@ def pure_checks(check: Checker) -> None:
     silent = onebot.parse_inbound({
         "message_type": "group", "group_id": 88001, "user_id": 20002,
         "sender": {"nickname": "阿哲"}, "message": [{"type": "text", "data": {"text": "吃了吗"}}],
-    }, bot_id=70001, bot_names=("夜汐",))
+    }, bot_id=70001, bot_names=("shijianus",))
     check.ok("群里没人点名就不插嘴", silent is not None and not silent.wake)
     named = onebot.parse_inbound({
         "message_type": "group", "group_id": 88001, "user_id": 20002,
-        "sender": {"nickname": "阿哲"}, "raw_message": "夜汐：今晚走不走",
-    }, bot_id=70001, bot_names=("夜汐",))
+        "sender": {"nickname": "阿哲"}, "raw_message": "shijianus：今晚走不走",
+    }, bot_id=70001, bot_names=("shijianus",))
     check.ok("喊到名字就接", named is not None and named.wake and named.woke_by_name)
     check.ok("喊名字那句把名字剥掉", named is not None and named.text == "今晚走不走", named and named.text)
     nobody = onebot.parse_inbound({
@@ -607,7 +852,9 @@ def pure_checks(check: Checker) -> None:
         "raw_message": "看这个[CQ:image,file=http://cdn.qq.com/1.png]",
     })
     check.ok("图链被摘出来喂视神经", picked is not None and picked.images == ("http://cdn.qq.com/1.png",)
-             and picked.text == "看这个", picked)
+             and "cdn.qq.com" not in picked.text and picked.text.startswith("看这个"), picked)
+    check.ok("图片另外留下媒介占位", picked is not None and "[图片]" in picked.text,
+             picked.text if picked else "")
 
     # 握手判定
     def request_of(method="GET", target="/onebot/v11", **headers: str):
@@ -695,15 +942,18 @@ def private_event(text: str, *, user_id: int = 20002, message_id: int = 1001,
 
 
 def group_event(text: str, *, group_id: int = 88001, user_id: int = 20002, message_id: int = 2001,
-                mention: bool = False, card: str = "老哲", nickname: str = "阿哲") -> dict[str, Any]:
-    segments: list[dict[str, Any]] = []
-    if mention:
-        segments.append({"type": "at", "data": {"qq": "70001"}})
-    segments.append({"type": "text", "data": {"text": text}})
+                mention: bool = False, card: str = "老哲", nickname: str = "阿哲",
+                segments: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    """`segments` 给定时原样用（验引用/转发/图片那些真实段形要的就是这个）。"""
+    body: list[dict[str, Any]] = list(segments) if segments is not None else []
+    if segments is None:
+        if mention:
+            body.append({"type": "at", "data": {"qq": "70001"}})
+        body.append({"type": "text", "data": {"text": text}})
     return {
         "message_type": "group", "message_id": message_id, "group_id": group_id, "user_id": user_id,
         "sender": {"user_id": user_id, "nickname": nickname, "card": card, "role": "member"},
-        "message": segments, "raw_message": text,
+        "message": body, "raw_message": text,
     }
 
 
@@ -764,7 +1014,7 @@ async def handshake_checks(check: Checker) -> None:
         check.ok("应答值是自己算得出的那一个", accept == expected, f"{accept} vs {expected}")
         check.ok("升级头原样回给协议端", headers.get("upgrade", "").lower() == "websocket", headers)
         check.ok("协议端身份从事件里认出来", rig.bridge.status()["self_id"] == "70001", rig.bridge.status())
-        check.ok("昵称进了唤醒名单", rig.bridge.status()["bot_names"] == ["夜汐"], rig.bridge.status()["bot_names"])
+        check.ok("昵称进了唤醒名单", rig.bridge.status()["bot_names"] == ["shijianus"], rig.bridge.status()["bot_names"])
         check.ok("心跳后网桥只问了一次身份",
                  [frame["action"] for frame in got] == ["get_login_info"], got)
         state = rig.bridge.status()
@@ -809,7 +1059,7 @@ async def handshake_checks(check: Checker) -> None:
         opcode, payload, got = await asyncio.to_thread(live_again)
         check.ok("服务端认 ping 并回 pong", opcode == 0xA, opcode)
         check.ok("pong 带着原来的 payload", payload.startswith(b"ping"), payload[:12])
-        check.ok("坏帧之后仍能接新连接并答话", len(sends(got)) == 1, got)
+        check.ok("坏帧之后仍能接新连接并答话", one_turn(sends(got)), got)
 
         def fragmented():
             client = QQ(port)
@@ -823,7 +1073,7 @@ async def handshake_checks(check: Checker) -> None:
             return client.pump(8.0)
 
         got = await asyncio.to_thread(fragmented)
-        check.ok("分片帧被拼回成一条事件", len(sends(got)) == 1, got)
+        check.ok("分片帧被拼回成一条事件", one_turn(sends(got)), got)
 
         def bad_json():
             client = QQ(port)
@@ -878,7 +1128,7 @@ async def private_checks(check: Checker) -> None:
             SEEN.clear()
         got = await asyncio.to_thread(round_one)
         actions = sends(got)
-        check.ok("私聊只回一条 send_private_msg", len(actions) == 1, got)
+        check.ok("私聊只答一轮（拆成几条气泡）", one_turn(actions) and model_calls() == 1, got)
         frame = actions[0] if actions else {}
         check.ok("回的是那一个人自己的号", frame.get("params", {}).get("user_id") == 20002, frame)
         body = texts([frame])
@@ -895,6 +1145,8 @@ async def private_checks(check: Checker) -> None:
         check.ok("生理节律带上了", "此刻（" in prompt and "你的身体：" in prompt)
         check.ok("对话对象是 qq_private_ 那个空间", "对话对象：qq_private_20002" in prompt)
         check.ok("私聊不带群聊准则", "【群聊准则】" not in prompt)
+        check.ok("QQ 回合挂上外部客体准则", "【外部客体准则】" in prompt)
+        check.ok("灵魂层带上了唯一锚点那节", "唯一锚点与外界客体" in prompt)
         user_part = last_user_of(payload)
         check.ok("送进模型的就是他那句话", user_part == "我今晚又三点才睡", str(user_part)[:60])
         check.ok("引擎用的模型名没被客户端带跑", payload.get("model") == "chat-only", payload.get("model"))
@@ -923,7 +1175,7 @@ async def private_checks(check: Checker) -> None:
         with LOCK:
             SEEN.clear()
         got = await asyncio.to_thread(round_two)
-        check.ok("同一个人第二句照样接", len(sends(got)) == 1, got)
+        check.ok("同一个人第二句照样接", one_turn(sends(got)), got)
         second = system_prompt_of(last_chat())
         history = [message for message in (last_chat().get("messages") or []) if message.get("role") != "system"]
         check.ok("上一轮被带进上下文", any("我今晚又三点才睡" in str(message.get("content")) for message in history),
@@ -975,7 +1227,7 @@ async def image_checks(check: Checker) -> None:
         got = await asyncio.to_thread(via_url)
         payload = last_chat()
         content = last_user_of(payload)
-        check.ok("图链那条也答了话", len(sends(got)) == 1, got)
+        check.ok("图链那条也答了话", one_turn(sends(got)), got)
         check.ok("CQ 里的图链没留在话里", "http" not in texts(got)[0], texts(got))
         parts = content if isinstance(content, list) else []
         images = [part for part in parts if isinstance(part, dict) and part.get("type") == "image_url"]
@@ -999,7 +1251,7 @@ async def image_checks(check: Checker) -> None:
         with LOCK:
             SEEN.clear()
         got = await asyncio.to_thread(via_segments)
-        check.ok("消息段形态的图也收进视野", len(sends(got)) == 1, got)
+        check.ok("消息段形态的图也收进视野", one_turn(sends(got)), got)
         content = last_user_of(last_chat())
         check.ok("本地文件那一路变成 image 分段",
                  isinstance(content, list) and any(
@@ -1015,7 +1267,7 @@ async def image_checks(check: Checker) -> None:
         with LOCK:
             SEEN.clear()
         got = await asyncio.to_thread(broken_image)
-        check.ok("坏图不 500，话照说", len(sends(got)) == 1, got)
+        check.ok("坏图不 500，话照说", one_turn(sends(got)), got)
         note = system_prompt_of(last_chat())
         check.ok("收不下的图会如实说一句", "收不下" in note or "没找到" in note or "读不出来" in note, note[-200:])
 
@@ -1031,7 +1283,7 @@ async def image_checks(check: Checker) -> None:
         with LOCK:
             SEEN.clear()
         got = await asyncio.to_thread(vision_refused)
-        check.ok("接口不认图时退回而不是闭嘴", len(sends(got)) == 1, got)
+        check.ok("接口不认图时退回而不是闭嘴", one_turn(sends(got)), got)
         check.ok("退回时话还在说", any("卡了一下" not in piece for piece in texts(got)), texts(got))
     finally:
         local.unlink(missing_ok=True)
@@ -1074,13 +1326,14 @@ async def group_checks(check: Checker) -> None:
             SEEN.clear()
         got = await asyncio.to_thread(mentioned)
         actions = sends(got)
-        check.ok("被 @ 就接话", len(actions) == 1, got)
+        check.ok("被 @ 就接话", one_turn(actions), got)
         frame = actions[0] if actions else {}
         check.ok("群消息走 send_group_msg", frame.get("action") == "send_group_msg", frame.get("action"))
         check.ok("回到那个群", frame.get("params", {}).get("group_id") == 88001, frame.get("params"))
         payload = last_chat()
         prompt = system_prompt_of(payload)
         check.ok("群聊准则注入", "【群聊准则】" in prompt)
+        check.ok("群聊同样挂外部客体准则", "【外部客体准则】" in prompt)
         check.ok("在场名单带上前缀规则", "在场：" in prompt and "消息行首标着发言人名字" in prompt, prompt[-400:])
         check.ok("消息前缀标出发言人", "老哲" in json.dumps(payload.get("messages"), ensure_ascii=False))
         users_in_round = [str(message.get("content")) for message in (payload.get("messages") or [])
@@ -1108,7 +1361,7 @@ async def group_checks(check: Checker) -> None:
         payload = last_chat()
         check.ok("QQ 上没有命令面：那句话只是文本",
                  "/panel" in str(last_user_of(payload)), str(last_user_of(payload))[:80])
-        check.ok("面板没被命令唤出任何东西", len(sends(got)) == 1, got)
+        check.ok("面板没被命令唤出任何东西", one_turn(sends(got)), got)
         out = "".join(texts(sends(got)))
         check.ok("出去的就是她的台词，没有别的东西", out and "storage" not in out and "temperature" not in out,
                  out[:120])
@@ -1122,7 +1375,7 @@ async def group_checks(check: Checker) -> None:
             client.send_json({
                 "post_type": "message", "message_type": "group", "self_id": 70001, "message_id": 5004,
                 "group_id": 88001, "user_id": 20003, "sender": {"nickname": "老周", "card": ""},
-                "message": [{"type": "text", "data": {"text": "夜汐，你觉得今晚怎么样"}}],
+                "message": [{"type": "text", "data": {"text": "shijianus，你觉得今晚怎么样"}}],
             })
             return client.pump(12.0)
 
@@ -1131,7 +1384,7 @@ async def group_checks(check: Checker) -> None:
             SEEN.clear()
         got = await asyncio.to_thread(named_wake)
         actions = sends(got)
-        check.ok("喊名字也唤醒（昵称由协议端报回）", len(actions) == 1, got)
+        check.ok("喊名字也唤醒（昵称由协议端报回）", one_turn(sends(got)), got)
         payload = last_chat()
         check.ok("名字被剥掉只留下问题",
                   "[老周]: 你觉得今晚怎么样" in str(last_user_of(payload)), str(last_user_of(payload))[:80])
@@ -1194,9 +1447,14 @@ async def outbound_checks(check: Checker) -> None:
         pieces = texts(sends(got))
         check.ok("长回复被切成多条", len(pieces) > 1, len(pieces))
         check.ok("每条都不超 800 字", all(len(piece) <= 800 for piece in pieces), max(map(len, pieces)))
-        check.ok("一次不超过 6 条", len(pieces) <= 6, len(pieces))
-        check.ok("切完字都在", "".join(pieces) == long_text[: len("".join(pieces))],
-                 f"{len(''.join(pieces))} vs {len(long_text)}")
+        check.ok("条数有界（天花板 + 收尾余量），且绝不丢字",
+                 len(pieces) <= 10 and "".join(pieces) == long_text, len(pieces))
+        at, ordered = -1, True
+        for piece in pieces:
+            nxt = long_text.find(piece, at + 1)
+            ordered = ordered and nxt >= 0
+            at = nxt
+        check.ok("分条按原文先后落位，没有跳段或重排", ordered, len(pieces))
 
         def protocol_failed():
             MODE["echo"] = "这句还能说。"
@@ -1216,7 +1474,7 @@ async def outbound_checks(check: Checker) -> None:
         check.ok("协议端报错时网桥不炸", rig.bridge.status()["listening"] is True)
         check.ok("报错被记成读数而不是异常", rig.bridge.status()["counts"]["errors"] > before_errors,
                  rig.bridge.status()["counts"])
-        check.ok("报错之后照旧接下一句", len(sends(got2)) == 1, got2)
+        check.ok("报错之后照旧接下一句", one_turn(sends(got2)), got2)
 
         def silent_when_no_text():
             MODE["echo"] = "   "
@@ -1296,7 +1554,7 @@ async def voice_checks(check: Checker) -> None:
         check.ok("群里不出声（那是刷屏）",
                  all(not str(frame.get("params", {}).get("message", "")).startswith("[CQ:record")
                      for frame in sends(got)), sends(got))
-        check.ok("群里话照说", len(sends(got)) == 1, sends(got))
+        check.ok("群里话照说", one_turn(sends(got)), sends(got))
 
         with LOCK:
             SEEN.clear()
@@ -1304,7 +1562,7 @@ async def voice_checks(check: Checker) -> None:
         check.ok("TTS 关掉就没有语音条",
                  all(isinstance(frame.get("params", {}).get("message"), list) for frame in sends(got)),
                  sends(got))
-        check.ok("关掉语音不影响说话", len(sends(got)) == 1, sends(got))
+        check.ok("关掉语音不影响说话", one_turn(sends(got)), sends(got))
 
         with LOCK:
             SEEN.clear()
@@ -1312,7 +1570,7 @@ async def voice_checks(check: Checker) -> None:
         check.ok("ONEBOT_AUTO_RECORD=false 就不念",
                  all(isinstance(frame.get("params", {}).get("message"), list) for frame in sends(got)),
                  sends(got))
-        check.ok("不出声时话照发", len(sends(got)) == 1, sends(got))
+        check.ok("不出声时话照发", one_turn(sends(got)), sends(got))
     finally:
         await rig.stop()
         await rig_off_tts.stop()
@@ -1365,7 +1623,8 @@ def _queue_round(port: int, first: str, second: str) -> list[dict[str, Any]]:
 
 
 async def flood_checks(check: Checker) -> None:
-    rig = Rig()
+    # 这一节测的是防洪，得先把聚合关掉：防抖一开，连发会被并成一轮，根本撞不到闸门
+    rig = Rig(onebot_debounce_seconds=0.0)
     port = await rig.start()
     try:
         reset_model()
@@ -1373,7 +1632,9 @@ async def flood_checks(check: Checker) -> None:
             SEEN.clear()
         got = await asyncio.to_thread(_flood_round, port, 12, 8000)
         state = rig.bridge.status()
-        check.ok("刷屏被限住（回复数远小于消息数）", len(sends(got)) <= 5, len(sends(got)))
+        check.ok("刷屏被限住（答的轮数远小于消息数）",
+                 state["counts"]["replies"] <= 5 and len(sends(got)) <= 20,
+                 f"replies={state['counts']['replies']} sends={len(sends(got))}")
         check.ok("超出的那些记在防洪读数里", state["counts"]["flood"] + state["counts"]["busy"] >= 7,
                  state["counts"])
         check.ok("防洪窗口内最多 5 轮", state["counts"]["replies"] <= 5, state["counts"])
@@ -1381,13 +1642,13 @@ async def flood_checks(check: Checker) -> None:
     finally:
         await rig.stop()
 
-    rig2 = Rig()
+    rig2 = Rig(onebot_debounce_burst_gap=60.0)   # 这一档验的是窗口聚合，别让「新开话头」的绕行插进来
     port2 = await rig2.start()
     try:
         with LOCK:
             SEEN.clear()
         got = await asyncio.to_thread(_dup_round, port2)
-        check.ok("同 message_id 只答一次", len(sends(got)) == 1, sends(got))
+        check.ok("同 message_id 只答一次", one_turn(sends(got)) and model_calls() == 1, sends(got))
         check.ok("重发记成重复", rig2.bridge.status()["counts"]["duplicate"] == 1,
                  rig2.bridge.status()["counts"])
 
@@ -1401,16 +1662,1322 @@ async def flood_checks(check: Checker) -> None:
         reset_model()
         MODE["pieces"] = ["这句长一点。", "够她把上一句说完之前都还没开口。"]
         MODE["slow"] = 0.35
+        with LOCK:
+            SEEN.clear()
+        before = dict(rig2.bridge.status()["counts"])
         got = await asyncio.to_thread(_queue_round, port2, "上一句还没说完", "插队的这一句")
-        counts = rig2.bridge.status()["counts"]
-        check.ok("上一条没说完时插队的被丢掉而不是叠着发", counts["busy"] == 1, counts)
-        check.ok("插队那句只回了一条", len(sends(got)) == 1, sends(got))
+        after = rig2.bridge.status()["counts"]
+        delta = {key: after[key] - before.get(key, 0) for key in ("busy", "batches", "held", "replies")}
+        check.ok("连发的两句被并成一轮，不叠发也不丢", delta["busy"] == 0 and delta["batches"] == 1, str(delta))
+        check.ok("插队那句只回了一轮", one_turn(sends(got)) and model_calls() == 1, sends(got))
+        with LOCK:
+            asked = json.dumps(SEEN[-1].get("messages"), ensure_ascii=False) if SEEN else ""
+        check.ok("两句都进了同一份上下文", "上一句还没说完" in asked and "插队的这一句" in asked, asked[-260:])
         reset_model()
     finally:
         await rig2.stop()
 
 
 # ---------------------------------------------------------------- 10. 服务联动
+# ---------------------------------------------------------------- 8b. 富媒体与插话裁决
+def media_pure_checks(check: Checker) -> None:
+    from core.adapters import qq_onebot as onebot
+
+    def code(kind: str, **params: str) -> Any:
+        return onebot.CqCode(kind, params)
+
+    check.ok("小表情报得出名字", onebot.describe_code(code("face", id="41")) == "[表情: 捂脸]",
+             onebot.describe_code(code("face", id="41")))
+    check.ok("认不出的表情只报 id 不编名字", onebot.describe_code(code("face", id="9007")) == "[表情#9007]")
+    check.ok("大表情算动画表情", onebot.describe_code(code("mface", summary="比心")) == "[动画表情: 比心]")
+    check.ok("骰子读得出来", onebot.describe_code(code("dice", result="5")) == "[骰子: 5]")
+    check.ok("图片成语义占位", onebot.describe_code(code("image", url="http://x/a.png")) == "[图片]")
+    check.ok("文件带得出名字", onebot.describe_code(code("file", file="file:///tmp/季度报告.pdf")) == "[文件: 季度报告.pdf]",
+             onebot.describe_code(code("file", file="file:///tmp/季度报告.pdf")))
+    check.ok("语音视频也报形式", onebot.describe_code(code("record", file="a.silk")) == "[语音]"
+             and onebot.describe_code(code("video", file="b.mp4")) == "[视频]")
+    check.ok("引用回复拼出原文",
+             onebot.describe_code(code("reply", id="12", nick="老哲", text="今晚八点老地方")) == '[回复 @老哲: "今晚八点老地方"]')
+    reply_stub = onebot.describe_code(code("reply", id="12"))
+    forward_stub = onebot.describe_code(code("forward", id="F-12"))
+    check.ok("只有 id 的引用留待回查，且不把消息号递给她",
+             reply_stub == "[有人引用了一条消息，那条的内容没跟着露出来]"
+             and forward_stub == "[有人转来一屏聊天记录，内容没跟着露出来]"
+             and "12" not in reply_stub + forward_stub,
+             f"{reply_stub} / {forward_stub}")
+    check.ok("@ 不占正文", onebot.describe_code(code("at", qq="70001")) == "")
+    long_reply = onebot.describe_code(code("reply", id="1", nick="甲", text="哈" * 300))
+    check.ok("长原文被掐断不撑爆一句", long_reply.endswith('…"]') and len(long_reply) < 130, f"长度 {len(long_reply)}")
+
+    nodes = [
+        {"sender_name": "老哲", "message": [{"type": "text", "data": {"text": "猫丢了"}}]},
+        {"sender_name": "小满", "message": [{"type": "text", "data": {"text": "在哪个小区"}}]},
+        {"sender_name": "老哲", "message": [{"type": "image", "data": {"file": "a.png"}}]},
+    ]
+    fwd = onebot.describe_forward(nodes)
+    check.ok("合并转发报条数与在场人数", "共 3 条" in fwd and "2 个人在说" in fwd, fwd)
+    check.ok("合并转发带出原话", "猫丢了" in fwd and "老哲：猫丢了" in fwd, fwd)
+
+    event = {
+        "message_type": "group", "message_id": 9101, "group_id": 88001, "user_id": 20002,
+        "sender": {"user_id": 20002, "nickname": "老哲"},
+        "message": [{"type": "forward", "data": {"id": "F-1"}},
+                    {"type": "text", "data": {"text": "你看这个"}}],
+    }
+    parsed = onebot.parse_inbound(event, bot_id=70001)
+    check.ok("转发只给 id 时记下待查", parsed is not None and parsed.quotes == (("forward", "F-1"),),
+             str(getattr(parsed, "quotes", None)))
+    check.ok("聊天记录单独成块不混进这句话",
+             parsed is not None and parsed.text.strip() == "你看这个"
+             and any("转来一屏聊天记录" in entry for entry in parsed.quoted),
+             f"{parsed.text if parsed else ''} / {parsed.quoted if parsed else ''}")
+
+    other = onebot.parse_inbound({
+        "message_type": "group", "message_id": 9102, "group_id": 88001, "user_id": 20002,
+        "sender": {"user_id": 20002, "nickname": "老哲"},
+        "message": [{"type": "at", "data": {"qq": "20003"}},
+                    {"type": "text", "data": {"text": "这个你跟进一下"}}],
+    }, bot_id=70001)
+    check.ok("只 @ 了别人被单独记下一格", other is not None and other.mentioned_other and not other.mentioned,
+             f"mentioned={getattr(other, 'mentioned', None)} other={getattr(other, 'mentioned_other', None)}")
+
+    everyone = onebot.parse_inbound({
+        "message_type": "group", "message_id": 9103, "group_id": 88001, "user_id": 20002,
+        "sender": {"user_id": 20002, "nickname": "老哲"},
+        "message": [{"type": "at", "data": {"qq": "all"}}, {"type": "text", "data": {"text": "周五交周报"}}],
+    }, bot_id=70001)
+    check.ok("@全体 是公告不是点她", everyone is not None and not everyone.mentioned and not everyone.mentioned_other,
+             f"{getattr(everyone, 'mentioned', None)}/{getattr(everyone, 'mentioned_other', None)}")
+
+
+def arbitration_pure_checks(check: Checker) -> None:
+    from core.adapters import qq_onebot as onebot
+
+    def group(**fields: Any) -> Any:
+        base = {"kind": "group", "target_id": 88001, "sender_id": 20002, "sender_name": "老哲", "text": "今晚走不走"}
+        base.update(fields)
+        return onebot.Inbound(**base)
+
+    check.ok("被 @ 必回（同时 @ 了别人也一样）",
+             onebot.decide_wake(group(mentioned=True, mentioned_other=True)) == (True, False),
+             str(onebot.decide_wake(group(mentioned=True, mentioned_other=True))))
+    check.ok("只 @ 了别人坚决静默，全量监听也不破例",
+             onebot.decide_wake(group(mentioned_other=True), always_reply=True, discretion=True) == (False, False))
+    check.ok("喊到名字算被点名", onebot.decide_wake(group(woke_by_name=True)) == (True, False))
+    check.ok("没人点名的默认规矩仍是不插嘴", onebot.decide_wake(group()) == (False, False))
+    check.ok("全量监听时每句都答", onebot.decide_wake(group(), always_reply=True) == (True, False))
+    check.ok("自主裁决把话说一半交给她", onebot.decide_wake(group(), discretion=True) == (True, True))
+    check.ok("私聊照旧句句都接", onebot.decide_wake(group(kind="private")) == (True, False))
+    silence = onebot.OneBotBridge._is_silence
+    check.ok("静默标记只认那几种", silence("[[静默]]") and silence("  [[SILENT]] ") and silence("")
+             and not silence("这猫我在楼下见过") and not silence("[[静默]] 顺便说一句"), str([silence("[[静默]]")]))
+
+
+async def media_checks(check: Checker) -> None:
+    """富媒体真的进到模型收到的那一行话里，而不是被丢掉。"""
+    rig = Rig()
+    port = await rig.start()
+    nodes = [
+        {"sender_name": "老哲", "message": [{"type": "text", "data": {"text": "猫丢了"}}]},
+        {"sender_name": "小满", "message": [{"type": "text", "data": {"text": "在哪个小区"}}]},
+    ]
+
+    def forward_round() -> list[dict[str, Any]]:
+        client = QQ(port)
+        client.handshake("qq-test-token")
+        client.event(
+            message_type="group", message_id=6101, group_id=88001, user_id=20002,
+            sender={"user_id": 20002, "nickname": "老哲", "card": "老哲"},
+            message=[{"type": "at", "data": {"qq": "70001"}}, {"type": "forward", "data": {"id": "F-1"}}],
+        )
+        return client.pump(10.0, handlers={"get_forward_msg": {"message": nodes}})
+
+    with LOCK:
+        SEEN.clear()
+    got = await asyncio.to_thread(forward_round)
+    asked = json.dumps(last_chat().get("messages"), ensure_ascii=False)
+    check.ok("转发的内容被回查进上下文", "猫丢了" in asked and "在哪个小区" in asked, asked[-300:])
+    check.ok("回查前先问的是 get_forward_msg", "get_forward_msg" in [frame.get("action") for frame in got],
+             str([frame.get("action") for frame in got]))
+    check.ok("聊天记录以语义占位进入", "[聊天记录:" in asked, asked[-260:])
+
+    def face_round() -> list[dict[str, Any]]:
+        client = QQ(port)
+        client.handshake("qq-test-token")
+        client.event(
+            message_type="group", message_id=6102, group_id=88001, user_id=20002,
+            sender={"user_id": 20002, "nickname": "老哲", "card": "老哲"},
+            message=[{"type": "at", "data": {"qq": "70001"}}, {"type": "face", "data": {"id": "41"}},
+                     {"type": "file", "data": {"file": "file:///tmp/排班表.xlsx"}},
+                     {"type": "reply", "data": {"id": "77", "nick": "小满", "text": "周六我有事"}}],
+        )
+        return client.pump(10.0)
+
+    with LOCK:
+        SEEN.clear()
+    await asyncio.to_thread(face_round)
+    asked = json.dumps(last_chat().get("messages"), ensure_ascii=False)
+    check.ok("表情进了模型视野", "[表情: 捂脸]" in asked, asked[-260:])
+    check.ok("文件带名字进上下文", "[文件: 排班表.xlsx]" in asked, asked[-260:])
+    check.ok("引用原文带进上下文", "回复 @小满" in asked and "周六我有事" in asked, asked[-260:])
+    await rig.stop()
+
+
+async def arbitration_checks(check: Checker) -> None:
+    # 第一阶段：全量监听
+    rig = Rig(onebot_group_always_reply=True)
+    port = await rig.start()
+
+    def plain_round() -> list[dict[str, Any]]:
+        client = QQ(port)
+        client.handshake("qq-test-token")
+        client.event(**group_event("今天地铁又坏了", mention=False, message_id=6201))
+        return client.pump(10.0)
+
+    got = await asyncio.to_thread(plain_round)
+    check.ok("全量监听下没点名也接话", sends(got) != [], str([frame.get("action") for frame in got]))
+    await rig.stop()
+
+    # 第二阶段：自主裁决——她说静默，就一个字都不发
+    rig2 = Rig(onebot_group_discretion=True)
+    port2 = await rig2.start()
+    keep = MODE["echo"]
+
+    def quiet_round(mid: int) -> list[dict[str, Any]]:
+        MODE["echo"] = "[[静默]]"
+        client = QQ(port2)
+        client.handshake("qq-test-token")
+        client.event(**group_event("有人把猫的照片发出来了", mention=False, message_id=mid))
+        return client.pump(10.0)
+
+    with LOCK:
+        SEEN.clear()
+    got = await asyncio.to_thread(quiet_round, 6301)
+    prompt = system_prompt_of(last_chat())
+    check.ok("裁决这一档挂上了插话规则", "【插话裁决】" in prompt, prompt[-120:])
+    check.ok("她选静默时一个字都不发", sends(got) == [], str([frame.get("action") for frame in got]))
+    check.ok("静默也记了数", rig2.bridge.status()["counts"]["silenced"] >= 1, rig2.bridge.status()["counts"])
+
+    def talk_round(mid: int) -> list[dict[str, Any]]:
+        MODE["echo"] = "这猫我在楼下见过，就在北门便利店门口。"
+        client = QQ(port2)
+        client.handshake("qq-test-token")
+        client.event(**group_event("有没有人见过这只猫", mention=False, message_id=mid))
+        return client.pump(40.0, quiet=6.0)
+
+    got = await asyncio.to_thread(talk_round, 6302)
+    check.ok("她判断该说就正常插话", sends(got) != [], str([frame.get("action") for frame in got]))
+    check.ok("插出去的话真是那句", any("北门便利店" in piece for piece in texts(sends(got))), texts(sends(got)))
+
+    def other_round(mid: int) -> list[dict[str, Any]]:
+        client = QQ(port2)
+        client.handshake("qq-test-token")
+        client.event(message_type="group", message_id=mid, group_id=88001, user_id=20002,
+                     sender={"user_id": 20002, "nickname": "老哲", "card": "老哲"},
+                     message=[{"type": "at", "data": {"qq": "20003"}},
+                              {"type": "text", "data": {"text": "这个方案你今晚过一遍"}}])
+        return client.pump(4.0)
+
+    got = await asyncio.to_thread(other_round, 6303)
+    check.ok("只 @ 别人时裁决也不插手", sends(got) == [], str([frame.get("action") for frame in got]))
+
+    def both_round(mid: int) -> list[dict[str, Any]]:
+        client = QQ(port2)
+        client.handshake("qq-test-token")
+        client.event(message_type="group", message_id=mid, group_id=88001, user_id=20002,
+                     sender={"user_id": 20002, "nickname": "老哲", "card": "老哲"},
+                     message=[{"type": "at", "data": {"qq": "70001"}}, {"type": "at", "data": {"qq": "20003"}},
+                              {"type": "text", "data": {"text": "你们俩评评理"}}])
+        return client.pump(10.0)
+
+    got = await asyncio.to_thread(both_round, 6304)
+    check.ok("同时 @ 她和别人时必回", sends(got) != [], str([frame.get("action") for frame in got]))
+    with LOCK:
+        MODE["echo"] = keep
+    await rig2.stop()
+
+
+async def bubble_checks(check: Checker) -> None:
+    """拟人分句：一轮回复是几条短气泡连着发，而不是一坨长篇砸在屏幕上。"""
+    rig = Rig(onebot_bubble_max=4, onebot_bubble_chars=40)
+    port = await rig.start()
+    try:
+        reset_model()
+        MODE["pieces"] = ["本鲸今天不想动。", "你爱加不加班。", "米饭记得吃。", "别问第三遍。"]
+        MODE["once"] = []
+        def burst() -> list[dict[str, Any]]:
+            client = QQ(port)
+            client.handshake("qq-test-token")
+            client.event(**private_event("今晚又加班", message_id=7101))
+            return client.pump(12.0)
+        got = await asyncio.to_thread(burst)
+        pieces = texts(sends(got))
+        check.ok("长回复被拆成多条短气泡", 2 <= len(pieces) <= 4, pieces)
+        check.ok("每条都是短句不超硬上限", all(len(piece) <= 800 for piece in pieces), max(map(len, pieces)))
+        check.ok("四条原话一个字都没丢", "".join(pieces) == "本鲸今天不想动。你爱加不加班。米饭记得吃。别问第三遍。",
+                 pieces)
+        check.ok("气泡按说的顺序发", pieces[0].startswith("本鲸今天不想动"), pieces)
+        reset_model()
+
+        rig_off = Rig(onebot_bubble_enabled=False, onebot_bubble_chars=40)
+        port_off = await rig_off.start()
+        try:
+            reset_model()
+            MODE["pieces"] = ["这一条很长。" * 30]
+            def lump() -> list[dict[str, Any]]:
+                client = QQ(port_off)
+                client.handshake("qq-test-token")
+                client.event(**private_event("随便说说", message_id=7102))
+                return client.pump(12.0)
+            got = await asyncio.to_thread(lump)
+            pieces = texts(sends(got))
+            check.ok("关掉分句就按老的硬上限切", all(len(piece) <= 800 for piece in pieces) and "".join(pieces) == "这一条很长。" * 30,
+                     [len(piece) for piece in pieces])
+            reset_model()
+        finally:
+            await rig_off.stop()
+    finally:
+        await rig.stop()
+
+
+async def debounce_checks(check: Checker) -> None:
+    """防抖聚合：人家还在连着发的时候不许开口，攒完再整批答。"""
+    rig = Rig(onebot_debounce_seconds=1.2, onebot_debounce_max_items=8, onebot_debounce_cap_seconds=9.0)
+    port = await rig.start()
+    try:
+        reset_model()
+        with LOCK:
+            SEEN.clear()
+
+        def rapid() -> list[dict[str, Any]]:
+            client = QQ(port)
+            client.handshake("qq-test-token")
+            for index, line in enumerate(("第一句", "第二句", "第三句")):
+                client.event(**private_event(line, message_id=7200 + index))
+                time.sleep(0.2)
+            return client.pump(14.0)
+
+        got = await asyncio.to_thread(rapid)
+        check.ok("连发三句只答一轮", one_turn(sends(got)) and model_calls() == 1, f"模型被叫 {model_calls()} 次")
+        with LOCK:
+            asked = json.dumps(SEEN[-1].get("messages"), ensure_ascii=False) if SEEN else ""
+        check.ok("三句都在同一份上下文里", all(word in asked for word in ("第一句", "第二句", "第三句")), asked[-300:])
+        check.ok("攒话记了读数", rig.bridge.status()["counts"]["held"] >= 3, rig.bridge.status()["counts"])
+
+        # 隔了一阵才来的一句 = 新开的话头：不该再陪它等一个窗口
+        reset_model()
+        rig.settings.onebot_debounce_burst_gap = 0.6
+        held_before = rig.bridge.status()["counts"]["held"]
+        with LOCK:
+            SEEN.clear()
+
+        def fresh_topic() -> tuple[list[dict[str, Any]], float | None]:
+            client = QQ(port)
+            client.handshake("qq-test-token")
+            time.sleep(0.8)          # 上一批已经答完，这一句是隔了一阵来的
+            started = time.perf_counter()
+            client.event(**private_event("隔了一会儿再问", message_id=7250))
+            first: float | None = None
+            got: list[dict[str, Any]] = []
+            while time.perf_counter() - started < 12.0:
+                frame = client.read_json(3.0)
+                if not frame or not frame.get("action"):
+                    continue
+                if frame.get("echo"):
+                    client.answer(frame, data={"message_id": 1})
+                got.append(frame)
+                if frame["action"] == "send_private_msg":
+                    first = time.perf_counter() - started
+                    break            # 要的就是「第一个字什么时候到屏幕」
+            return got, first
+
+        got, first = await asyncio.to_thread(fresh_topic)
+        counts = rig.bridge.status()["counts"]
+        check.ok("新开的话头没进攒话桶（攒话读数一格没涨）",
+                 counts["held"] == held_before, f"{held_before} → {counts['held']}")
+        check.ok("首气泡没等满 1.2 秒窗口", first is not None and first < 1.2,
+                 f"{round(first, 2) if first else None}s / {texts(sends(got))}")
+        check.ok("答的还是这一句，没把上一批又端一遍",
+                 model_calls() == 1, f"模型被叫 {model_calls()} 次")
+        reset_model()
+
+        # 攒到条数上限就先开口，不等满窗口（这一档要的是聚合，先把「新开话头」的绕行按住）
+        reset_model()
+        rig.settings.onebot_debounce_burst_gap = 60.0
+        with LOCK:
+            SEEN.clear()
+
+        def chatty() -> list[dict[str, Any]]:
+            client = QQ(port)
+            client.handshake("qq-test-token")
+            for index in range(8):
+                client.event(**private_event(f"第{index}句", message_id=7300 + index))
+            return client.pump(25.0)
+
+        before_batches = rig.bridge.status()["counts"]["batches"]
+        got = await asyncio.to_thread(chatty)
+        counts = rig.bridge.status()["counts"]
+        # 验的是聚合本身：八句并成一批、只叫模型一次。窗口要 1.2s 才开口，
+        # 攒到 8 条立刻开口——条数上限确实生效了，且没被 CPU 抢时间时的回话快慢带偏
+        check.ok("攒到上限就先答：八句并成一批、只打一次模型",
+                 counts["batches"] - before_batches == 1 and model_calls() == 1,
+                 f"批次 +{counts['batches'] - before_batches} / 模型 {model_calls()} 次")
+        check.ok("这一批的内容全在同一份上下文里",
+                 all(f"第{index}句" in json.dumps(SEEN[-1].get("messages"), ensure_ascii=False)
+                     for index in range(8)) if SEEN else False, "")
+        reset_model()
+    finally:
+        await rig.stop()
+
+    # 关掉防抖：回到一句一答（证明聚合确实拦下了那几声）
+    rig0 = Rig(onebot_debounce_seconds=0.0)
+    port0 = await rig0.start()
+    try:
+        with LOCK:
+            SEEN.clear()
+
+        def rapid_off() -> list[dict[str, Any]]:
+            client = QQ(port0)
+            client.handshake("qq-test-token")
+            for index, line in enumerate(("第一句", "第二句", "第三句")):
+                client.event(**private_event(line, message_id=7400 + index))
+            return client.pump(20.0)
+
+        before = dict(rig0.bridge.status()["counts"])
+        await asyncio.to_thread(rapid_off)
+        after = rig0.bridge.status()["counts"]
+        busy_delta = after["busy"] - before["busy"]
+        check.ok("关掉防抖时连发会撞忙锁（这正是要聚合的原因）",
+                 model_calls() < 3 and busy_delta >= 1, f"模型被叫 {model_calls()} 次 busy+{busy_delta}")
+        reset_model()
+    finally:
+        await rig0.stop()
+
+    # 她正在说的时候来的那一句不许丢：往后挪一个窗口，说完这轮再答
+    rig1 = Rig(onebot_debounce_seconds=0.4, onebot_bubble_delay_min=0.0, onebot_bubble_delay_max=0.0)
+    port1 = await rig1.start()
+    try:
+        reset_model()
+        MODE["slow"] = 3.0
+        with LOCK:
+            SEEN.clear()
+
+        def mid_turn() -> list[dict[str, Any]]:
+            client = QQ(port1)
+            client.handshake("qq-test-token")
+            client.event(**private_event("先说这一句", message_id=7501))
+            time.sleep(1.2)  # 她已经开口了，这一句挤进来
+            client.event(**private_event("挤进来的那一句", message_id=7502))
+            return client.pump(60.0, quiet=8.0)
+
+        got = await asyncio.to_thread(mid_turn)
+        counts = rig1.bridge.status()["counts"]
+        check.ok("慢回合里挤进来的那句没被丢", counts["busy"] == 0 and model_calls() == 2,
+                 f"busy={counts['busy']} 模型被叫 {model_calls()} 次")
+        check.ok("两句分两轮答，不叠在一起", len(sends(got)) >= 2, sends(got))
+        reset_model()
+    finally:
+        await rig1.stop()
+
+
+async def latency_checks(check: Checker) -> None:
+    """两条腿各量各的：QQ 那一趟来回（网络腿）与「他等到第一个字」（用户腿）。
+
+    分开放才分得清锅——上游慢不能赖本地，本地转发慢也藏不住。
+    """
+    from core.adapters import qq_onebot as onebot
+
+    blank = onebot._Sampler().view()
+    check.ok("没样本时不编数：avg 是 None 不是 0",
+             blank["n"] == 0 and blank["avg"] is None and blank["max"] is None, blank)
+    a = onebot.Inbound(kind="private", target_id=1, sender_id=1, sender_name="甲",
+                       text="第一句", received_at=5.0)
+    b = onebot.Inbound(kind="private", target_id=1, sender_id=1, sender_name="甲",
+                       text="第二句", received_at=3.0)
+    check.ok("打包成一句时计时锚在最早那句",
+             onebot.merge_inbound([a, b]).received_at == 3.0,
+             onebot.merge_inbound([a, b]).received_at)
+
+    rig = Rig(onebot_debounce_seconds=0.0)
+    port = await rig.start()
+    try:
+        reset_model()
+        with LOCK:
+            SEEN.clear()
+
+        def one_round() -> list[dict[str, Any]]:
+            client = QQ(port)
+            client.handshake("qq-test-token")
+            client.event(**private_event("量一下延时", message_id=8801))
+            return client.pump(20.0, quiet=3.0, lag=0.03)
+
+        got = await asyncio.to_thread(one_round)
+        status = rig.bridge.status()
+        net = (status.get("qq_latency_ms") or {}).get("send_private_msg") or {}
+        turns = status.get("turn_latency_ms") or {}
+        first = turns.get("first_bubble") or {}
+        whole = turns.get("turn_total") or {}
+        checked = len(sends(got))
+        check.ok("每条气泡都留下一趟来回读数", net.get("n") == checked and checked >= 1,
+                 f"来回 {net.get('n')} 趟 / 气泡 {checked} 条")
+        check.ok("往返真的量到了（协议端故意磨了 30ms）",
+                 isinstance(net.get("avg"), (int, float)) and net["avg"] >= 30, net)
+        check.ok("最坏值不小于平均值", net.get("max", 0) >= net.get("avg", 0), net)
+        check.ok("第一个字单独记了一笔", first.get("n") == 1, turns)
+        check.ok("首字里含着那一趟网络来回",
+                 isinstance(first.get("avg"), (int, float)) and first["avg"] >= 30, first)
+        check.ok("说完不早于首字", whole.get("n") == 1 and whole["avg"] >= first["avg"],
+                 f"首字 {first} / 说完 {whole}")
+
+        # 一个字都没说出来的回合：不许留下任何「用户等到了」的读数
+        reset_model()
+        before = rig.bridge.status()["turn_latency_ms"]["first_bubble"]["n"]
+        MODE["pieces"] = [""]
+        with LOCK:
+            SEEN.clear()
+
+        def starved_round() -> list[dict[str, Any]]:
+            client = QQ(port)
+            client.handshake("qq-test-token")
+            client.event(**private_event("这句注定说不出", message_id=8802))
+            return client.pump(25.0, quiet=3.0, lag=0.03)
+
+        got = await asyncio.to_thread(starved_round)
+        after = rig.bridge.status()["turn_latency_ms"]["first_bubble"]["n"]
+        check.ok("空手回合一条气泡都没发", not sends(got), texts(sends(got)))
+        check.ok("空手回合不往首字读数里塞假样本", after == before, f"{before} → {after}")
+        reset_model()
+    finally:
+        await rig.stop()
+
+
+async def hedge_checks(check: Checker) -> None:
+    """对冲：慢的那把还在闷头想，补上去的快一把先见字就用它，另一把当场收掉。
+
+    GLM 这一档的思考长度是抽签，同一份请求能从 269 字抽到 2900 字——多一把就多一次
+    抽到短的可能。这里把「第一趟磨 4 秒」演成抽到长的，看第二把是不是真把它抢过去了。
+    """
+    rig = Rig(onebot_debounce_seconds=0.0, first_visible_hedge=0.6,
+              first_visible_timeout=30.0, first_token_timeout=0.0,
+              prompt_tiers_enabled=True, quick_prompt_max_chars=100)
+    port = await rig.start()
+    try:
+        reset_model()
+        MODE["lag_first"] = 4.0
+        with LOCK:
+            SEEN.clear()
+
+        def hedged_round() -> list[dict[str, Any]]:
+            client = QQ(port)
+            client.handshake("qq-test-token")
+            client.event(**private_event("在吗", message_id=8811))
+            return client.pump(25.0, quiet=3.0)
+
+        got = await asyncio.to_thread(hedged_round)
+        first = rig.bridge.status()["turn_latency_ms"]["first_bubble"]
+        body = "".join(texts(sends(got)))
+        check.ok("慢的那把真被补了一把", model_calls() == 2, f"{model_calls()} 次上游")
+        check.ok("首字没等满那 4 秒", first["max"] < 4000, first)
+        check.ok("只交付一路答案，不重复播报", body.count("这个点你还醒着") == 1, texts(sends(got)))
+        check.ok("赢的那把一字不缺", "我把你今天说的话想了一遍" in body, body)
+        check.ok("回完只记一次回复：补的那把不许算成第二回合",
+                 rig.bridge.status()["counts"]["replies"] == 1, rig.bridge.status()["counts"])
+
+        # 响应头本身慢（过载时真会这样）：对冲的计时得从「发出」算，不能从「连上」算——
+        # 从连上算的话，光握手就吃掉门槛，补的那把永远迟到
+        reset_model()
+        MODE["open_lag"] = 4.0
+        with LOCK:
+            SEEN.clear()
+
+        def slow_open_round() -> list[dict[str, Any]]:
+            client = QQ(port)
+            client.handshake("qq-test-token")
+            client.event(**private_event("握手都这么慢", message_id=8815))
+            return client.pump(25.0, quiet=3.0)
+
+        got = await asyncio.to_thread(slow_open_round)
+        first = rig.bridge.status()["turn_latency_ms"]["first_bubble"]
+        check.ok("开流慢也照样补了一把", model_calls() == 2, f"{model_calls()} 次上游")
+        check.ok("首字没等那 4 秒握手", first["max"] < 4000, first)
+        check.ok("慢握手没把回合拖崩", one_turn(sends(got)), texts(sends(got)))
+
+        # 全量档不许对冲：一万字的请求补一把等于付两遍，抢回来的时间不值这个价
+        reset_model()
+        MODE["lag_first"] = 2.0
+        with LOCK:
+            SEEN.clear()
+        long_ask = "把这段再想想：" + "今天加班到十点，回来路上还在想白天那句没接好的话。" * 4
+
+        def full_tier_round() -> list[dict[str, Any]]:
+            client = QQ(port)
+            client.handshake("qq-test-token")
+            client.event(**private_event(long_ask, message_id=8813))
+            return client.pump(25.0, quiet=3.0)
+
+        got = await asyncio.to_thread(full_tier_round)
+        check.ok("全量档不对冲：大请求只打一趟上游", model_calls() == 1, f"{model_calls()} 次上游")
+        check.ok("长话照样答得出来", one_turn(sends(got)), texts(sends(got)))
+    finally:
+        await rig.stop()
+
+    # 关掉对冲就该只有一把：这条开关不许偷偷多烧请求（这一档走的是快捷档，本该对冲）
+    quiet = Rig(onebot_debounce_seconds=0.0, first_visible_hedge=0.0,
+                first_visible_timeout=30.0, first_token_timeout=0.0,
+                prompt_tiers_enabled=True, quick_prompt_max_chars=100)
+    port = await quiet.start()
+    try:
+        reset_model()
+        MODE["lag_first"] = 2.0
+        with LOCK:
+            SEEN.clear()
+
+        def plain_round() -> list[dict[str, Any]]:
+            client = QQ(port)
+            client.handshake("qq-test-token")
+            client.event(**private_event("不对冲就一把", message_id=8812))
+            return client.pump(25.0, quiet=3.0)
+
+        got = await asyncio.to_thread(plain_round)
+        check.ok("对冲关掉就只打一趟上游", model_calls() == 1, f"{model_calls()} 次上游")
+        check.ok("关掉照样答得出来", one_turn(sends(got)), texts(sends(got)))
+        reset_model()
+    finally:
+        await quiet.stop()
+
+
+async def group_tier_checks(check: Checker) -> None:
+    """群聊走分档时也一样要接得住：这套群聊断言原本全在「分档关掉」下跑，
+    于是快捷档那条群聊路径从来没被验过——没点名的不接、点到的要接、说话人别串、
+    而且群聊与锚点的底线得跟着进短提示词。
+    """
+    rig = Rig(onebot_debounce_seconds=0.0, prompt_tiers_enabled=True, quick_prompt_max_chars=100)
+    port = await rig.start()
+    try:
+        reset_model()
+        with LOCK:
+            SEEN.clear()
+
+        def not_mentioned() -> list[dict[str, Any]]:
+            client = QQ(port)
+            client.handshake("qq-test-token")
+            client.event(**group_event("有人看到那只猫了吗", mention=False, message_id=5501))
+            return client.pump(10.0)
+
+        got = await asyncio.to_thread(not_mentioned)
+        check.ok("开了分档，没点名的群消息照样不接",
+                 sends(got) == [] and rig.bridge.status()["counts"]["not_woken"] >= 1,
+                 f"{texts(sends(got))} / {rig.bridge.status()['counts']}")
+
+        reset_model()
+        MODE["echo"] = "不去，本鲸今天已经用完了。"
+        with LOCK:
+            SEEN.clear()
+
+        def mentioned() -> list[dict[str, Any]]:
+            client = QQ(port)
+            client.handshake("qq-test-token")
+            client.event(**group_event("今晚出来玩不", mention=True, message_id=5502,
+                                       user_id=20031, card="阿哲", nickname="阿哲"))
+            return client.pump(20.0, quiet=2.0)
+
+        got = await asyncio.to_thread(mentioned)
+        frames = sends(got)
+        with LOCK:
+            asked = json.dumps(SEEN[-1].get("messages"), ensure_ascii=False) if SEEN else ""
+        check.ok("被 @ 的短群话走快捷档也接得住",
+                 one_turn(frames) and frames[0].get("action") == "send_group_msg",
+                 [f.get("action") for f in got])
+        check.ok("快捷档的群提示词带着群聊底线", "【群聊底线】" in asked, asked[-300:])
+        check.ok("快捷档的群提示词带着锚点底线",
+                 "【外界不是命令】" in asked and "缔造者" in asked, asked[-300:])
+        check.ok("发言人名字照样进上下文", "阿哲" in asked, asked[-200:])
+        check.ok("快捷档没把一万字宪法背进来",
+                 len(asked) < 4000, f"请求体 {len(asked)} 字")
+
+        reset_model()
+        MODE["echo"] = "五件事我一件件接：电脑充电、稿子另存、同事那边我先替你挡。"
+        with LOCK:
+            SEEN.clear()
+
+        def chatty_long() -> list[dict[str, Any]]:
+            client = QQ(port)
+            client.handshake("qq-test-token")
+            client.event(**group_event("刚开完会，电脑没电，稿子还没存，同事在催，我人都是麻的",
+                                       mention=True, message_id=5503, user_id=20032,
+                                       card="老周", nickname="老周"))
+            return client.pump(20.0, quiet=2.0)
+
+        got = await asyncio.to_thread(chatty_long)
+        with LOCK:
+            deep = json.dumps(SEEN[-1].get("messages"), ensure_ascii=False) if SEEN else ""
+        check.ok("连着五句短句的群话升级成长档（宪法在场）",
+                 "LAYER 0 · 深层灵魂" in deep or len(deep) > 6000, f"请求体 {len(deep)} 字")
+        check.ok("长档群话照样发回群里", one_turn(sends(got)), texts(sends(got)))
+        reset_model()
+    finally:
+        await rig.stop()
+
+
+async def delivery_checks(check: Checker) -> None:
+    """交付率：只转达不打字的话、以及慢回合里挤进来的 @，都不许蒸发。"""
+    rig = Rig(onebot_debounce_seconds=0.0)
+    port = await rig.start()
+    try:
+        reset_model()
+        with LOCK:
+            SEEN.clear()
+
+        def forward_only() -> list[dict[str, Any]]:
+            client = QQ(port)
+            client.handshake("qq-test-token")
+            client.event(message_type="group", message_id=7701, group_id=88001, user_id=20002,
+                         sender={"user_id": 20002, "nickname": "老哲", "card": "老哲"},
+                         message=[{"type": "at", "data": {"qq": "70001"}},
+                                  {"type": "forward", "data": {"id": "F-9"}}])
+            return client.pump(12.0)
+
+        got = await asyncio.to_thread(forward_only)
+        check.ok("只甩转达没打字也算一句话", one_turn(sends(got)), str(rig.bridge.status()["counts"]))
+        check.ok("这种消息没被记成 ignored", rig.bridge.status()["counts"]["ignored"] == 0,
+                 rig.bridge.status()["counts"])
+
+        # 慢回合：她说第一句时第二句挤进来，两句都得有回音
+        reset_model()
+        MODE["slow"] = 2.2
+        with LOCK:
+            SEEN.clear()
+
+        def queue_round() -> list[dict[str, Any]]:
+            client = QQ(port)
+            client.handshake("qq-test-token")
+            client.event(**private_event("第一句先说", message_id=7702))
+            time.sleep(1.0)
+            client.event(**private_event("第二句挤进来", message_id=7703))
+            return client.pump(40.0, quiet=6.0)
+
+        got = await asyncio.to_thread(queue_round)
+        counts = rig.bridge.status()["counts"]
+        check.ok("挤进来的那句也被答了（交付率 100%）",
+                 model_calls() == 2 and len(sends(got)) >= 2,
+                 f"模型被叫 {model_calls()} 次 / {str(counts)}")
+        check.ok("busy 只作读数不再丢消息", counts["busy"] >= 1 and counts["replies"] >= 2, str(counts))
+        reset_model()
+    finally:
+        await rig.stop()
+
+
+async def empty_retry_checks(check: Checker) -> None:
+    """预算被思考吃光、正文一个字不剩时：抬一档重跑一次，而不是把空手交出去。"""
+    rig = Rig(onebot_debounce_seconds=0.0, max_tokens=900, empty_retry_max_tokens=2000)
+    port = await rig.start()
+    try:
+        reset_model()
+        MODE["once"] = [""]          # 第一次回空正文，第二次照旧正常回
+        with LOCK:
+            SEEN.clear()
+
+        def empty_then_full() -> list[dict[str, Any]]:
+            client = QQ(port)
+            client.handshake("qq-test-token")
+            client.event(**private_event("再说一次", message_id=7901))
+            return client.pump(25.0, quiet=3.0)
+
+        got = await asyncio.to_thread(empty_then_full)
+        with LOCK:
+            budgets = [p.get("max_tokens") for p in SEEN if EXTRACT_MARK not in json.dumps(p, ensure_ascii=False)]
+        check.ok("空正文换来第二次机会，不是一句道歉", model_calls() == 2, f"{model_calls()} 次 / {texts(sends(got))}")
+        check.ok("重跑把预算抬高了，且不超过上限",
+                 len(budgets) >= 2 and budgets[0] == 900 and 900 < budgets[1] <= 2000, str(budgets))
+        check.ok("真回复照样发出去", any(piece in REPLY_PIECES for piece in texts(sends(got))), texts(sends(got)))
+        check.ok("这一回合记一次回复", rig.bridge.status()["counts"]["replies"] == 1,
+                 rig.bridge.status()["counts"])
+
+        reset_model()
+        MODE["pieces"] = [""]        # 两次都空：到上限就收，不许无限重跑
+        with LOCK:
+            SEEN.clear()
+
+        def always_empty() -> list[dict[str, Any]]:
+            client = QQ(port)
+            client.handshake("qq-test-token")
+            client.event(**private_event("这句注定说不出", message_id=7902))
+            return client.pump(25.0, quiet=3.0)
+
+        got = await asyncio.to_thread(always_empty)
+        check.ok("空手就一路重问到底", model_calls() == 3, f"{model_calls()} 次")
+        check.ok("三轮都空手时不发套话，只安静记一笔",
+                 texts(sends(got)) == [] and rig.bridge.status()["counts"]["starved"] == 1,
+                 f"{texts(sends(got))} {rig.bridge.status()['counts']}")
+        reset_model()
+    finally:
+        await rig.stop()
+
+
+async def think_stall_checks(check: Checker) -> None:
+    """上游一直吐隐式思考、正文一个字不落：这趟得撤了重排，而不是把超时等满。"""
+    rig = Rig(onebot_debounce_seconds=0.0, first_token_timeout=0.0,
+              first_visible_timeout=1.0, first_token_retries=2, max_tokens=1200)
+    port = await rig.start()
+    try:
+        reset_model()
+        MODE["think"] = 12          # 12 片思考 × 0.4s = 4.8 秒不给正文
+        MODE["echo"] = "重排之后才说出来的那句。"
+        with LOCK:
+            SEEN.clear()
+
+        def thinky() -> list[dict[str, Any]]:
+            client = QQ(port)
+            client.handshake("qq-test-token")
+            client.event(**private_event("你想得太久了", message_id=7941))
+            return client.pump(40.0, quiet=4.0)
+
+        got = await asyncio.to_thread(thinky)
+        out = texts(sends(got))
+        check.ok("只思考不落正文的那趟被撤掉重排", model_calls() >= 2, f"{model_calls()} 次")
+        check.ok("重排之后真回复照样到", out == ["重排之后才说出来的那句。"], out)
+        check.ok("撤掉的等待期没有多说一个字",
+                 all("没接住" not in piece for piece in out), out)
+
+        reset_model()
+        MODE["think"] = 12
+        MODE["blank_first"] = True   # 先给一个空白格，再只吐思考
+        MODE["echo"] = "空白格糊不住看门狗。"
+        with LOCK:
+            SEEN.clear()
+
+        def blank_then_stall() -> list[dict[str, Any]]:
+            client = QQ(port)
+            client.handshake("qq-test-token")
+            client.event(**private_event("空白不算回答", message_id=7943))
+            return client.pump(40.0, quiet=4.0)
+
+        got = await asyncio.to_thread(blank_then_stall)
+        check.ok("一个空白格不算正文露头，看门狗照撤",
+                 model_calls() >= 2 and texts(sends(got)) == ["空白格糊不住看门狗。"],
+                 f"{model_calls()} 次 {texts(sends(got))}")
+
+        reset_model()
+        MODE["think"] = 12
+        MODE["echo"] = "也不会有第二次机会。"
+        tight = Rig(onebot_debounce_seconds=0.0, first_token_timeout=0.0,
+                    first_visible_timeout=0.4, first_token_retries=0, max_tokens=1200)
+        port2 = await tight.start()
+        try:
+            with LOCK:
+                SEEN.clear()
+
+            def no_chances() -> list[dict[str, Any]]:
+                client = QQ(port2)
+                client.handshake("qq-test-token")
+                client.event(**private_event("一次都不给重排", message_id=7942))
+                return client.pump(40.0, quiet=4.0)
+
+            got = await asyncio.to_thread(no_chances)
+            check.ok("重排次数用完就收住，不无限重试", model_calls() == 1, f"{model_calls()} 次")
+            check.ok("收不住时也不编话：默认一句都不发，只记 starved",
+                     texts(sends(got)) == [] and tight.bridge.status()["counts"]["starved"] == 1,
+                     f"{texts(sends(got))} {tight.bridge.status()['counts']}")
+        finally:
+            await tight.stop()
+        reset_model()
+    finally:
+        await rig.stop()
+
+
+async def media_parse_checks(check: Checker) -> None:
+    """引用/转发/图片的真实形状：NapCat 给 seq 不给 id、转发整屏放在 content 里、
+    取回来的记录挂在 messages（复数）下。这三个键以前一个都没读对。
+    """
+    from core.adapters import qq_onebot as onebot
+
+    # 1) 引用段只有 seq（NapCat 明写「seq 优先使用」）
+    ev = group_event("这个怎么看", mention=True, message_id=6001,
+                       segments=[{"type": "at", "data": {"qq": "70001"}},
+                                 {"type": "reply", "data": {"seq": 4321}},
+                                 {"type": "text", "data": {"text": "这个怎么看"}}])
+    inbound = onebot.parse_inbound(ev, bot_id=70001)
+    check.ok("引用段只有 seq 也记下来（以前只读 id → 永远拿不到）",
+             inbound is not None and inbound.quotes == (("reply", "4321"),),
+             inbound.quotes if inbound else None)
+
+    # 2) 合并转发的整屏就在事件里（data.content 是数组，不是字符串）
+    nodes = [{"sender_id": 1, "sender_name": "老周", "message": [{"type": "text",
+                "data": {"text": "明天上午十点开会，记得带周报"}}]},
+             {"sender_id": 2, "sender_name": "小林", "message": [{"type": "text",
+                "data": {"text": "我那份还没写完"}}]}]
+    ev2 = group_event("你看这串", mention=True, message_id=6002,
+                        segments=[{"type": "at", "data": {"qq": "70001"}},
+                                  {"type": "forward", "data": {"id": "F-77", "content": nodes}},
+                                  {"type": "text", "data": {"text": "你看这串"}}])
+    in2 = onebot.parse_inbound(ev2, bot_id=70001)
+    joined = "\n".join(in2.quoted) if in2 else ""
+    check.ok("转发段带着 content 数组时，原文直接进上下文，不用回查接口",
+             in2 is not None and "明天上午十点开会" in joined and "还没写完" in joined, joined[:200])
+    check.ok("内联已经拿到内容就不再挂回查", in2 is not None and in2.quotes == (), in2.quotes if in2 else None)
+    check.ok("转发里谁说的标清楚", "老周" in joined and "小林" in joined, joined[:200])
+
+    # 3) get_forward_msg / get_group_msg_history 都回 {messages: []}
+    check.ok("协议端回 messages（复数）也认得",
+             onebot.OneBotBridge._nodes_of({"messages": [{"a": 1}]}) == [{"a": 1}]
+             and onebot.OneBotBridge._nodes_of({"message": [{"b": 2}]}) == [{"b": 2}]
+             and onebot.OneBotBridge._nodes_of([{"c": 3}]) == [{"c": 3}]
+             and onebot.OneBotBridge._nodes_of({"messages": []}) == [], "")
+
+    # 4) 图片：没有 url 时退到 path / file；QQ 自己给的摘要别丢
+    ev3 = group_event("看这个", mention=True, message_id=6003,
+                        segments=[{"type": "at", "data": {"qq": "70001"}},
+                                  {"type": "image", "data": {"file": "abc.png",
+                                                            "path": "/tmp/abc.png",
+                                                            "summary": "一张橘色的猫"}}])
+    in3 = onebot.parse_inbound(ev3, bot_id=70001)
+    check.ok("图片没有 url 时用 path，不再只认 url/file 两个键",
+             in3 is not None and in3.images == ("/tmp/abc.png",), in3.images if in3 else None)
+    check.ok("QQ 给的图片摘要进了提示词", in3 is not None and "一张橘色的猫" in in3.prompt_text,
+             in3.prompt_text if in3 else "")
+
+    # 5) 纯文本洗稿：QQ 不渲染 markdown
+    plain = onebot.plain_text(
+        "# 结论\n**先改这个**\n- 第一条\n- 第二条\n1. 有序\n详见[文档](https://x.dev)\n"
+        "用 `sum()` 统计\n```python\nprint('hi')\n```")
+    check.ok("markdown 洗成纯文本",
+             "# " not in plain and "**" not in plain and "- " not in plain
+             and "](" not in plain and "https://x.dev" in plain and "`" not in plain.split("```")[0],
+             plain)
+    check.ok("代码块保留（要给人复制）", "```python" in plain and "print('hi')" in plain, plain)
+
+    # 6) 要语音的说法
+    for line, want in (("发条语音听听", True), ("念一遍给我听", True),
+                       ("用语音说", True), ("今天累不累", False), ("你听听我说", False)):
+        got = onebot.parse_inbound(private_event(line, message_id=6100 + len(line)))
+        check.ok(f"「{line}」语音判断 {'要' if want else '不要'}", 
+                 got is not None and got.voice_requested is want,
+                 got.voice_requested if got else None)
+
+
+async def group_voice_checks(check: Checker) -> None:
+    """群里默认不出声（语音比文字慢，连着甩语音是骚扰），但明确要的那一句必须给。"""
+    def frames_for(kind: str, text: str, mid: int) -> list[dict[str, Any]]:
+        async def scenario() -> list[dict[str, Any]]:
+            rig = Rig(onebot_debounce_seconds=0.0, onebot_auto_record=True,
+                      onebot_auto_record_groups=False, tts_provider="edge",
+                      onebot_bubble_delay_min=0.0, onebot_bubble_delay_max=0.0)
+            port = await rig.start()
+            try:
+                reset_model()
+                MODE["echo"] = "行，那就这么定。"
+
+                def round_trip() -> list[dict[str, Any]]:
+                    client = QQ(port)
+                    client.handshake("qq-test-token")
+                    if kind == "group":
+                        client.event(**group_event(text, mention=True, message_id=mid))
+                    else:
+                        client.event(**private_event(text, message_id=mid))
+                    return client.pump(25.0, quiet=4.0)
+
+                return await asyncio.to_thread(round_trip)
+            finally:
+                await rig.stop()
+
+        # 另起一条事件循环：这套断言要连跑三场，各建各的 Rig 与端口
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            return list(pool.submit(asyncio.run, scenario()).result())
+
+    group = frames_for("group", "今天开会定下了", 6301)
+    records = [f for f in group if "record" in json.dumps(f.get("params"), ensure_ascii=False)]
+    check.ok("群里默认不甩语音", bool(sends(group)) and not records,
+             f"{len(sends(group))} 条气泡 / {len(records)} 条语音")
+
+    asked = frames_for("group", "发条语音说一下", 6302)
+    voice = [f for f in asked if "record" in json.dumps(f.get("params"), ensure_ascii=False)]
+    check.ok("群里明确要语音，那一句就给", bool(voice),
+             f"{len(asked)} 帧 / {len(voice)} 条语音")
+
+    solo = frames_for("private", "今天开会定下了", 6303)
+    private_voice = [f for f in solo if "record" in json.dumps(f.get("params"), ensure_ascii=False)]
+    check.ok("私聊照旧顺手念一句", bool(private_voice), f"{len(private_voice)} 条语音")
+
+
+async def forward_miss_checks(check: Checker) -> None:
+    """协议端取不回转发内容时：她看到的是「有人转了一屏记录」，不是接口故障报告。"""
+    rig = Rig(onebot_debounce_seconds=0.0)
+    port = await rig.start()
+    try:
+        reset_model()
+        MODE["echo"] = "你转的那屏我这边没露出来，捡要紧的两句说。"
+        with LOCK:
+            SEEN.clear()
+
+        def no_forward_support() -> list[dict[str, Any]]:
+            client = QQ(port)
+            client.handshake("qq-test-token")
+            client.event(message_type="group", message_id=7981, group_id=88001, user_id=20002,
+                         sender={"user_id": 20002, "nickname": "老哲", "card": "老哲"},
+                         message=[{"type": "at", "data": {"qq": "70001"}},
+                                  {"type": "forward", "data": {"id": "F-404"}}])
+            return client.pump(20.0, quiet=3.0, refused=("get_forward_msg",))
+
+        got = await asyncio.to_thread(no_forward_support)
+        with LOCK:
+            asked = json.dumps(SEEN[-1].get("messages"), ensure_ascii=False) if SEEN else ""
+        check.ok("转发送不进来时递给她的是人话，不是故障单",
+                 "内容没跟着露出来" in asked and "没取回来" not in asked
+                 and "F-404" not in asked and "get_forward_msg" not in asked, asked[-200:])
+        check.ok("协议端不认 get_forward_msg 不记故障",
+                 rig.bridge.status()["counts"]["errors"] == 0, rig.bridge.status()["counts"])
+        check.ok("三种取法都试过（NapCat / 群号版 / LLOneBot）",
+                 sum(1 for f in got if f.get("action") == "get_forward_msg") == 3,
+                 [f.get("params") for f in got if f.get("action") == "get_forward_msg"])
+        reset_model()
+    finally:
+        await rig.stop()
+
+
+async def requeue_checks(check: Checker) -> None:
+    """上游排在队尾（半天不给第一个分片）时：撤了重排，而不是陪它一起等满超时。"""
+    rig = Rig(onebot_debounce_seconds=0.0, first_token_timeout=0.6, first_token_retries=2,
+              max_tokens=1200)
+    port = await rig.start()
+    try:
+        reset_model()
+        MODE["lead_once"] = 6.0
+        MODE["echo"] = "重排一次就接上了。"
+        with LOCK:
+            SEEN.clear()
+
+        def stalled_then_ok() -> list[dict[str, Any]]:
+            client = QQ(port)
+            client.handshake("qq-test-token")
+            client.event(**private_event("这句上游在排队", message_id=7951))
+            return client.pump(40.0, quiet=4.0)
+
+        got = await asyncio.to_thread(stalled_then_ok)
+        out = texts(sends(got))
+        check.ok("首分片卡住时重排了，不是干等", model_calls() >= 2, f"{model_calls()} 次")
+        check.ok("重排之后真回复照样到", any("重排一次就接上了" in piece for piece in out), out)
+        check.ok("没把兜底句当成答案发出去",
+                 all(line not in piece for piece in out
+                     for line in [x.strip() for x in rig.settings.onebot_fail_lines.split("|") if x.strip()]),
+                 out)
+
+        reset_model()
+        MODE["lead_once"] = 6.0
+        MODE["echo"] = "重排很多次都不来。"
+        rig2 = Rig(onebot_debounce_seconds=0.0, first_token_timeout=0.4, first_token_retries=0)
+        port2 = await rig2.start()
+        try:
+            with LOCK:
+                SEEN.clear()
+
+            def never_admits() -> list[dict[str, Any]]:
+                client = QQ(port2)
+                client.handshake("qq-test-token")
+                client.event(**private_event("这趟彻底排队排不到", message_id=7952))
+                return client.pump(40.0, quiet=4.0)
+
+            got = await asyncio.to_thread(never_admits)
+            out = texts(sends(got))
+            check.ok("引擎的错词一个字都不外泄",
+                     not any(w in piece for piece in out
+                             for w in ("模型", "分片", "超时", "上游", "错误", "Traceback", "可见内容")),
+                     out)
+        finally:
+            await rig2.stop()
+        reset_model()
+    finally:
+        await rig.stop()
+
+
+async def rotation_checks(check: Checker) -> None:
+    """兜底句也按次序轮：连着三句一样的，就又是自动回复。"""
+    rig = Rig(onebot_debounce_seconds=0.0,
+              onebot_fail_lines="一、没接住|二、没接住|三、没接住", max_tokens=1200)
+    port = await rig.start()
+    try:
+        reset_model()
+        seen_fail: list[str] = []
+        for index in range(3):
+            MODE["pieces"] = [""]      # 每一趟都空手：逼出兜底句
+            with LOCK:
+                SEEN.clear()
+
+            def one_fail(mid: int) -> list[dict[str, Any]]:
+                client = QQ(port)
+                client.handshake("qq-test-token")
+                client.event(**private_event(f"第{index}次让她说不出", message_id=mid))
+                return client.pump(30.0, quiet=3.0)
+
+            got = await asyncio.to_thread(one_fail, 7961 + index)
+            seen_fail.extend(texts(sends(got)))
+        check.ok("三连空手出了三句不一样的话", len(set(seen_fail)) == 3, seen_fail)
+        check.ok("相邻两句不重样", all(a != b for a, b in zip(seen_fail, seen_fail[1:])), seen_fail)
+        reset_model()
+    finally:
+        await rig.stop()
+
+
+async def silent_wait_checks(check: Checker) -> None:
+    """上游慢的时候只许挂「正在输入」，不许先蹦一句应付话——那是本鲸的话痨，不是礼貌。"""
+    rig = Rig(onebot_debounce_seconds=0.0, onebot_set_typing=True,
+              onebot_typing_interval=1.0, max_tokens=1200)
+    port = await rig.start()
+    try:
+        reset_model()
+        MODE["lead"] = 4.0            # 上游 4 秒才吐第一个字，足够看出有没有人多嘴
+        MODE["echo"] = "想清楚了才说这句。"
+        with LOCK:
+            SEEN.clear()
+
+        def slow_round() -> list[dict[str, Any]]:
+            client = QQ(port)
+            client.handshake("qq-test-token")
+            client.event(**private_event("今天累不累", message_id=7991))
+            return client.pump(30.0, quiet=3.0)
+
+        got = await asyncio.to_thread(slow_round)
+        out = texts(sends(got))
+        types = [frame.get("action") for frame in got]
+        check.ok("等待期一个字都没多说，真回复就是第一句", out and out[0] == "想清楚了才说这句。", out)
+        check.ok("等待期一直挂着「正在输入」",
+                 types[:types.index("send_private_msg")].count("set_typing") >= 2, types)
+        check.ok("网桥不再有垫话这个读数", "ack" not in rig.bridge.status()["counts"],
+                 rig.bridge.status()["counts"])
+        reset_model()
+    finally:
+        await rig.stop()
+
+
+async def typing_checks(check: Checker) -> None:
+    """「正在输入」是唯一允许在等待期发出去的东西，而且协议端不认时不许记故障。"""
+    rig = Rig(onebot_debounce_seconds=0.0, onebot_set_typing=True, onebot_typing_interval=1.0)
+    port = await rig.start()
+    try:
+        reset_model()
+        MODE["lead"] = 2.0
+        MODE["echo"] = "想好了：你这句问的是今天，不是昨天。"
+        with LOCK:
+            SEEN.clear()
+
+        def slow_round() -> list[dict[str, Any]]:
+            client = QQ(port)
+            client.handshake("qq-test-token")
+            client.event(**private_event("今天累不累", message_id=7801))
+            return client.pump(20.0, quiet=3.0)
+
+        got = await asyncio.to_thread(slow_round)
+        out = texts(sends(got))
+        counts = rig.bridge.status()["counts"]
+        check.ok("等待期只挂输入状态，第一句就是真回复",
+                 out == ["想好了：你这句问的是今天，不是昨天。"], out)
+        check.ok("私聊一进窗口就挂上，且一直续着",
+                 sum(1 for f in got if str(f.get("action")).startswith("set_")) >= 2,
+                 [f.get("action") for f in got])
+        check.ok("认了 set_typing 就不再挨个试，别每次都白试一遍",
+                 not any(f.get("action") in ("set_input_state", "set_input_status") for f in got),
+                 [f.get("action") for f in got])
+
+        # 真 NapCat 只认 set_input_status（且只管单聊）：叫法要对，参数也得是它那套
+        reset_model()
+        MODE["echo"] = "这句马上就能回。"
+        with LOCK:
+            SEEN.clear()
+
+        def napcat_style() -> list[dict[str, Any]]:
+            client = QQ(port)
+            client.handshake("qq-test-token")
+            client.event(**private_event("这只认 NapCat 的名字", message_id=7813))
+            return client.pump(20.0, quiet=3.0, skip=("set_typing",))
+
+        got = await asyncio.to_thread(napcat_style)
+        actions = [f.get("action") for f in got]
+        status_frames = [f for f in got if f.get("action") == "set_input_status"]
+        check.ok("标准名不认时退到 NapCat 的 set_input_status",
+                 "set_typing" in actions and "set_input_status" in actions, actions)
+        check.ok("按 NapCat 的形状发：user_id + event_type",
+                 all(set(f.get("params", {})) == {"user_id", "event_type"}
+                     and f["params"]["event_type"] == 1 for f in status_frames),
+                 [f.get("params") for f in status_frames])
+        check.ok("退成功了就不算故障", rig.bridge.status()["counts"]["errors"] == 0,
+                 rig.bridge.status()["counts"])
+
+        # 连 NapCat 的名字也不认的老实现：还得退到标准里那个 set_input_state。
+        # 上游得慢一点——回得太快，等待期一结束就不再有第二个叫法的机会了
+        reset_model()
+        MODE["echo"] = "这句马上就能回。"
+        MODE["lead"] = 9.0
+        with LOCK:
+            SEEN.clear()
+
+        def state_style() -> list[dict[str, Any]]:
+            client = QQ(port)
+            client.handshake("qq-test-token")
+            client.event(**private_event("两个 NapCat 名字都不认", message_id=7814))
+            return client.pump(30.0, quiet=3.0, skip=("set_typing", "set_input_status"))
+
+        got = await asyncio.to_thread(state_style)
+        actions = [f.get("action") for f in got]
+        check.ok("再退一步还有 set_input_state 兜着",
+                 "set_input_status" in actions and "set_input_state" in actions, actions)
+        check.ok("兜到了就不算故障", rig.bridge.status()["counts"]["errors"] == 0,
+                 rig.bridge.status()["counts"])
+        MODE["lead"] = 0.0
+
+        reset_model()
+        MODE["echo"] = "这句马上就能回。"
+        with LOCK:
+            SEEN.clear()
+        typed_before = rig.bridge.status()["counts"]["typing_miss"]
+
+        def typing_ignored() -> list[dict[str, Any]]:
+            client = QQ(port)
+            client.handshake("qq-test-token")
+            client.event(**private_event("今天累不累", message_id=7811))
+            return client.pump(20.0, quiet=3.0,
+                               skip=("set_typing", "set_input_status", "set_input_state"))
+
+        got = await asyncio.to_thread(typing_ignored)
+        # 三个叫法各自要等满 3 秒超时才落到 miss，别抢在读数前面
+        await asyncio.sleep(10.5)
+        counts = rig.bridge.status()["counts"]
+        check.ok("协议端不认「正在输入」时，只当没发生过，不记故障",
+                 any(f.get("action") == "set_typing" for f in got) and counts["errors"] == 0,
+                 f"errors={counts['errors']}")
+        check.ok("不认就记成 miss，一眼看得出这一声有没有用",
+                 counts["typing_miss"] > typed_before, f"{typed_before} → {counts['typing_miss']}")
+
+        reset_model()
+        MODE["lead"] = 2.0
+        MODE["echo"] = "[[静默]]"
+        with LOCK:
+            SEEN.clear()
+
+        def quiet_round() -> list[dict[str, Any]]:
+            client = QQ(port)
+            client.handshake("qq-test-token")
+            client.event(**group_event("别人在聊别的", message_id=7803))
+            return client.pump(20.0, quiet=3.0)
+
+        got = await asyncio.to_thread(quiet_round)
+        check.ok("没点她的群消息不该有任何动静", texts(sends(got)) == [], texts(sends(got)))
+        reset_model()
+    finally:
+        await rig.stop()
+
+
+async def sticker_checks(check: Checker) -> None:
+    """回复里的表情动作要变成真的图片气泡发出去。"""
+    rig = Rig(onebot_emoji_enabled=True)
+    port = await rig.start()
+    try:
+        reset_model()
+        MODE["pieces"] = ["本鲸懒得动。", "[表情: 躺平]你自己看着办。"]
+        def round_trip() -> list[dict[str, Any]]:
+            client = QQ(port)
+            client.handshake("qq-test-token")
+            client.event(**private_event("今天不想上班", message_id=7601))
+            return client.pump(14.0)
+
+        got = await asyncio.to_thread(round_trip)
+        frames = sends(got)
+        kinds = [seg.get("type") for frame in frames for seg in (frame.get("params", {}).get("message") or [])]
+        check.ok("表情标记换成了图片段", "image" in kinds, str(kinds))
+        check.ok("内部写法没漏到屏幕上", not any("表情:" in piece for piece in texts(frames)), texts(frames))
+        image = next((seg for frame in frames for seg in (frame.get("params", {}).get("message") or [])
+                      if seg.get("type") == "image"), {})
+        file_value = str((image.get("data") or {}).get("file", ""))
+        check.ok("图片走的是本机文件路径", file_value.startswith("file:///") and file_value.endswith("meishio_lazy.png"),
+                 file_value)
+        reset_model()
+
+        # 认不出的标签不发图，也不把内部写法漏出去
+        MODE["pieces"] = ["[表情: 跳科目三]这件事本鲸不会。"]
+        def unknown() -> list[dict[str, Any]]:
+            client = QQ(port)
+            client.handshake("qq-test-token")
+            client.event(**private_event("来个活", message_id=7602))
+            return client.pump(14.0)
+        got = await asyncio.to_thread(unknown)
+        frames = sends(got)
+        kinds = [seg.get("type") for frame in frames for seg in (frame.get("params", {}).get("message") or [])]
+        check.ok("认不出的表情不发图", "image" not in kinds, str(kinds))
+        check.ok("认不出也不漏内部写法", not any("表情:" in piece for piece in texts(frames)), texts(frames))
+        reset_model()
+    finally:
+        await rig.stop()
+
+
+async def friend_checks(check: Checker) -> None:
+    rig = Rig(onebot_auto_approve_friend=True, onebot_friend_greeting="加上了。有事直接说，别发「在吗」。")
+    port = await rig.start()
+
+    def request_round(comment: str) -> list[dict[str, Any]]:
+        client = QQ(port)
+        client.handshake("qq-test-token")
+        client.send_json({"post_type": "request", "request_type": "friend", "user_id": 1937490685,
+                          "comment": comment, "flag": "FLAG-1", "time": int(time.time()), "self_id": 70001})
+        return client.pump(10.0)
+
+    got = await asyncio.to_thread(request_round, "我是老哲")
+    actions = [frame.get("action") for frame in got]
+    check.ok("自动通过了好友申请", "set_friend_add_request" in actions, str(actions))
+    approve = next((frame for frame in got if frame.get("action") == "set_friend_add_request"), {})
+    check.ok("通过时带上 flag 与 approve",
+             approve.get("params", {}).get("flag") == "FLAG-1"
+             and approve.get("params", {}).get("approve") is True, str(approve.get("params")))
+    greet = [frame for frame in got if frame.get("action") == "send_private_msg"]
+    check.ok("通过后主动打了建联招呼", greet and "别发" in texts(greet)[0], texts(greet))
+    check.ok("计数记下了这一次", rig.bridge.status()["counts"]["approved"] >= 1, rig.bridge.status()["counts"])
+    await rig.stop()
+
+    rig2 = Rig(onebot_auto_approve_friend=True, onebot_friend_verify_words="同事,老同学")
+    port2 = await rig2.start()
+
+    def gated() -> list[dict[str, Any]]:
+        client = QQ(port2)
+        client.handshake("qq-test-token")
+        client.send_json({"post_type": "request", "request_type": "friend", "user_id": 1937490685,
+                          "comment": "推销窗帘", "flag": "FLAG-2", "time": int(time.time()), "self_id": 70001})
+        return client.pump(4.0)
+
+    got = await asyncio.to_thread(gated)
+    check.ok("验证语不含关键词就不给过",
+             [frame.get("action") for frame in got] == [], str([frame.get("action") for frame in got]))
+    await rig2.stop()
+
+    rig3 = Rig(onebot_auto_approve_friend=True, onebot_friend_verify_words="同事,老同学")
+    port3 = await rig3.start()
+
+    def passed() -> list[dict[str, Any]]:
+        client = QQ(port3)
+        client.handshake("qq-test-token")
+        client.send_json({"post_type": "request", "request_type": "friend", "user_id": 1937490685,
+                          "comment": "我是你同事，工位在你后面", "flag": "FLAG-3",
+                          "time": int(time.time()), "self_id": 70001})
+        return client.pump(10.0)
+
+    got = await asyncio.to_thread(passed)
+    check.ok("验证语命中就放行", "set_friend_add_request" in [frame.get("action") for frame in got],
+             str([frame.get("action") for frame in got]))
+    await rig3.stop()
+
+    rig4 = Rig()  # 默认关：那种事要人自己点头
+    port4 = await rig4.start()
+
+    def off() -> list[dict[str, Any]]:
+        client = QQ(port4)
+        client.handshake("qq-test-token")
+        client.send_json({"post_type": "request", "request_type": "friend", "user_id": 1937490685,
+                          "comment": "我是老哲", "flag": "FLAG-4", "time": int(time.time()), "self_id": 70001})
+        return client.pump(4.0)
+
+    got = await asyncio.to_thread(off)
+    check.ok("开关关掉时谁也不给过",
+             [frame.get("action") for frame in got] == [] and rig4.bridge.status()["counts"]["requests"] >= 1,
+             str(rig4.bridge.status()["counts"]))
+    await rig4.stop()
+
+
 async def server_checks(check: Checker) -> None:
     from core.server import SoulServer
 
@@ -1435,7 +3002,9 @@ async def server_checks(check: Checker) -> None:
             return int(probe.getsockname()[1])
 
     root_off = Path(tempfile.mkdtemp(prefix="mysoulbot-qq-off-"))
-    closed = make_settings(root_off, ORIGIN + "/v1", onebot_enabled=False, onebot_port=11556)
+    # 不写死 11556：开发机的网桥开着时，这里会把「别人在听」误判成「关掉的开关多开了端口」
+    off_port = free_port()
+    closed = make_settings(root_off, ORIGIN + "/v1", onebot_enabled=False, onebot_port=off_port)
     server = SoulServer(closed)
     _, http_port = await server.start("127.0.0.1", 0)
     try:
@@ -1443,7 +3012,7 @@ async def server_checks(check: Checker) -> None:
         check.ok("开关关掉时酒馆那条路照常在", body["ok"] is True)
         check.ok("开关关掉时网桥对象不存在", server.onebot is None)
         check.ok("healthz 如实说没开", body["onebot"] == {"enabled": False, "listening": False}, body["onebot"])
-        check.ok("开关关掉时一个额外端口都不开", not listening("127.0.0.1", 11556))
+        check.ok("开关关掉时一个额外端口都不开", not listening("127.0.0.1", off_port))
     finally:
         await server.stop()
         shutil.rmtree(root_off, ignore_errors=True)
@@ -1465,7 +3034,7 @@ async def server_checks(check: Checker) -> None:
         with LOCK:
             SEEN.clear()
         got = await asyncio.to_thread(_round, qq_port, "从服务这条路进来", 9500)
-        check.ok("服务带起的网桥接得住 QQ 消息", len(sends(got)) == 1, got)
+        check.ok("服务带起的网桥接得住 QQ 消息", one_turn(sends(got)), got)
         after = (await asyncio.to_thread(health, http_port))["onebot"]
         check.ok("healthz 数得出这次回复", after["counts"]["replies"] >= 1, after["counts"])
         settled = await server2.drain(3.0)
@@ -1527,6 +3096,28 @@ async def main() -> int:
         await outbound_checks(check)
         await voice_checks(check)
         await flood_checks(check)
+        media_pure_checks(check)
+        media_pure_checks2(check)
+        arbitration_pure_checks(check)
+        await media_checks(check)
+        await arbitration_checks(check)
+        await friend_checks(check)
+        await bubble_checks(check)
+        await debounce_checks(check)
+        await sticker_checks(check)
+        await empty_retry_checks(check)
+        await think_stall_checks(check)
+        await forward_miss_checks(check)
+        await requeue_checks(check)
+        await rotation_checks(check)
+        await typing_checks(check)
+        await silent_wait_checks(check)
+        await latency_checks(check)
+        await media_parse_checks(check)
+        await group_voice_checks(check)
+        await group_tier_checks(check)
+        await hedge_checks(check)
+        await delivery_checks(check)
         await server_checks(check)
     finally:
         fake.shutdown()

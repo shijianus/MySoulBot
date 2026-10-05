@@ -257,6 +257,19 @@ class SoulServer:
         if clean == "/api/state":
             await self._send_json(writer, await self._state_of(query))
             return True
+        if clean == "/api/approvals":
+            # 只读列工单：面板按设计没有任何写入口，批准这一下留在命令行上由人来做
+            from core.sandbox import ApprovalDesk
+
+            desk = ApprovalDesk(self._settings)
+            items = desk.list()
+            await self._send_json(writer, {
+                "ok": True,
+                "pending": [item.human() for item in items if item.state == "pending"],
+                "total": len(items),
+                "decided": [item.human() for item in items if item.state != "pending"][-20:],
+            })
+            return True
         if clean == "/api/timeline":
             view = await panel.build_timeline(
                 self.storage, self._user_for_panel(query), limit=panel.TIMELINE_LIMIT
@@ -570,6 +583,7 @@ class SoulServer:
             "requests": self.requests,
             "active_turns": self.active,
             "memory_backlog": self.bot.extractor.backlog,
+            "upstreams": self.bot.routes.view(),
             "onebot": (
                 self.onebot.status()
                 if self.onebot is not None

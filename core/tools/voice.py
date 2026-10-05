@@ -133,12 +133,17 @@ def prosody_for(now: dt.datetime, settings: Settings) -> VoiceProsody:
     """把此刻换算成怎么念。显式吃 `now`，与生理层同一套可测纪律。"""
     if not settings.rhythm_enabled:
         label, values = _NEUTRAL
-        return VoiceProsody(*values, slot=label, night=False)
+        rate, pitch = values[0] + settings.tts_rate_bias, values[1] + settings.tts_pitch_bias_hz
+        return VoiceProsody(max(0.4, min(2.0, rate)), max(120.0, min(400.0, pitch)),
+                            values[2], values[3], values[4], slot=label, night=False)
     moment = resolve_now(now, settings.user_timezone)
     slot = slot_for(moment)
     night = in_deep_night(moment, *settings.night_hours)
-    values = _SLOT_PROSODY.get(slot.key, _NEUTRAL[1])
-    return VoiceProsody(*values, slot=slot.label, night=night)
+    rate, pitch, volume, pause_ms, breath_ms = _SLOT_PROSODY.get(slot.key, _NEUTRAL[1])
+    # 时段决定基调，两条 bias 决定「像不像真人闲聊」：整体提一点语速、抬一点音调
+    rate = max(0.4, min(2.0, rate + settings.tts_rate_bias))
+    pitch = max(120.0, min(400.0, pitch + settings.tts_pitch_bias_hz))
+    return VoiceProsody(rate, pitch, volume, pause_ms, breath_ms, slot=slot.label, night=night)
 
 
 def spoken_text(text: str, settings: Settings) -> str:

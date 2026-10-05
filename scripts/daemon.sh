@@ -81,6 +81,31 @@ print(
         counts.get("flood", 0), counts.get("duplicate", 0), counts.get("errors", 0),
     )
 )
+
+def leg(view):
+    # 只有样本才成句：刚起来的空服务不该报一排 None 装成读数
+    if not isinstance(view, dict) or not view.get("n"):
+        return ""
+    return "均 {avg}ms / 最坏 {max}ms ×{n}".format(**view)
+
+first = leg(bridge.get("turn_latency_ms", {}).get("first_bubble"))
+whole = leg(bridge.get("turn_latency_ms", {}).get("turn_total"))
+net = leg(bridge.get("qq_latency_ms", {}).get("send_private_msg")) or leg(
+    bridge.get("qq_latency_ms", {}).get("send_group_msg"))
+parts = [label + " " + text for label, text in (
+    ("首字", first), ("说完", whole), ("QQ 来回", net)) if text]
+if parts:
+    print("  " + " · ".join(parts))
+
+routes = (health.get("upstreams") or {}).get("routes") or []
+if len(routes) > 1:
+    print("  上游线路（谁快先打谁，坏了同回合换下一条）：")
+    for row in routes:
+        state = "冷却 {:.0f}s".format(row["cooling"]) if row.get("cooling") else "可打"
+        speed = "{:.1f}s".format(row["first_visible_avg"]) if row.get("first_visible_avg") is not None else "没测过"
+        print("    {:<8} {:<22} 优先级 {:>3} · 成 {} 败 {} 白等 {} · 首字 {} · {}".format(
+            row["name"], row["model"], row["priority"], row["ok"], row["fail"],
+            row["stalled"], speed, state))
 PY
 }
 

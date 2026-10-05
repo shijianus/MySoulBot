@@ -14,6 +14,7 @@ import datetime as dt
 import json
 import logging
 import re
+import time
 from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -30,8 +31,19 @@ from openai import (
 from config import Settings
 from core.card_loader import PersonaLibrary, Preset
 from core.clawd_soul import ClawdSoul
+from core.mood_soul import MoodSoul
+from core.recap import SessionRecap
+from core.cognition import CognitionLoop
 from core.memory_extractor import MemoryExtractor
-from core.prompt_builder import Message, PromptBuilder, PromptLayers, history_from_log_records
+from core.prompt_builder import (
+    TIER_FULL,
+    TIER_QUICK,
+    Message,
+    PromptBuilder,
+    PromptLayers,
+    history_from_log_records,
+)
+from core.upstream import Route, UpstreamPool
 from core.presence import (
     SLOTS,
     Mood,
@@ -57,6 +69,36 @@ from core.vision import (
 
 logger: Final = logging.getLogger("mysoulbot.bot")
 
+# 整条回复只由这些词拼成时，等于没说。「收到」「好的」不配当回答——重问一次，
+# 也别递到对方面前。判定用「覆盖」而不是正则：把「好的收到明白了」这种拼起来的也认出来。
+_FILLER_WORDS: Final[tuple[str, ...]] = (
+    "收到", "好的", "好嘞", "好", "嗯哼", "嗯", "哦", "噢", "哎", "行吧", "行", "成", "得嘞",
+    "明白了", "明白", "了解了", "了解", "知道了", "知道", "没问题", "没事", "有道理", "确实",
+    "辛苦了", "辛苦", "okay", "ok", "yep", "yes", "哈哈", "呵呵", "嘿嘿", "哈", "呵",
+)
+_FILLER_STRIP: Final[str] = "。！!？~、.,…， ：:　\t "
+
+_REASK_HINT: Final[str] = (
+    "（上一条你没给出实际内容。就着对方这句话直接回，说一个具体的点；"
+    "不许只回「收到」「好的」「嗯」这类词。）"
+)
+
+
+def _has_substance(text: str) -> bool:
+    """这一句接住话了没有：空、或者整句只由套话拼成，都算没接住。"""
+    body = (text or "").strip().strip(_FILLER_STRIP).strip()
+    if not body or len(body) > 20:
+        return bool(body)
+    covered, index = 0, 0
+    while index < len(body):
+        for word in sorted(_FILLER_WORDS, key=len, reverse=True):
+            if body.startswith(word, index):
+                index += len(word)
+                covered += len(word)
+                break
+        else:
+            return True  # 有一个字不在套话表里，就说明她真的说了话
+    return covered < len(body) if body else False
 HISTORY_MULTIPLIER: Final[int] = 4
 TOOL_TRAIL_ROUNDS: Final[int] = 3
 
@@ -145,6 +187,7 @@ class MySoulBot:
         extractor: MemoryExtractor,
         library: PersonaLibrary | None = None,
         clawd: ClawdSoul | None = None,
+        recap: SessionRecap | None = None,
     ) -> None:
         self._settings = settings
         self._storage = storage
@@ -152,8 +195,19 @@ class MySoulBot:
         self._extractor = extractor
         self.library = library or PersonaLibrary(settings)
         self.clawd = clawd or ClawdSoul(settings)
+        self.mood = MoodSoul(settings)
+        # 回看只有一个实例：写的人（引擎）和读的人（提示词装配）必须共用同一份后台队列，
+        # 各开各的就会出现「写了但等的是自己那队」这种丢要点
+        self.recap = recap or SessionRecap(settings, storage)
+        self._prompts.bind_recap(self.recap)
+        self.cognition = CognitionLoop(settings, storage, self.mood)
         self.rapport = RapportEngine(settings, storage)
         self._client: AsyncOpenAI | None = None
+        self._client_hook: Any = None   # 探针接管位：scripts 用它按线路包一层记账壳
+        # 上游路由池：分档选路 + 按实测速度均衡 + 同一回合内换家。没配 ROUTES 就是一条线，
+        # 行为与从前一致
+        self.routes = UpstreamPool(settings)
+        self._pool_clients: dict[str, AsyncOpenAI] = {}
         self._sessions: dict[str, Session] = {}
         self._today = dt.date.today()
 
@@ -190,7 +244,8 @@ class MySoulBot:
 
     def _context(self, user_id: str, group_mode: bool | None = None) -> ToolContext:
         return ToolContext(
-            settings=self._scene(group_mode), storage=self._storage, user_id=user_id, clawd=self.clawd
+            settings=self._scene(group_mode), storage=self._storage, user_id=user_id,
+            clawd=self.clawd, mood=self.mood
         )
 
     def _scene(self, group_mode: bool | None) -> Settings:
@@ -213,7 +268,55 @@ class MySoulBot:
             )
         return self._client
 
+    def client_for(self, route: Route) -> AsyncOpenAI:
+        """这条线的真客户端，按 (base_url, key) 缓存。"""
+        client = self._pool_clients.get(route.client_id())
+        if client is None:
+            client = AsyncOpenAI(
+                api_key=route.api_key or "EMPTY",
+                base_url=route.base_url,
+                timeout=route.timeout or self._settings.request_timeout,
+                max_retries=self._settings.max_retries,
+            )
+            self._pool_clients[route.client_id()] = client
+        return client
+
+    def _route_client(self, route: Route) -> AsyncOpenAI:
+        """取这条线的客户端；探针（`_client_hook`）接管时也要**按线路**各包一层。
+
+        以前是「一旦有探针就全家共用它那一个客户端」——那等于把多线路悄悄打回一条：
+        日志里模型名换成了 sol61，请求却还发给 GLM 那个域名，回退全变成 503。
+        """
+        if self._client_hook is not None:
+            return self._client_hook(route, self.client_for)
+        return self.client_for(route)
+
+    def _fold_history(self, session: Session) -> None:
+        """逐字只留最近几条，更早的压进会话回看。
+
+        为什么要收口：原文一路堆到几十条，代价不是「她懂得更多」，而是上游多想一倍时间、
+        更容易一个字都说不出，真要点反而抓不住。
+        收口不等于忘掉——被挤出去的那些交去压成要点，下一句照样接得上。
+        """
+        if not self.recap.enabled:
+            return
+        tail = max(2, int(self._settings.recap_tail_turns))
+        if len(session.history) <= tail:
+            return
+        dropped, session.history = session.history[:-tail], session.history[-tail:]
+        lines = [str(item.get("content") or "") for item in dropped if item.get("content")]
+        if lines:
+            self.recap.note(session.user_id, lines)
+
     async def aclose(self) -> None:
+        await self.recap.aclose()
+        await self.cognition.aclose()
+        for client in list(self._pool_clients.values()):
+            try:
+                await client.close()
+            except Exception:  # noqa: BLE001 - 关闭失败不影响退出
+                logger.debug("线路客户端关闭异常", exc_info=True)
+        self._pool_clients.clear()
         if self._client is not None:
             try:
                 await self._client.close()
@@ -228,6 +331,10 @@ class MySoulBot:
         """初始化用户目录并（可选）从日志恢复上下文。"""
         await self._storage.ensure_user(user_id, soul_text=soul_text)
         session = Session(user_id=user_id)
+        if restore and self._settings.soul_files_only:
+            # 红线：日志只做留档，不做上下文回放。同一会话内的多轮照旧连着说，
+            # 但重启后不把过去聊过什么重新塞回提示词。
+            restore = False
         if restore:
             limit = self._settings.context_max_turns
             try:
@@ -402,6 +509,8 @@ class MySoulBot:
         now: dt.datetime | None = None,
         images: Sequence[Any] = (),  # noqa: ANN401 - core.vision.ImageRef 或图片来源字符串
         group_mode: bool | None = None,
+        external_origin: bool = False,
+        group_discretion: bool = False,
     ) -> AsyncIterator[str]:
         """流式产出一段角色回复。
 
@@ -410,6 +519,8 @@ class MySoulBot:
 
         `images` 走原生多模态通道：模型是真的在看，不是在读一段别人的转述。
         `group_mode` 锁定这一回合的场景（群聊准则 + 工具群聊锁），留空跟随 CHAT_MODE。
+        `external_origin` 表示话来自外部协议端（QQ）而非缔造者本人，挂外部客体准则。
+        `group_discretion` 只给没被点名的群消息：这一句说不说话由她自己裁决。
         """
         session = self._sessions.get(user_id) or await self.open_session(user_id)
         if session.busy:
@@ -427,16 +538,19 @@ class MySoulBot:
         vision_on = can_see and bool(refs)
         guard = StreamGuard(trim_closers=self._settings.trim_stock_closers)
         visible: list[str] = []
+        ask_extra = ""       # 最后重问那趟附加的要求，只进这一次请求，不落盘不改历史
         groups: list[list[Message]] = []  # 每组=一次「下单+结果」，永不拆开，避免留下无主的 tool 消息
         rounds = 0
         completed = False
+        escalated = False  # 正文被思考吃光时，允许把预算抬一档重跑一次
+        nudged = False     # 抬档还不够时，最后把要求说白再问一次
         try:
             rebuild = True
             while True:
                 if rebuild:
                     messages, session.last_layers = await self._prompts.build_messages(
                         user_id,
-                        user_text,
+                        f"{user_text}\n{ask_extra}" if ask_extra else user_text,
                         session.history,
                         today=day,
                         tool_mode=mode,
@@ -448,16 +562,24 @@ class MySoulBot:
                         vision_on=vision_on,
                         media_extra=problems,
                         group_mode=group_mode,
+                        external_origin=external_origin,
+                        group_discretion=group_discretion,
                     )
                     rebuild = False
+                # 快捷档那一趟连工具清单都不挂：六个开关的名字就够把她按进一分多钟的盘算里，
+                # 而「在吗」这种话本来就不需要她动手。同一趟也只给它开对冲：正文十几个字，
+                # 多烧一把不心疼；一万字的重回合补一把等于把大请求付两遍。
+                quick = session.last_layers.tier == TIER_QUICK
                 sink: dict[str, Any] = {"tool_calls": []}
                 ordered: list[Directive] = []
                 try:
                     async for delta in self._call_stream(
                         messages + [m for group in groups for m in group],
                         params,
-                        tools=registry.native_specs() if mode == "native" else None,
+                        tools=registry.native_specs() if mode == "native" and not quick else None,
                         sink=sink,
+                        hedge=quick,
+                        tier=session.last_layers.tier,
                     ):
                         shown, found = guard.feed(delta)
                         ordered.extend(found)
@@ -492,6 +614,24 @@ class MySoulBot:
 
                 calls = self._collect_calls(mode, sink, ordered, registry, echo_of=user_text)
                 if not calls:
+                    empty_handed = not _has_substance("".join(visible))
+                    if empty_handed and self._escalate_budget(params, escalated):
+                        # 想满预算、正文一个字不剩：抬高一档重跑一次，别把空手当成回答送出去
+                        escalated = True
+                        visible = []
+                        guard = StreamGuard(trim_closers=self._settings.trim_stock_closers)
+                        logger.info("这一轮正文被思考吃光了，预算抬到 %s 重跑", params["max_tokens"])
+                        continue
+                    if empty_handed and not nudged:
+                        # 预算已经抬到顶还是空手：最后把要求说白，再问一次。
+                        # 宁可多说一句「就着这话回」，也不换成一句现成的套话糊弄过去
+                        nudged = True
+                        visible = []
+                        guard = StreamGuard(trim_closers=self._settings.trim_stock_closers)
+                        rebuild = True
+                        ask_extra = _REASK_HINT
+                        logger.info("重跑还是空手，加一句明确的要求再问一次")
+                        continue
                     break
                 if rounds >= self._settings.tool_max_rounds:
                     logger.info("本轮工具往返已达上限 %d，剩下的单不接", self._settings.tool_max_rounds)
@@ -512,7 +652,7 @@ class MySoulBot:
                 )
             finally:
                 session.busy = False
-        if completed and not "".join(visible).strip():
+        if completed and not _has_substance("".join(visible)):
             raise BotError(
                 "模型没有返回可见内容",
                 hint=(
@@ -525,6 +665,23 @@ class MySoulBot:
             )
 
     # ------------------------------------------------------------ 视觉
+    def _escalate_budget(self, params: dict[str, Any], already: bool) -> bool:
+        """推理型模型常把 max_tokens 想满、正文一个字不剩。
+
+        空手回来时把预算抬一档再给一次机会：一次半长的等待，总比把「没接住」递到对面屏幕上强。
+        只抬一次，且有上限——不然一个坏回合能在网关上烧掉二十分钟。
+        """
+        if already:
+            return False
+        cap = int(self._settings.empty_retry_max_tokens)
+        current = int(params["max_tokens"])
+        if cap <= 0 or current >= cap:
+            return False
+        # 抬太高反而更慢：预算就是这档模型的思考上限，3000 那档实测要等 300 秒才吐正文。
+        # 2000 是「能出字」与「别让人等五分钟」的折中
+        params["max_tokens"] = min(cap, max(int(current * 1.8), current + 400))
+        return True
+
     async def _ingest(self, user_id: str, images: Sequence[Any]) -> tuple[list[ImageRef], str]:
         """把来路收成能递给模型的图；收不下的那些变成一句明白话，不静默吞掉。"""
         refs: list[ImageRef] = []
@@ -705,22 +862,18 @@ class MySoulBot:
         # 整组进出：绝不留下没有下单头的 tool 消息，那会让严格网关直接 400
         return (groups + [group])[-TOOL_TRAIL_ROUNDS:]
 
-    def _model_for(self, messages: list[Message]) -> str:
-        """带图分段的那一趟走 VISION_MODEL，其余走 MODEL。
-
-        判据是「请求体里真的有 image 分段」，不是「他这轮贴了图」：工具拍来、
-        画来的图同样得交给看得见东西的那个模型。网关只有对话模型时留空即可，
+    @staticmethod
+    def _has_images(messages: list[Message]) -> bool:
+        """这一趟请求里真的有图吗——判据是分段，不是「他这轮贴了图」：工具拍来、
+        画来的图同样得交给看得见东西的那个模型。只有对话模型时留空 VISION_MODEL 即可，
         接口拒绝图像分段的退回路径由 `_should_degrade_vision` 负责。
         """
-        if not self._settings.vision_model:
-            return self._settings.model
-        for message in messages:
-            content = message.get("content")
-            if isinstance(content, list) and any(
-                isinstance(part, dict) and part.get("type") == "image_url" for part in content
-            ):
-                return self._settings.effective_vision_model
-        return self._settings.model
+        return any(
+            isinstance(message.get("content"), list)
+            and any(isinstance(part, dict) and part.get("type") == "image_url"
+                    for part in message["content"])
+            for message in messages
+        )
 
     async def _call_stream(
         self,
@@ -729,42 +882,283 @@ class MySoulBot:
         *,
         tools: list[dict[str, Any]] | None = None,
         sink: dict[str, Any] | None = None,
+        hedge: bool = True,
+        tier: str = TIER_FULL,
     ) -> AsyncIterator[str]:
-        kwargs: dict[str, Any] = {
-            "model": self._model_for(messages),
-            "messages": messages,
-            "temperature": float(params["temperature"]),
-            "top_p": float(params["top_p"]),
-            "max_tokens": int(params["max_tokens"]),
-            "frequency_penalty": float(params["frequency_penalty"]),
-            "stream": True,
-            "timeout": self._settings.request_timeout,
-        }
-        if tools:
-            kwargs["tools"] = tools
-            kwargs["tool_choice"] = "auto"
-        try:
-            stream = await self._get_client().chat.completions.create(**kwargs)
-        except APIStatusError as exc:
-            raise self._translate_status_error(exc) from exc
-        except (APIConnectionError, APITimeoutError) as exc:
-            raise self._translate_connection_error(exc) from exc
-        except OpenAIError as exc:
-            raise BotError(f"SDK 错误：{type(exc).__name__}", cause=exc) from exc
+        """打一趟流式请求，并在**同一回合内**自己完成选路与回退。
 
-        try:
-            async for chunk in stream:
-                if sink is not None:
-                    self._absorb_tool_calls(chunk, sink)
-                delta = self._delta_text(chunk)
-                if delta:
-                    yield delta
-        except APIStatusError as exc:
-            raise self._translate_status_error(exc) from exc
-        except (APIConnectionError, APITimeoutError) as exc:
-            raise self._translate_connection_error(exc) from exc
-        finally:
-            await self._close_stream(stream)
+        顺序是「先在这条线里重试，重试用尽再换下一条线」：同一家内部偶尔排队是运气，
+        连着几趟白等才是线路坏了。换家时不重发消息、不改历史，对面看到的还是同一句话。
+        """
+        has_images = self._has_images(messages)
+        # 两道看门狗，都只管「拿到正文之前」这段时间：
+        #   first_token_timeout  —— 连分片都不来 = 排在队尾，撤了重发
+        #   first_visible_timeout —— 分片一直在来，但全是隐式思考、正文一个字没有；
+        #                            这趟再等下去也只是把超时等满，换一条线才有下一把
+        # 实测同一份请求：首分片 1.9s 与 254s 都出现过，思考能连吐 5000 字不落正文。
+        patience = float(self._settings.first_token_timeout)
+        visible_limit = float(self._settings.first_visible_timeout)
+        # 对冲只给快捷档：那一趟正文十几个字，多烧一把不心疼；一万字的重回合再补一把，
+        # 等于把同一份大请求付两遍，抢回来的那点时间不值这个价
+        hedge_after = float(self._settings.first_visible_hedge) if hedge else 0.0
+        chances = max(1, int(self._settings.first_token_retries) + 1)
+        tried: tuple[str, ...] = ()
+        last_error: BotError | None = None
+
+        while True:
+            route = self.routes.pick(tier, tried=tried)
+            if route is None:
+                break
+            tried = (*tried, route.name)
+            # 对冲补的那一把优先打**下一条线**：同一家里再排一次队多半还是那个水位，
+            # 换一家才是真的多抽一次。只有一条线时才在同一家内补。
+            rival = self.routes.pick(tier, tried=(route.name,)) if hedge_after > 0 else None
+            emitted = False
+            problem: BotError | None = None
+            async for kind, payload in self._stream_on_route(
+                route, messages, params, tools=tools, sink=sink, has_images=has_images,
+                patience=patience, visible_limit=visible_limit, hedge_after=hedge_after,
+                chances=chances, rival=rival,
+            ):
+                if kind == "delta":
+                    emitted = True
+                    yield payload
+                else:
+                    problem = payload
+            if problem is None:
+                return                        # 这条线说完了
+            if emitted:
+                # 已经开口了就不许换家重说：那会变成把同一句话讲两遍，比不回更难堪
+                raise problem
+            last_error = problem
+            if len(tried) >= len(self.routes.routes):
+                break                         # 每条线都试过了，别再兜圈
+        if last_error is not None:
+            raise last_error
+        raise BotError(
+            f"{tier} 档没有可用上游线路",
+            hint="检查 ROUTES 里各条线的 tiers 是否覆盖这一档。",
+        )
+
+    async def _stream_on_route(
+        self, route: Route, messages: list[Message], params: dict[str, Any], *,
+        tools: list[dict[str, Any]] | None, sink: dict[str, Any] | None, has_images: bool,
+        patience: float, visible_limit: float, hedge_after: float, chances: int,
+        rival: Route | None = None,
+    ) -> AsyncIterator[tuple[str, Any]]:
+        """在这一条线上把一趟流跑完：吐 ("delta", 正文)，坏了吐 ("problem", BotError)。
+
+        返回问题而不是抛出，是为了让调用方换下一条线接着答**同一句话**——
+        上游挂了不该变成「请再说一遍」。`rival` 是对冲要打的另一条线。
+        """
+        def request_for(target: Route) -> tuple[Any, dict[str, Any]]:  # noqa: ANN401
+            kwargs: dict[str, Any] = {
+                "model": target.model_for(has_images=has_images),
+                "messages": messages,
+                "temperature": float(params["temperature"]),
+                "top_p": float(params["top_p"]),
+                "max_tokens": int(params["max_tokens"]),
+                "frequency_penalty": float(params["frequency_penalty"]),
+                "stream": True,
+                "timeout": target.timeout or self._settings.request_timeout,
+            }
+            if tools:
+                kwargs["tools"] = tools
+                kwargs["tool_choice"] = "auto"
+            return self._route_client(target), kwargs
+
+        async def open_stream(target: Route) -> Any:  # noqa: ANN401 - SDK 的流对象没有公开类型
+            client, kwargs = request_for(target)
+            try:
+                return await client.chat.completions.create(**kwargs)
+            except APIStatusError as exc:
+                raise self._translate_status_error(exc) from exc
+            except (APIConnectionError, APITimeoutError) as exc:
+                raise self._translate_connection_error(exc) from exc
+            except OpenAIError as exc:
+                raise BotError(f"SDK 错误：{type(exc).__name__}", cause=exc) from exc
+
+        async def prime(stream: Any) -> tuple[Any, Any, list[Any], str]:  # noqa: ANN401
+            """读到看见正文为止，带回 (流, 迭代器, 攒下的分片, 卡住的原因)。
+
+            等正文这段时间里读到的分片一律先攒着：里面可能正是 tool_calls，
+            当场丢掉就等于把下单吞了，模型那边会留下一条没人认领的调用。
+            """
+            iterator = stream.__aiter__()
+            pending: list[Any] = []
+            t0 = time.perf_counter()
+            last_at = t0
+            try:
+                while True:
+                    budget, why = self._wait_budget(patience, visible_limit,
+                                                    time.perf_counter() - last_at,
+                                                    time.perf_counter() - t0)
+                    if budget == 0.0:
+                        return stream, iterator, pending, f"上游 {why}"
+                    try:
+                        chunk = await (asyncio.wait_for(iterator.__anext__(), budget)
+                                       if budget > 0 else iterator.__anext__())
+                    except StopAsyncIteration:
+                        return stream, iterator, pending, ""   # 本来就没了正文，交下面按原样吐
+                    except TimeoutError:
+                        return stream, iterator, pending, f"上游 {why}"
+                    last_at = time.perf_counter()
+                    if chunk is None:
+                        return stream, iterator, pending, ""
+                    # 只当拿到「能看的字」才算数：有的网关先甩一个空格再闷 80 秒，
+                    # 按非空判定会让看门狗提前解除武装，正好放过最该撤的那一趟
+                    pending.append(chunk)
+                    if self._delta_text(chunk).strip():
+                        return stream, iterator, pending, ""
+            except APIStatusError as exc:
+                raise self._translate_status_error(exc) from exc
+            except (APIConnectionError, APITimeoutError) as exc:
+                raise self._translate_connection_error(exc) from exc
+
+        async def shoot(target: Route, must: bool,
+                        opened: list[Any]) -> tuple[Any, Route, Any, list[Any], str]:
+            """开一趟并读到看见正文，带回 (流, 这条线, 迭代器, 攒下的分片, 卡住的原因)。
+
+            开流这一步本身就可能很慢（过载时响应头都要等八九秒），所以它必须算在
+            看门狗与对冲的计时里——先 `await` 再计时等于把最该抢的那段时间放过。
+            `must=False` 是对冲那把：开不起来就当没补过，不许把好的那把带崩。
+            """
+            try:
+                fresh = await open_stream(target)
+            except BotError as exc:
+                if must:
+                    raise
+                logger.info("对冲那一趟没开起来（%s），这一把当作没补", exc.message)
+                return None, target, None, [], f"{exc.message}"
+            opened.append(fresh)
+            stream, iterator, pending, stalled = await prime(fresh)
+            return stream, target, iterator, pending, stalled
+
+        for attempt in range(1, chances + 1):
+            opened: list[Any] = []
+            tasks: list[Any] = []
+            winner: asyncio.Task | None = None
+            stream: Any = None
+            try:
+                started = time.perf_counter()
+                tasks.append(asyncio.create_task(shoot(route, True, opened)))
+                # 到点还没见正文就再补一把同时等：推理长度是抽签（同一份请求实测
+                # 269 字与 2900 字都出现过），多一把就多一次抽到短的可能。只补一把，不铺。
+                deadline = started + hedge_after if hedge_after > 0 else None
+                while True:
+                    left = None if deadline is None else max(0.0, deadline - time.perf_counter())
+                    # FIRST_COMPLETED 才是抢：`asyncio.wait` 默认等**全部**跑完，
+                    # 那样补一把只会让慢的那把把等待一起拖满，等于没对冲
+                    done, _ = await asyncio.wait(tasks, timeout=left,
+                                                 return_when=asyncio.FIRST_COMPLETED)
+                    if done:
+                        picked = next(iter(done))
+                        if picked.cancelled():
+                            tasks.remove(picked)
+                            continue
+                        failure = picked.exception()
+                        if failure is not None:
+                            # 开流就翻车（密钥不吃这个模型、404、连不上）也算这条线的账：
+                            # 换下一条线，而不是让这一句白问
+                            problem = failure if isinstance(failure, BotError) else BotError(
+                                str(failure) or type(failure).__name__, cause=failure)
+                            self.routes.report_bad(route.name, problem.message)
+                            logger.warning("%s 没开起来：%s", route.name, problem.message)
+                            yield ("problem", problem)
+                            return
+                        if picked.result()[0] is None and len(tasks) > 1:
+                            tasks.remove(picked)      # 对冲那把没开起来：不算赢，等真那把
+                            continue
+                        winner = picked
+                        for task in tasks:
+                            if task is not winner:
+                                task.cancel()          # 输的立刻撤，别让它继续占着上游那条连接
+                        break
+                    if deadline is None:
+                        continue                       # 不对冲：让这一把的看门狗自己撤
+                    deadline = None
+                    logger.info("%g 秒还没见正文，补一把同时等", hedge_after)
+                    tasks.append(asyncio.create_task(
+                        shoot(rival or route, False, opened)))
+                stream, answered, iterator, pending, stalled = await winner
+                if stalled:
+                    self.routes.report_bad(answered.name, stalled, stalled=True)
+                    if attempt < chances:
+                        logger.info("%s：%s，撤了重发（第 %d/%d 趟）",
+                                    answered.name, stalled, attempt, chances)
+                        continue
+                    logger.warning("%s 这趟白等（%s）", answered.name, stalled)
+                    yield ("problem", BotError(
+                        stalled,
+                        hint=f"{answered.name} 连着 {chances} 趟都不落正文。"))
+                    return
+                if answered.name != route.name:
+                    logger.info("对冲那把（%s）先见正文，用了它", answered.name)
+                self.routes.report_ok(answered.name, time.perf_counter() - started)
+                async for chunk in self._prefixed(pending, iterator):
+                    if sink is not None:
+                        self._absorb_tool_calls(chunk, sink)
+                    delta = self._delta_text(chunk)
+                    if delta:
+                        yield ("delta", delta)
+                return
+            except APIStatusError as exc:
+                problem = self._translate_status_error(exc)
+                self.routes.report_bad(route.name, problem.message)
+                logger.warning("%s 回了错误：%s", route.name, problem.message)
+                yield ("problem", problem)
+                return
+            except (APIConnectionError, APITimeoutError) as exc:
+                problem = self._translate_connection_error(exc)
+                self.routes.report_bad(route.name, problem.message)
+                logger.warning("%s 连不上：%s", route.name, problem.message)
+                yield ("problem", problem)
+                return
+            finally:
+                await self._retire(tasks, winner, opened)
+
+    @staticmethod
+    async def _retire(tasks: list[Any], winner: asyncio.Task | None,  # noqa: ANN401
+                      opened: list[Any]) -> None:
+        """一把见正文，其余的当场收摊：撤任务、等它撤干净、每一把的流都关掉。
+
+        赢的那把也在这里关：走到 finally 就是这一趟用完了（读完、卡住、或出异常），
+        留着只会让网关那侧挂一条没人读的流。
+        """
+        stragglers = [task for task in tasks if task is not winner]
+        for task in stragglers:
+            task.cancel()
+        if stragglers:
+            await asyncio.gather(*stragglers, return_exceptions=True)
+        for stream in opened:
+            await MySoulBot._close_stream(stream)
+
+    @staticmethod
+    async def _prefixed(head: list[Any], iterator: Any) -> AsyncIterator[Any]:  # noqa: ANN401
+        """先吐攒下的分片，再接着读剩下的：一个字节、一次下单都不丢。"""
+        for chunk in head:
+            yield chunk
+        async for chunk in iterator:
+            yield chunk
+
+    @staticmethod
+    def _wait_budget(patience: float, visible_limit: float, since_last: float,
+                     since_start: float) -> tuple[float, str]:
+        """这一口还能等多久，以及是谁在催：预算 0 = 已超时，负数 = 不设限。
+
+        两条看门狗取更紧的那条——「多久没来下一个分片」按上一口算，
+        「多久没见正文」从发请求算。两回事不能混成一个计时器，否则思考刷得越勤
+        反而越不容易超时，正好放过最该撤的那一趟。
+        """
+        options: list[tuple[float, str]] = []
+        if patience > 0:
+            options.append((patience - since_last, f"{patience:g} 秒没吐下一个分片"))
+        if visible_limit > 0:
+            options.append((visible_limit - since_start, f"{visible_limit:g} 秒只思考、不落正文"))
+        if not options:
+            return -1.0, ""
+        tightest, reason = min(options)
+        return (0.0, reason) if tightest <= 0 else (tightest, reason)
 
     @staticmethod
     def _absorb_tool_calls(chunk: Any, sink: dict[str, Any]) -> None:
@@ -832,7 +1226,7 @@ class MySoulBot:
         角色读到「他给看过一张 cat.png」，比重新吞 2MB 像素更像想起过这件事。
         """
         text = reply.strip()
-        if not text:
+        if not _has_substance(text):
             if interrupted:
                 logger.info("%s 回复被中断且无内容，本回合不落盘", session.user_id)
             else:
@@ -843,6 +1237,7 @@ class MySoulBot:
         session.append("user", user_text, self._settings.context_max_turns)
         session.append("assistant", text + suffix, self._settings.context_max_turns)
         session.turns += 1
+        self._fold_history(session)
 
         user_entry: dict[str, Any] = {"role": "user", "content": user_text}
         if attachments:
@@ -858,6 +1253,8 @@ class MySoulBot:
 
         window = session.history[-self._settings.extractor_lookback_turns :]
         self._extractor.submit(session.user_id, window, today=day)
+        # 慢环：攒够几轮就在后台复盘一次，把心得落进 MOOD.md，下一轮的提示词自然带上
+        self.cognition.note_turn(session.user_id)
 
     async def _settle_emotion(
         self, session: Session, user_text: str, reply: str, interrupted: bool

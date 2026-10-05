@@ -8,6 +8,8 @@ from __future__ import annotations
 import ipaddress
 import re
 import socket
+import ssl
+import http.client
 from dataclasses import dataclass, field
 from typing import Any, Final
 from html.parser import HTMLParser
@@ -178,6 +180,80 @@ class GuardedRedirect(HTTPRedirectHandler):
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
+# 只有这类「根本没连上」的错才值得换协议族重试；超时和证书问题换过去也一样
+_DROP_REASONS: Final[tuple[str, ...]] = (
+    "remote end closed connection", "connection reset", "broken pipe",
+    "bad handshake", "timed out", "unreachable", "refused",
+)
+
+
+def _is_connection_drop(reason: object) -> bool:
+    text = str(reason or "").lower()
+    return any(token in text for token in _DROP_REASONS)
+
+
+class _IPv4HTTPS(http.client.HTTPSConnection):
+    """只按 IPv4 拨号，但证书与 SNI 仍按真实主机名校验。
+
+    为什么需要这条：不少国内站点（东财 push2 就是）同时发 A 和 AAAA 记录，
+    而本机 IPv6 是**通不了**的。urllib 拿到 getaddrinfo 的结果后可能选中那个死地址，
+    表现就是 `RemoteDisconnected: Remote end closed connection without response`——
+    看着像被限流，其实是选错了协议族。钉死 IPv4 就好了，顺带把「校验的 IP 和连的 IP
+    是同一个」这件事也办成了。
+    """
+
+    def connect(self) -> None:
+        infos = socket.getaddrinfo(self.host, self.port, socket.AF_INET, socket.SOCK_STREAM)
+        if not infos:
+            raise OSError(f"{self.host} 没有 IPv4 地址")
+        address = infos[0][4]
+        ip = ipaddress.ip_address(address[0])
+        if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_unspecified:
+            raise OSError(f"目标在内网或元数据地址上（{self.host} → {address[0]}），我不去碰")
+        sock = socket.create_connection(address, self.timeout)
+        try:
+            context = self._context or ssl.create_default_context()
+            self.sock = context.wrap_socket(sock, server_hostname=self.host)
+        except BaseException:
+            sock.close()
+            raise
+
+
+def _fetch_via_ipv4(
+    target: str,
+    *,
+    timeout: float,
+    max_bytes: int,
+    headers: dict[str, str],
+) -> tuple[bytes, int, Any, str]:
+    """直连一次 IPv4，返回（正文, 状态, 响应头, 最终地址）。只跟一跳重定向。"""
+    parsed = urlparse(target)
+    host = parsed.hostname or ""
+    port = parsed.port or 443
+    selector = parsed.path or "/"
+    if parsed.query:
+        selector = f"{selector}?{parsed.query}"
+    conn = _IPv4HTTPS(host, port, timeout=timeout)
+    try:
+        conn.request("GET", selector, headers=headers)
+        response = conn.getresponse()
+        status = response.status
+        location = response.getheader("Location") or ""
+        body = response.read(max_bytes + 1)
+        truncated = len(body) > max_bytes
+        headers_out = response.headers
+        if status in (301, 302, 303, 307, 308) and location:
+            nxt = urljoin(target, location)
+            again = urlparse(nxt)
+            if again.scheme in BLOCKED_SCHEMES or not again.netloc:
+                raise FetchError(f"这页想把我带到 {again.scheme or '没写协议'} 的地址，我不跟")
+            _assert_public_host(again.hostname or "")
+            return _fetch_via_ipv4(nxt, timeout=timeout, max_bytes=max_bytes, headers=headers)
+        return (body[:max_bytes], status, headers_out, target if not truncated else target)
+    finally:
+        conn.close()
+
+
 def fetch(
     url: str,
     *,
@@ -225,10 +301,31 @@ def fetch(
             body = b"".join(chunks)[:max_bytes]
     except HTTPError as exc:
         raise FetchError(f"这页回我说 {exc.code}，我进不去") from exc
-    except URLError as exc:
-        raise FetchError(f"连不上：{exc.reason}") from exc
-    except OSError as exc:
-        raise FetchError(f"打不开：{exc}") from exc
+    except (URLError, OSError) as exc:
+        # 连接层失败不一定是对方不在线：双栈域名 + 本机 IPv6 不通时，urllib 选中死地址
+        # 也会报这个。换条钉死 IPv4 的路再试一次，还不成才真的算打不开。
+        reason = getattr(exc, "reason", exc)
+        if parsed.scheme != "https" or allow_private or not _is_connection_drop(reason):
+            raise FetchError(f"打不开：{reason}") from exc
+        try:
+            body, status, resp_headers, final_url = _fetch_via_ipv4(
+                target,
+                timeout=timeout,
+                max_bytes=max_bytes,
+                headers={
+                    "User-Agent": user_agent,
+                    "Accept": accept,
+                    "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.6",
+                },
+            )
+        except (OSError, ValueError) as retry_exc:
+            raise FetchError(f"打不开：{reason}") from retry_exc
+        charset = resp_headers.get_content_charset() or "utf-8"
+        ctype = (resp_headers.get_content_type() or "").lower()
+        read = len(body)
+        truncated = False
+        if status >= 400:
+            raise FetchError(f"这页回我说 {status}，我进不去")
 
     text_body = body.decode(charset, errors="replace")
     markup = ""

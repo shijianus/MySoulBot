@@ -26,7 +26,7 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
-TODAY = "2026-10-03"
+TODAY = time.strftime("%Y-%m-%d")  # 写死日期过零点就自打：事实由引擎按今天盖章
 FACT_LINE_RE = re.compile(r"^- \[\d{4}-\d{2}-\d{2}\] ", re.M)
 STATE = {"extract_calls": 0, "chat_calls": 0, "extract_empty_once": False}
 LAST_CHAT_PARAMS: dict[str, object] = {}
@@ -339,7 +339,7 @@ async def _persona_checks(
     check.ok("Echo 的 max_tokens 生效", LAST_CHAT_PARAMS.get("max_tokens") == 800, str(LAST_CHAT_PARAMS))
 
     back = await bot.apply_persona(user, lib.get("default"))
-    check.ok("可切回默认模板", "夜汐" in await storage.read_doc(user, "SOUL") and back.greeting == "",
+    check.ok("可切回默认模板", "shijianus" in await storage.read_doc(user, "SOUL") and back.greeting == "",
              (await storage.read_doc(user, "SOUL"))[:40])
     check.ok("SOUL 备份累积且受限", len(list((storage.backups_dir(user)).glob("SOUL-*.md"))) <= 5)
 
@@ -378,6 +378,9 @@ async def main() -> int:  # noqa: C901 - 顺序执行的一组独立场景
             "BASE_URL": base_url,
             "API_KEY": "fake-key",
             "MODEL": "fake-chat",
+            # ROUTES 会盖掉 BASE_URL（生产上正是这么用的），这里必须显式清空：
+            # 不然开发机一配多线路，这套测试就跑去打真网关了
+            "ROUTES": "",
             "EXTRACTOR_MODEL": "fake-lite",
             "STORAGE_DIR": root,
             "EXTRACTOR_MAX_FACTS": "5",
@@ -393,6 +396,9 @@ async def main() -> int:  # noqa: C901 - 顺序执行的一组独立场景
 
     check = Checker()
     settings = config_module.get_settings()
+    # 这份档案通篇在测记忆注入与历史恢复本身，先按红线关掉前的行为跑；
+    # 红线由下面「红线下重启不回放历史对话」那组断言单独验，别让默认值替它说话。
+    settings.soul_files_only = False
     storage = StorageManager(settings)
     extractor = MemoryExtractor(settings, storage)
     bot = MySoulBot(settings, storage, PromptBuilder(settings, storage), extractor)
@@ -419,7 +425,7 @@ async def main() -> int:  # noqa: C901 - 顺序执行的一组独立场景
     check.ok("Prompt 含禁止代用户发言", "绝不代替用户发言" in prompt)
     check.ok("Prompt 含人格连贯约束", "保持人格" in prompt)
     check.ok("Prompt 含硬约束原文", "你必须始终遵守以下硬约束" in prompt)
-    check.ok("Prompt 含人格内核正文", "夜汐" in prompt)
+    check.ok("Prompt 含人格内核正文", "shijianus" in prompt)
     check.ok("记忆为空时显式声明", "尚无确认的关键事实" in prompt)
     check.ok("分层报告可读", "system prompt 合计" in layers.render_report(), layers.render_report())
 
@@ -453,10 +459,16 @@ async def main() -> int:  # noqa: C901 - 顺序执行的一组独立场景
     check.ok("对话日志按天落盘", bool(logs), str(logs))
     records = await storage.read_recent_transcript(user, 12)
     check.ok("日志可回读为上下文", len(records) == 4, f"{len(records)}")
+    settings.soul_files_only = True  # 红线开：日志只留档，不回放进上下文
     restored = await MySoulBot(
         settings, storage, PromptBuilder(settings, storage), extractor
     ).open_session(user)
-    check.ok("重开会话恢复上下文", len(restored.history) == 4, f"{len(restored.history)}")
+    check.ok("红线下重启不回放历史对话", len(restored.history) == 0, f"{len(restored.history)}")
+    settings.soul_files_only = False
+    restored = await MySoulBot(
+        settings, storage, PromptBuilder(settings, storage), extractor
+    ).open_session(user)
+    check.ok("关掉红线才恢复上下文", len(restored.history) == 4, f"{len(restored.history)}")
 
     written = await storage.append_facts(user, ["用户喝咖啡会失眠"])
     check.ok("手工追加事实", written == ["用户喝咖啡会失眠"], str(written))
@@ -535,8 +547,8 @@ async def main() -> int:  # noqa: C901 - 顺序执行的一组独立场景
     check.ok("wait_idle 等到真正落盘才返回", left == 0 and FACT_LINE_RE.search(racer_memory) is not None,
              f"left={left} memory={racer_memory[-120:]!r}")
     check.ok(
-        "残缺括号 `-2026-10-03] 事实` 被修复落盘",
-        "- [2026-10-03] 用户养了一只叫花卷的猫" in racer_memory,
+        "残缺括号被修好后按今天落盘",
+        f"- [{TODAY}] 用户养了一只叫花卷的猫" in racer_memory,
         racer_memory[-160:],
     )
     check.ok("残缺行未被计入丢弃导致事实丢失", "叫花卷的猫" in racer_memory, racer_memory[-160:])

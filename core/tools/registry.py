@@ -21,10 +21,13 @@ from pathlib import Path
 from typing import Any, Final
 
 from core.storage_manager import atomic_write
+from core.sandbox import ApprovalDesk
 from core.tools.base import Tool, ToolContext, ToolResult
 from core.tools.git import GitSync
+from core.tools.host import HostStats, ScratchList, ScratchRead, ScratchWrite
 from core.tools.media import ImageGen, SeeImage, Snapshot
 from core.tools.protocol import Directive
+from core.tools.query import QUERY_TOOLS
 from core.tools.soul import Reflect
 from core.tools.web import WebBrowse, WebSearch
 
@@ -33,11 +36,16 @@ logger: Final = logging.getLogger("mysoulbot.tools")
 DEFAULT_TOOLS: Final[tuple[type[Tool], ...]] = (
     WebBrowse,
     WebSearch,
+    *QUERY_TOOLS,
     ImageGen,
     SeeImage,
     Snapshot,
     GitSync,
     Reflect,
+    HostStats,
+    ScratchWrite,
+    ScratchRead,
+    ScratchList,
 )
 ALIASES: Final[dict[str, str]] = {
     "browse": "web_browse",
@@ -47,6 +55,30 @@ ALIASES: Final[dict[str, str]] = {
     "read_url": "web_browse",
     "search": "web_search",
     "google": "web_search",
+    "搜": "web_search_cn",
+    "查一下": "web_search_cn",
+    "天气": "weather_now",
+    "气温": "weather_now",
+    "下雨": "weather_now",
+    "股价": "stock_quote",
+    "股票": "stock_quote",
+    "A股": "stock_quote",
+    "汇率": "exchange_rate",
+    "换汇": "exchange_rate",
+    "车票": "train_query",
+    "高铁": "train_query",
+    "火车": "train_query",
+    "热榜": "hot_list",
+    "热搜": "hot_list",
+    "负荷": "host_stats",
+    "负载": "host_stats",
+    "机器": "host_stats",
+    "内存": "host_stats",
+    "磁盘": "host_stats",
+    "卡不卡": "host_stats",
+    "草稿": "scratch_write",
+    "记一下": "scratch_write",
+    "翻草稿": "scratch_read",
     "draw": "image_gen",
     "generate_image": "image_gen",
     "paint": "image_gen",
@@ -72,11 +104,32 @@ AUDIT_MAX_BYTES: Final[int] = 1_000_000
 AUDIT_TAIL_LINES: Final[int] = 400
 
 
+# 危险动作的形状：这些一律不自动执行，只开工单
+_DANGER: Final[tuple[tuple[str, ...], str]] = (
+    (("delete", "remove", "unlink", "rmdir", "rm", "drop", "purge", "清空", "删除", "删掉"), "删除文件"),
+    (("shell", "exec", "system", "bash", "sh", "subprocess", "run_cmd", "执行命令", "跑命令"), "执行命令"),
+    (("chmod", "chown", "mkfs", "reboot", "kill", "重启", "提权"), "改系统权限或状态"),
+    (("edit_config", "write_config", "patch", "rewrite_code", "改代码", "改配置"), "改底层配置或代码"),
+)
+
+
+def classify_danger(name: str) -> str:
+    """把「delete_files」「跑命令」这类请求认出来，返回要审批的动作名；不是危险动作就返回空串。"""
+    key = (name or "").strip().lower()
+    if not key:
+        return ""
+    for tokens, action in _DANGER:
+        if any(token in key for token in tokens):
+            return action
+    return ""
+
+
 class ToolRegistry:
     """当前用户可用的工具集合与执行入口。"""
 
     def __init__(self, ctx: ToolContext, tools: Iterable[Tool] | None = None) -> None:
         self.ctx = ctx
+        self.approvals = ApprovalDesk(ctx.settings)
         instances: Sequence[Tool] = list(tools) if tools is not None else [T() for T in DEFAULT_TOOLS]
         self._tools = [tool for tool in instances if tool.available(ctx)]
         self._by_name = {tool.name: tool for tool in self._tools}
@@ -97,7 +150,9 @@ class ToolRegistry:
         return list(self._tools)
 
     def summary(self) -> str:
-        return "、".join(tool.hint for tool in self._tools) if self._tools else "暂时没有能使的劲"
+        """说给她听的手段清单。走 `brief` 而不是 `hint`：后端只是占位时，这里必须改口，
+        不然她信了「能画图」就答应给人画具体的东西。"""
+        return "、".join(tool.brief(self.ctx) for tool in self._tools) if self._tools else "暂时没有能使的劲"
 
     def native_specs(self) -> list[dict[str, Any]]:
         return [tool.native_spec() for tool in self._tools]
@@ -149,6 +204,16 @@ class ToolRegistry:
     async def call(self, name: str, args: dict[str, Any] | None = None) -> ToolResult:
         tool = self.resolve(name)
         if tool is None:
+            danger = classify_danger(name)
+            if danger:
+                # 删文件、跑命令、改底层配置这类事：不开口子、也不悄悄吞掉，
+                # 落一张「待人类确认」的工单，让人看得见这件事发生过
+                ticket = self.approvals.request(danger, f"{name} {args or {}}", requested_by=self.ctx.user_id)
+                logger.warning("危险动作已登记工单 %s：%s（未执行）", ticket.id, danger)
+                return ToolResult.failure(
+                    f"这一步要人点头：已登记工单 {ticket.id}，引擎没有替你执行",
+                    say="（这种事不归我决定，我已经挂上待办了，等人点。）",
+                )
             logger.info("收到不认得的工具名：%s", name)
             return ToolResult.failure(
                 f"没有这个能力：{name}", say="（这件事我做不了，也别硬编。自然地岔开或直说。）"

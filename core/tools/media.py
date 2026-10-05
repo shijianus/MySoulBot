@@ -59,6 +59,14 @@ class ImageGen(Tool):
     def available(self, ctx: ToolContext) -> bool:
         return ctx.settings.tools_enabled and ctx.settings.image_provider != "none"
 
+    def brief(self, ctx: ToolContext) -> str:
+        """占位后端不许冒充会画画：工具清单里就得说清楚，
+        不然她信了 hint，转头跟人说「我给你画了一只鲸鱼」——那是撒谎。
+        """
+        if ctx.settings.image_provider == "stub":
+            return "画图后端目前是占位实现（只会出纯色渐变），别答应给人画具体的东西"
+        return self.hint
+
     async def run(self, ctx: ToolContext, args: dict[str, Any]) -> ToolResult:
         prompt = str(args.get("prompt", "")).strip()
         if not prompt:
@@ -106,7 +114,8 @@ class ImageGen(Tool):
     @staticmethod
     def _openai(ctx: ToolContext, prompt: str, size: str) -> bytes:
         s = ctx.settings
-        url = f"{s.base_url}/images/generations"
+        # 绘图通道常常和对话不在同一个网关/群组上，所以允许单独指一条
+        url = f"{(s.image_base_url or s.base_url).rstrip('/')}/images/generations"
         payload = {
             "model": s.image_model or s.model,
             "prompt": prompt,
@@ -118,7 +127,7 @@ class ImageGen(Tool):
             data=json.dumps(payload).encode("utf-8"),
             headers={
                 "Content-Type": "application/json",
-                "Authorization": f"Bearer {s.api_key or 'EMPTY'}",
+                "Authorization": f"Bearer {s.image_api_key or s.api_key or 'EMPTY'}",
             },
             method="POST",
         )

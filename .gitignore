@@ -29,3 +29,20 @@ storage/run/
 
 # 裸机协议端的工作目录（含鉴权串与主程序软链，机器本地状态）
 onebot/
+
+# NapCat 配置留档里带着真实鉴权串，和 .env 同级敏感，不进版本库
+scripts/qq/napcat_config.json
+
+# 她自己的心境记事与审批工单：私有运行数据，不进主仓库（灵魂资产走 ClawdSoul 独立分支）
+storage/soul/MOOD.md
+storage/run/approvals/
+storage/data/users/*/*.bak-*
+
+# 实验残留的 sqlite 与本地跑图产物：不是资产，不进版本库
+guild1.db
+guild1.db-shm
+guild1.db-wal
+vibe_images/
+
+# 她的草稿工位是运行时数据（查来的材料、算一半的数），不进版本库
+storage/sandbox/

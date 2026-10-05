@@ -185,7 +185,7 @@ def make_settings(root: Path, base_url: str, **overrides: Any) -> Any:
         "panel_enabled": True,
     }
     values.update(overrides)
-    return Settings(**values)
+    return Settings(_env_file=None, **values)  # 不吃开发机的 .env，端口与开关一律自己定
 
 
 # ---------------------------------------------------------------- HTTP 侧的小工具
@@ -519,6 +519,16 @@ async def voice_checks(check: Checker, settings: Any, base: str) -> None:
     night = voice.prosody_for(late, settings)
     midnight = voice.prosody_for(zero, settings)
     check.ok("白天是常态语调", day.night is False and day.rate > night.rate, str(day.as_dict()))
+    check.ok("默认音线不是播报腔的晓晓",
+             settings.tts_voice_day == "zh-CN-XiaoyiNeural" and "Xiaoxiao" not in (settings.tts_voice_day
+                                                                                   + settings.tts_voice_night),
+             f"{settings.tts_voice_day}/{settings.tts_voice_night}")
+    check.ok("音线 bias 真的落到调参上",
+             voice.prosody_for(noon, settings.model_copy(update={"tts_rate_bias": 0.2})).rate > day.rate
+             and voice.prosody_for(noon, settings.model_copy(update={"tts_pitch_bias_hz": 30.0})).pitch_hz > day.pitch_hz,
+             f"{day.edge_tuning()}")
+    check.ok("动作描写不念出口",
+             "尾巴" not in voice.spoken_text("*尾鳍摆了摆* 本鲸不去（小声）", settings))
     check.ok("深夜自动压低语速与响度",
              night.night and night.volume < day.volume and night.pitch_hz < day.pitch_hz,
              f"day={day.rate}/{day.volume} night={night.rate}/{night.volume}")

@@ -38,7 +38,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
 REPLY_RE = "（盯着看）"
-STAMP = dt.datetime(2026, 10, 3, 21, 12, 0, tzinfo=dt.timezone(dt.timedelta(hours=8)))
+STAMP = dt.datetime.now().astimezone().replace(hour=22, minute=30, second=0, microsecond=0)
 NOW = dt.datetime.now().astimezone()
 
 # 假端点的可观察状态
@@ -153,7 +153,9 @@ def make_settings(root: Path, base_url: str, **overrides: Any) -> Any:
         "panel_enabled": True,
     }
     values.update(overrides)
-    return Settings(**values)
+    # _env_file=None：测试只认自己写死的那套值。开发机的 .env 一开 ONEBOT_ENABLED，
+    # 继承下来的话这里会去抢 11556，测试就变成在测「这台机器现在怎么配的」。
+    return Settings(_env_file=None, **values)
 
 
 async def build_bot(settings: Any) -> Any:

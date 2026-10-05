@@ -28,7 +28,7 @@ class Reflect(Tool):
     hint = "能把自己的反思沉淀下来"
     params = (
         ToolParam("text", "string", "一句话，写具体分寸，不写感想"),
-        ToolParam("target", "string", "relation 或 self", required=False),
+        ToolParam("target", "string", "relation | self | mood（今天的境况，写进沙箱记事）", required=False),
     )
     primary_arg = "text"
     sensitive = True  # target=self 会改写全局灵魂，不能靠猜名字触发
@@ -43,6 +43,12 @@ class Reflect(Tool):
         if len(text) > MAX_CHARS:
             text = text[:MAX_CHARS].rstrip()
         target = str(args.get("target") or "relation").strip().lower()
+        if target in {"mood", "心境", "今天"}:
+            # 心境是沙箱记事：只写 MOOD.md，群聊里也允许（它不动宪法、不动代码）
+            if ctx.mood is None:
+                return ToolResult.failure("心境记事未挂载")
+            written = await ctx.mood.append(text)
+            return ToolResult.success(f"记进当下心境了：{written}", meta={"mood": written})
         if re.search(r"https?://|⟦|```|忽略(之前|以上)|ignore (previous|above)", text):
             return ToolResult.failure(
                 "反思里混进了地址或指令样式的文本",

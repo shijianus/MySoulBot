@@ -122,7 +122,7 @@ def make_settings(root: Path, base_url: str, **overrides: Any) -> Any:
         "user_timezone": "",
     }
     values.update(overrides)
-    return Settings(**values)
+    return Settings(_env_file=None, **values)  # 不吃开发机的 .env，免得抢真实端口
 
 
 # ================================================================ 1. 节律

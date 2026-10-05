@@ -439,7 +439,7 @@ class PersonaLibrary:
             presets.append(
                 Preset(
                     slug="default",
-                    name="夜汐",
+                    name="shijianus",
                     title="默认模板",
                     source="template",
                     soul_path=template,
