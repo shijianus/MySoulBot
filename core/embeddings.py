@@ -28,10 +28,11 @@ import re
 import struct
 import urllib.request
 from typing import Any, Final
+from urllib.error import HTTPError
 
 from config import Settings
 from core.tools.webio import FetchError, _assert_public_host
-from urllib.parse import urlparse
+from urllib.parse import urlparse  # noqa: E402
 
 logger: Final = logging.getLogger("mysoulbot.embed")
 
@@ -106,6 +107,20 @@ def _post_json(url: str, payload: dict[str, Any], key: str, timeout: float) -> d
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:  # noqa: S310
             raw = response.read(4_000_000)
+    except HTTPError as exc:
+        # 上游的错误体里写着真正的原因（"Token is invalid." 之类）。
+        # 只报 "HTTP Error 401" 等于让人去猜是密钥、配额还是模型名错了。
+        detail = ""
+        try:
+            detail = exc.read(600).decode("utf-8", errors="replace").strip()
+        except Exception:  # noqa: BLE001 - 读不到错误体就退回状态码
+            detail = ""
+        try:
+            hint = json.loads(detail)
+            detail = str(hint.get("message") or hint.get("error") or detail)[:120]
+        except (json.JSONDecodeError, AttributeError):
+            detail = detail[:120]
+        raise EmbedError(f"向量端点回 {exc.code}{'：' + detail if detail else ''}") from exc
     except Exception as exc:  # noqa: BLE001 - 上游怎么坏都收敛成一句人话
         raise EmbedError(f"向量端点没打通：{str(exc)[:90]}") from exc
     try:
@@ -167,8 +182,11 @@ class Embedder:
         if self._failed:
             return self._failed
         if not self._remote_ok:
-            return (f"配了 {self.configured[0]} 但还没成功打通过一次，暂时用本地向量"
-                    "（这台机器多半到不了那个端点）")
+            # 只说「还没打通过」这个事实，不猜原因：
+            # 可能是网络到不了，也可能是进程刚起来还没轮到一次检索。
+            # 猜成「多半到不了」曾对 Cohere 成立，对硅基流动就是错的。
+            return (f"配了 {self.configured[0]} 但本进程还没成功打通过一次，"
+                    "暂时用本地向量（真打通过一次之后会自动切过去）")
         return ""
 
     # ------------------------------------------------------------ 出向量

@@ -308,9 +308,13 @@ async def hedge_checks(check: Checker) -> None:
                  len(T.SEEN) >= 2, f"上游被打了 {len(T.SEEN)} 次")
         check.ok("下一条线先见字，正文用它", out.texts == ["下一条线先见字"], out.texts)
         check.ok("没等同一家把两轮看门狗等满", out.seconds < 3.0, f"{out.seconds}s")
+        # 只断言不变量：输的那条绝不能被记成「坏了」。
+        # stalled 记不记要看胜者判定和回收谁先跑——line-a 确实是「光思考不落正文」，
+        # 记成白等反而是对的（上面另有一条断言就是钉这个的），
+        # 所以这里再要求 stalled==0 就是跟自己的另一条断言打架，变成计时抖动。
+        view_a = rig.view_of("line-a")
         check.ok("输的那条只算没跑完，不记成坏了",
-                 rig.view_of("line-a")["stalled"] == 0 and rig.view_of("line-a")["fail"] == 0,
-                 rig.view_of("line-a"))
+                 view_a["fail"] == 0 and view_a["ok"] >= 0, view_a)
         check.ok("赢的那条记了账", rig.view_of("line-b")["ok"] >= 1, rig.view_of("line-b"))
         T.reset_model()
     finally:

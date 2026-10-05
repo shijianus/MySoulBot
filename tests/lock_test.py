@@ -20,7 +20,7 @@ import qq_onebot_test as T  # noqa: E402
 from config import Settings  # noqa: E402
 from core import secrecy as SEC  # noqa: E402
 from core.embeddings import Embedder, cosine, embed_local  # noqa: E402
-from core.vector_index import VectorIndex  # noqa: E402
+from core.vector_index import Hit, VectorIndex  # noqa: E402
 
 Checker = T.Checker
 
@@ -214,6 +214,74 @@ async def vector_checks(check: Checker) -> None:
              (await off.upsert(uid, "fact", corpus)) == 0 and await off.search(uid, "猫") == [], "")
     check.ok("状态里能看到现在用哪条后端", ix.status["backend"] in ("local", "cohere", "openai"),
              ix.status)
+    check.ok("状态里也能看到重排是哪条", ix.status["rerank"] in ("off", "siliconflow"), ix.status)
+    check.ok("精排有下限，不为显得记得而硬凑不相干的旧事",
+             s.rerank_floor > 0 and s.rerank_recall > s.rerank_recall * 0, s.rerank_floor)
+
+
+def rerank_checks(check: Checker) -> None:
+    import core.rerank as R
+
+    s = lock_settings(rerank_provider="off")
+    r = R.Reranker(s)
+    check.ok("没配精排时 usable=False 且 backend 报 off",
+             not r.usable and r.backend == "off", r.backend)
+    check.ok("并说清为什么", "RERANK_PROVIDER" in r.degraded_because, r.degraded_because[:50])
+    check.ok("不可用时 rerank() 直接返回空而不是抛", r.rerank("问", ["a"]) == [], "")
+
+    cfg = lock_settings(rerank_provider="siliconflow", rerank_base_url="https://api.siliconflow.cn/v1",
+                        rerank_api_key="sk-x" * 6, rerank_model="BAAI/bge-reranker-v2-m3")
+    rc = R.Reranker(cfg)
+    check.ok("配了但没打通过 → 报 off，不冒充在跑真重排",
+             rc.usable and rc.configured_backend == "siliconflow" and rc.backend == "off",
+             f"{rc.configured_backend}/{rc.backend}")
+    check.ok("原因写明还没打通过", "还没成功打通过" in rc.degraded_because, rc.degraded_because[:60])
+
+    # 注入假响应验解析：不依赖网络，也不依赖上游今天活不活着
+    captured: dict[str, Any] = {}
+
+    def fake_post(url, payload, key, timeout):
+        captured["url"] = url
+        captured["payload"] = payload
+        return {"results": [{"index": 2, "relevance_score": 0.97},
+                            {"index": 0, "relevance_score": 0.02},
+                            {"index": 1, "relevance_score": 0.001}]}
+    original = R._post
+    R._post = fake_post
+    try:
+        got = rc.rerank("他猫叫什么", ["甲", "乙", "丙"], top_n=2)
+        check.ok("按上游给的顺序与分数返回", got == [(2, 0.97), (0, 0.02)], got)
+        check.ok("打过一次之后才敢报自己是那条后端", rc.backend == "siliconflow", rc.backend)
+        check.ok("URL 拼到 /rerank", captured["url"].endswith("/v1/rerank"), captured["url"])
+        check.ok("不重复回传文档正文（省流量）",
+                 captured["payload"].get("return_documents") is False, captured["payload"].keys())
+        check.ok("top_n 透传", captured["payload"].get("top_n") == 2, captured["payload"])
+
+        # 越界下标必须丢掉：宁可少一条，不能把不相干的排进来
+        R._post = lambda *a, **k: {"results": [{"index": 99, "relevance_score": 1.0},
+                                               {"index": 0, "relevance_score": 0.5}]}
+        rc2 = R.Reranker(cfg)
+        check.ok("越界下标被丢掉", rc2.rerank("问", ["甲", "乙"], top_n=2) == [(0, 0.5)],
+                 rc2.rerank("问", ["甲", "乙"], top_n=2))
+        # 上游结构变了要退回向量序，不能抛
+        R._post = lambda *a, **k: {"unexpected": 1}
+        rc3 = R.Reranker(cfg)
+        check.ok("结构变了退回空列表", rc3.rerank("问", ["甲"]) == [], "")
+        check.ok("并记下原因", "results" in rc3.degraded_because, rc3.degraded_because[:60])
+        R._post = lambda *a, **k: (_ for _ in ()).throw(R.RerankError("精排端点回 401：Token is invalid."))
+        rc4 = R.Reranker(cfg)
+        check.ok("上游报错也退回空，不抛给对话", rc4.rerank("问", ["甲"]) == [], "")
+        check.ok("上游错误体里的原因被保留（不是光一个 401）",
+                 "Token is invalid" in rc4.degraded_because, rc4.degraded_because[:70])
+    finally:
+        R._post = original
+
+    # 精排不可用时，检索必须退回向量序而不是空手
+    ix = VectorIndex(lock_settings(rerank_provider="off"))
+    hits = [Hit(text=f"第{i}条", kind="fact", day="2026-10-01", score=0.9 - i * 0.1) for i in range(5)]
+    back = ix._rerank("问", hits, 3)
+    check.ok("没开精排时按向量原序给满 limit", [h.text for h in back] == ["第0条", "第1条", "第2条"],
+             [h.text for h in back])
 
 
 async def prompt_recall_checks(check: Checker) -> None:
@@ -256,6 +324,7 @@ async def main() -> int:
         lock_list_checks(check)
         await lock_wire_checks(check)
         embed_checks(check)
+        rerank_checks(check)
         await vector_checks(check)
         await prompt_recall_checks(check)
     finally:

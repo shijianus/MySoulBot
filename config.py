@@ -273,7 +273,8 @@ class Settings(BaseSettings):
     judgment_model: str = Field(default="", description="攒判断走哪个模型，留空跟着抽取器/主模型")
     # ---------------- 向量检索：记忆按「像不像」取，不按「新不新」取 ----------------
     embed_provider: str = Field(
-        default="off", description="off | cohere | openai。off 就是只用本地兜底向量",
+        default="off", description="off | cohere | openai。openai 指任何 OpenAI 兼容网关"
+        "（硅基流动、one-api 之类都走这条）。off 就是只用本地兜底向量",
     )
     embed_base_url: str = Field(
         default="",
@@ -283,12 +284,35 @@ class Settings(BaseSettings):
     embed_api_key: str = Field(default="", description="向量端点密钥。**只从 .env 读，绝不写进任何进版本库的文件**")
     embed_model: str = Field(default="", description="向量模型名，如 embed-multilingual-v3.0")
     embed_timeout: float = Field(default=15.0, gt=0, description="一次向量请求的天花板；超了就退本地")
+    # ---------------- 精排（rerank）：召回之后再做一次精排 ----------------
+    rerank_enabled: bool = Field(
+        default=True,
+        description="向量召回之后，用精排模型再排一次。向量负责「别漏」，"
+        "精排负责「谁最相关」——两件事两种错法，合起来才好用",
+    )
+    rerank_provider: str = Field(
+        default="off", description="off | siliconflow（OpenAI 式 /rerank）。off 就退回向量原序"
+    )
+    rerank_base_url: str = Field(default="", description="精排端点，填到 /v1 即可（会自动接 /rerank）")
+    rerank_api_key: str = Field(default="", description="精排密钥。**只从 .env 读，不进版本库**")
+    rerank_model: str = Field(default="", description="精排模型名，如 BAAI/bge-reranker-v2-m3")
+    rerank_timeout: float = Field(default=10.0, gt=0, description="一次精排请求的天花板；超了就退回向量序")
+    rerank_floor: float = Field(
+        default=0.05, ge=0.0, le=1.0,
+        description="精排分数低于这条的记忆**不塞进提示词**。精排器按 top_n 硬给结果，"
+        "问「今天天气不错」也能给你三条 0.0000 的旧事——那不是想起，是硬凑。"
+        "宁可不提，也不要为了显得记得而扯一句不相干的",
+    )
+    rerank_recall: int = Field(
+        default=20, ge=4, le=64, description="先按向量召回多少条候选交给精排（精排按条计费，别贪）",
+    )
     vector_enabled: bool = Field(
         default=True,
         description="用向量相似度挑记忆。关掉就退回「取最近 N 条」那套旧行为",
     )
+    # bge-large / bge-m3 都是 1024 维，留一倍余量给以后换更大的模型
     vector_dim_guard: int = Field(
-        default=1024, ge=64, description="索引里维度超过这个数就当脏数据重建（防配错把库撑爆）"
+        default=2048, ge=64, description="索引里维度超过这个数就当脏数据重建（防配错把库撑爆）"
     )
     cognition_temperature: float = Field(default=0.4, ge=0.0, le=2.0)
 

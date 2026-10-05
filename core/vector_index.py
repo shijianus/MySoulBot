@@ -31,6 +31,7 @@ from typing import Any, Final
 
 from config import Settings
 from core.embeddings import Embedder
+from core.rerank import Reranker
 
 logger: Final = logging.getLogger("mysoulbot.vector")
 
@@ -77,15 +78,22 @@ class Hit:
 class VectorIndex:
     """记忆的向量索引。所有阻塞调用都在 `asyncio.to_thread` 里跑。"""
 
-    def __init__(self, settings: Settings, embedder: Embedder | None = None) -> None:
+    def __init__(self, settings: Settings, embedder: Embedder | None = None,
+                 reranker: Reranker | None = None) -> None:
         self._settings = settings
         self.embedder = embedder or Embedder(settings)
+        # 精排器：召回之后再做一次精排。没配或打不通就退回向量序
+        self.reranker = reranker or Reranker(settings)
         self._path = settings.storage_dir / "data" / "vectors.db"
         self._broken = ""
 
     @property
     def enabled(self) -> bool:
         return bool(self._settings.vector_enabled) and not self._broken
+
+    @property
+    def rerank_backend(self) -> str:
+        return self.reranker.backend
 
     @property
     def status(self) -> dict[str, Any]:
@@ -98,7 +106,10 @@ class VectorIndex:
         if self._broken:
             info["broken"] = self._broken
         if self.embedder.degraded_because:
-            info["degraded"] = self.embedder.degraded_because
+            info["embed_degraded"] = self.embedder.degraded_because
+        info["rerank"] = self.reranker.backend
+        if self.reranker.degraded_because:
+            info["rerank_degraded"] = self.reranker.degraded_because
         return info
 
     # ------------------------------------------------------------ 连接
@@ -164,6 +175,12 @@ class VectorIndex:
     # ------------------------------------------------------------ 检索
     def search_sync(self, user_id: str, query: str, *, kinds: tuple[str, ...] = (),
                     limit: int = 6, floor: float = 0.12) -> list[Hit]:
+        """两段检索：向量宽召回 → 精排。
+
+        向量负责「别漏」（快、能扫全库，但排序粗——它没把问题和候选放一起看过），
+        精排负责「谁最相关」（准，但每条都要算一次，没法拿去扫一万条）。
+        精排不可用就退回向量序，并在 status 里说清楚这次是退化的。
+        """
         body = (query or "").strip()
         if not self._settings.vector_enabled or not body or self._broken:
             return []
@@ -193,7 +210,27 @@ class VectorIndex:
             if score >= floor:
                 scored.append(Hit(text=text, kind=kind, day=day, score=round(score, 4)))
         scored.sort(key=lambda hit: hit.score, reverse=True)
-        return scored[:limit]
+        # 召回放宽到 rerank_recall，精排后才收到 limit；没开精排就照原样按 limit 收
+        recall = scored[:max(limit, self._settings.rerank_recall)] if self.reranker.usable else scored[:limit]
+        return self._rerank(body, recall, limit)
+
+    def _rerank(self, query: str, recall: list[Hit], limit: int) -> list[Hit]:
+        """把候选原文交给精排器，按它给的分排序。失败就原样退回。"""
+        if not recall or not self.reranker.usable:
+            return recall[:limit]
+        ranked = self.reranker.rerank(query, [hit.text for hit in recall], top_n=limit)
+        if not ranked:
+            return recall[:limit]   # 退回向量序；原因已经写在 reranker.degraded_because 里
+        # 精排器按 top_n 硬给结果：问「今天天气不错」也能返回三条 0.0000 的旧事。
+        # 那不算想起，是硬凑——低于下限的一律丢掉，宁可不提。
+        floor = self._settings.rerank_floor
+        out: list[Hit] = []
+        for index, score in ranked[:limit]:
+            if score < floor:
+                continue
+            hit = recall[index]
+            out.append(Hit(text=hit.text, kind=hit.kind, day=hit.day, score=round(score, 4)))
+        return out
 
     async def search(self, user_id: str, query: str, *, kinds: tuple[str, ...] = (),
                      limit: int = 6, floor: float = 0.12) -> list[Hit]:
