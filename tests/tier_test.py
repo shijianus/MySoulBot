@@ -11,6 +11,7 @@ import asyncio
 import json
 import shutil
 import sys
+import dataclasses
 import tempfile
 import time
 from pathlib import Path
@@ -25,6 +26,7 @@ import qq_onebot_test as T  # noqa: E402
 from config import OWNER_USER_ID, Settings  # noqa: E402
 from core import identity as ID  # noqa: E402
 from core import judgment as J  # noqa: E402
+from core import pair_phrase as PP  # noqa: E402
 from core.storage_manager import PathSafetyError, StorageManager  # noqa: E402
 from core.tools.base import ToolContext  # noqa: E402
 from core.tools.registry import ToolRegistry  # noqa: E402
@@ -134,88 +136,129 @@ def owner_qq_checks(check: Checker) -> None:
 def pairing_checks(check: Checker) -> None:
     s = tier_settings(owner_enabled=True, pairing_ttl_seconds=120)
     desk = ID.PairingDesk(s)
-    check.ok("没挑战时任何话都不被截走", ID.consume_pairing(desk, "你好溟汐，我是管理员", source="cli") is None)
-    check.ok("没挑战时回填码形状也不截", ID.consume_pairing(desk, "QE9BGM", source="cli") is None)
+    check.ok("没挑战时任何话都不被截走",
+             ID.consume_pairing(desk, "你好溟汐，我是管理员", source="cli") is None)
 
-    ch = desk.start(channel="cli")
+    ch = desk.start(channel="cli", phrase="鲸鱼今晚不翻身")
     check.ok("挑战默认 120 秒内有效", 115 <= ch.seconds_left() <= 120, ch.seconds_left())
+    check.ok("口令是这一场的，不是写死的那句", ch.phrase == "鲸鱼今晚不翻身", ch.phrase)
     check.ok("唯一来源确认前，码一个字都不给", desk.plaintext_code(ch) == "", desk.plaintext_code(ch))
+    check.ok("旧那句固定话术不再算口令（防撞库）",
+             ID.consume_pairing(desk, "你好溟汐，我是管理员", source="cli") is None, "")
 
-    note = ID.consume_pairing(desk, "你好溟汐，我是管理员", source="cli")
-    check.ok("激活语被截走并确认唯一来源", note and "唯一来源确认" in note, note)
+    note = ID.consume_pairing(desk, "鲸鱼今晚不翻身", source="cli")
+    check.ok("这一场的口令被截走并确认唯一来源", note and "唯一来源确认" in note, note)
     ch = desk.active()
     code = desk.plaintext_code(ch)
     check.ok("确认后才吐码且是分组形状", len(code) == 6 and ID.format_code(code) == f"{code[:3]}-{code[3:]}",
-            f"{code} / {ID.format_code(code)}")
+             f"{code} / {ID.format_code(code)}")
     done = ID.consume_pairing(desk, ID.format_code(code), source="cli")
     check.ok("回填码完成配对", done and "配对完成" in done, done)
     check.ok("身份升级为管理者", ID.resolve_identity(s, OWNER_USER_ID).is_owner, "")
     check.ok("交互者仍是交互者", ID.resolve_identity(s, "qq_private_9").tier is ID.Tier.INTERACTOR)
     check.ok("配对结束后闲聊不再被截",
              ID.consume_pairing(desk, "今天吃米饭", source="cli") is None)
+    check.ok("完成后挑战文件被删（不在盘上留凭据）", not list(s.pairing_dir.glob("PAIR-*.json")),
+             [f.name for f in s.pairing_dir.glob("PAIR-*.json")])
 
-    # 码只存哈希：明文出现在盘上就等于门是开的
-    blobs = [p.read_bytes() for p in s.pairing_dir.glob("*.json")]
-    check.ok("挑战文件里没有明文码", all(code.encode() not in blob for blob in blobs),
-             [len(b) for b in blobs])
-    check.ok("挑战文件里也没有激活语之外的凭据", all(b"code_hash" in b for b in blobs))
+    # 口令每场不同：同一句写死的话术被公开过一次，就不能再复用到下一场
+    s_dup = tier_settings(owner_enabled=True)
+    d_dup = ID.PairingDesk(s_dup)
+    phrases = set()
+    for _ in range(6):
+        existing = d_dup.active()
+        if existing is not None:
+            d_dup.void(existing.id)
+        phrases.add(d_dup.start(channel="cli", phrase=PP.local_phrase()).phrase)
+    check.ok("连开六场，口令不是一句写死的", len(phrases) >= 5, phrases)
+
+    # 跨进程：换一个 PairingDesk 实例（相当于守护进程）也能完成 CLI 发起的那场
+    s_x = tier_settings(owner_enabled=True)
+    d_cli = ID.PairingDesk(s_x)
+    made = d_cli.start(channel="cli", phrase="米饭要热的")
+    d_other = ID.PairingDesk(s_x)          # 另一个进程，内存里什么都没有
+    got = d_other.active()
+    check.ok("另一个进程能读到同一场挑战（落盘共享）", got is not None and got.id == made.id,
+             f"{got.id if got else None} vs {made.id}")
+    ID.consume_pairing(d_other, "米饭要热的", source="cli")
+    got = d_other.get(made.id)
+    code_x = d_other.plaintext_code(got)
+    check.ok("另一个进程也拿得到回填码（跨进程可完成）", len(code_x) == 6, code_x)
+    done_x = ID.consume_pairing(d_other, code_x, source="cli")
+    check.ok("在另一个进程里完成配对", done_x and "配对完成" in done_x, done_x)
+
+    # 挑战文件权限：里面躺着这一场的口令与码
+    s_perm = tier_settings(owner_enabled=True)
+    d_perm = ID.PairingDesk(s_perm)
+    made_p = d_perm.start(channel="cli", phrase="三点的水族箱")
+    path = s_perm.pairing_dir / f"{made_p.id}.json"
+    mode = path.stat().st_mode & 0o777
+    check.ok("挑战文件锁到 0600（口令与码在盘上不能给别人读）", mode == 0o600, oct(mode))
+    d_perm.void(made_p.id)
+    check.ok("作废即删，不留一个废口令在盘上", not path.exists(), str(path))
+
+    # 唯一来源：两个通道同时喊，整场作废
+    s3 = tier_settings(owner_enabled=True)
+    d3 = ID.PairingDesk(s3)
+    ph3 = "会发光的尾鳍"
+    d3.start(channel="cli", phrase=ph3)
+    a = ID.consume_pairing(d3, ph3, source="cli")
+    b = ID.consume_pairing(d3, ph3, source="qq_private", qq="777")
+    check.ok("第二个来源进来就整场作废", a and "唯一来源确认" in a and b and "作废" in b, f"{a} / {b}")
+    check.ok("作废后拿不到码", d3.active() is None or d3.plaintext_code(d3.active()) == "", "")
 
     # 大小写与短横都不该成为输错的理由
     s2 = tier_settings(owner_enabled=True)
     d2 = ID.PairingDesk(s2)
-    d2.start()
-    ID.consume_pairing(d2, "你好溟汐，我是管理员", source="cli")
+    d2.start(channel="cli", phrase="海带不上岸")
+    ID.consume_pairing(d2, "海带不上岸", source="cli")
     c2 = d2.active()
     k2 = d2.plaintext_code(c2)
     lower_spaced = f"{k2[:3].lower()} {k2[3:].lower()}"
     verdict = ID.consume_pairing(d2, lower_spaced, source="cli")
     check.ok("小写带空格也能过", verdict is not None and "配对完成" in verdict, f"{lower_spaced} -> {verdict}")
 
-    # 唯一来源：两个通道同时喊，整场作废
-    s3 = tier_settings(owner_enabled=True)
-    d3 = ID.PairingDesk(s3)
-    d3.start()
-    a = ID.consume_pairing(d3, "你好溟汐，我是管理员", source="cli")
-    b = ID.consume_pairing(d3, "你好溟汐，我是管理员", source="qq_private", qq="777")
-    check.ok("第二个来源进来就整场作废", a and "唯一来源确认" in a and b and "作废" in b, f"{a} / {b}")
-    voided = [d3.get(path.stem) for path in sorted(d3.directory.glob("PAIR-*.json"))]
-    check.ok("作废的那场拿不到码", all(got is None or desk_code_empty(d3, got) for got in voided),
-             [got.stage for got in voided if got])
+    # 口令比对是整句相等，不是包含：长闲聊顺嘴带出口令不该被当成配对
+    s5 = tier_settings(owner_enabled=True)
+    d5 = ID.PairingDesk(s5)
+    d5.start(channel="cli", phrase="声呐朝北游")
+    check.ok("口令嵌在长句里不算（整句相等才认）",
+             ID.consume_pairing(d5, "我今天聊到声呐朝北游这件事", source="cli") is None, "")
 
     # 群聊不配对
     s4 = tier_settings(owner_enabled=True)
     d4 = ID.PairingDesk(s4)
-    d4.start()
-    check.ok("群聊来源不记为配对", ID.consume_pairing(d4, "你好溟汐，我是管理员", source="qq_group", group=True) is None)
-    check.ok("群聊来源没污染候选", not d4.active().candidates, d4.active().candidates)
+    d4.start(channel="cli", phrase="浮标留了灯")
+    check.ok("群聊来源不截不记",
+             ID.consume_pairing(d4, "浮标留了灯", source="qq_group", group=True) is None
+             and not d4.active().candidates, d4.active().candidates)
 
     # 过期即废
-    s5 = tier_settings(owner_enabled=True, pairing_ttl_seconds=120)
-    d5 = ID.PairingDesk(s5)
-    c5 = d5.start()
-    saved = d5._load(c5.id)
-    saved.expires_at = time.time() - 1
-    d5._save(saved)
-    check.ok("过期挑战不再算活跃", d5.active() is None)
-    check.ok("过期后激活语不截", ID.consume_pairing(d5, "你好溟汐，我是管理员", source="cli") is None)
+    s6 = tier_settings(owner_enabled=True, pairing_ttl_seconds=120)
+    d6 = ID.PairingDesk(s6)
+    c6 = d6.start(channel="cli", phrase="逆流的珊瑚")
+    d6._save(dataclasses.replace(d6.get(c6.id), expires_at=time.time() - 1))
+    check.ok("过期挑战不再算活跃", d6.active() is None)
+    check.ok("过期后口令不截", ID.consume_pairing(d6, "逆流的珊瑚", source="cli") is None)
 
     # 一个机器人只有一个管理者：换号顶替必须被拒
-    s6 = tier_settings(owner_enabled=True)
-    d6 = ID.PairingDesk(s6)
-    d6.start()
-    ID.consume_pairing(d6, "你好溟汐，我是管理员", source="cli")
-    c6 = d6.active()
-    ID.consume_pairing(d6, d6.plaintext_code(c6), source="cli")
-    again = d6.start()
-    ID.consume_pairing(d6, "你好溟汐，我是管理员", source="cli", qq="888888")
-    c6 = d6.active()
-    blocked = ID.consume_pairing(d6, d6.plaintext_code(c6), source="cli")
+    s7 = tier_settings(owner_enabled=True, owner_qq="")
+    d7 = ID.PairingDesk(s7)
+    d7.start(channel="cli", phrase="没写完的潜水钟")
+    ID.consume_pairing(d7, "没写完的潜水钟", source="cli")
+    c7 = d7.active()
+    ID.consume_pairing(d7, d7.plaintext_code(c7), source="cli")
+    again = d7.start(channel="cli", phrase="赖床的深海灯")
+    ID.consume_pairing(d7, "赖床的深海灯", source="cli", qq="888888")
+    c7 = d7.active()
+    blocked = ID.consume_pairing(d7, d7.plaintext_code(c7), source="cli")
     check.ok("已绑定时另一个号来顶替被拒", blocked and "已经绑过管理者" in blocked, blocked)
-    check.ok("顶替失败后原绑定没变", ID.read_owner(s6).binding_key() == "cli|anon",
-             ID.read_owner(s6).binding_key())
-    check.ok("解绑后回到未配对", ID.unpair(s6) is not None and ID.resolve_identity(s6, OWNER_USER_ID).tier is ID.Tier.INTERACTOR)
-    check.ok("解绑顺手清掉残留挑战", not list(s6.pairing_dir.glob("PAIR-*.json")))
-    check.ok("没绑定时解绑不炸", ID.unpair(s6) is None)
+    check.ok("顶替失败后原绑定没变", ID.read_owner(s7).binding_key() == "cli|anon",
+             ID.read_owner(s7).binding_key())
+    check.ok("解绑后回到未配对", ID.unpair(s7) is not None
+             and ID.resolve_identity(s7, OWNER_USER_ID).tier is ID.Tier.INTERACTOR)
+    check.ok("解绑顺手清掉残留挑战", not list(s7.pairing_dir.glob("PAIR-*.json")))
+    check.ok("没绑定时解绑不炸", ID.unpair(s7) is None)
 
 
 # ---------------------------------------------------------------- 3. 账号能力放行

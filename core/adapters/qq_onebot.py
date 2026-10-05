@@ -46,6 +46,7 @@ from urllib.parse import parse_qs, unquote, urlparse
 from config import PROJECT_ROOT, Settings
 from core.bot import BotError, MySoulBot
 from core.identity import PairingDesk, consume_pairing
+from core.pair_phrase import make_greeting
 from core.secrecy import Leak, guard as guard_secrecy
 from core.stickers import StickerBook
 from core.storage_manager import PathSafetyError
@@ -1623,6 +1624,18 @@ class OneBotBridge:
             self.bot_names = (nickname, *self.bot_names)
         logger.info("协议端报来的身份：%s（%s）", nickname or "无名", self.bot_id or "未知号")
 
+    async def _owner_capability_line(self, inbound: Inbound) -> str:
+        """配对成功后告诉她自己：现在手上多了哪些活。用真实注册表数，不写死。"""
+        try:
+            registry = self._bot.registry(inbound.engine_user_id)
+        except Exception:  # noqa: BLE001 - 自述失败不影响配对本身成立
+            return ""
+        names = [name for name in registry.names if name.startswith("qq_")]
+        if not names:
+            return ""
+        return ("我现在能动的：" + "、".join(sorted(names))
+                + f"。这些只对管理者开放，别人叫我也不使。")
+
     def _live_connection(self) -> _Connection | None:
         for connection in list(self._connections):
             if connection.alive:
@@ -1750,7 +1763,17 @@ class OneBotBridge:
         if note is not None:
             self._bump("paired_handled")
             logger.info("配对握手（%s）：%s", inbound.sender_id, note.splitlines()[0])
-            connection.track(self._send_bubble(connection, inbound, note))
+            await self._send_bubble(connection, inbound, note)
+            if "配对完成" in note:
+                # 认出来之后先打招呼，再报她能干什么——这是「我认出你了」的实测证据。
+                # 话是现生成的，不是模板；生成不出来就随机取一句人话兜底。
+                greet = await make_greeting(self._bot.ask_once)
+                await self._type_pause()
+                await self._send_bubble(connection, inbound, greet)
+                tools = await self._owner_capability_line(inbound)
+                if tools:
+                    await self._type_pause()
+                    await self._send_bubble(connection, inbound, tools)
             return
         if not inbound.is_group:
             # 私聊这一句她必定要接：先把「正在输入」挂上。等防抖窗口走完再挂，

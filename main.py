@@ -51,6 +51,7 @@ from core.bot import BotError, MySoulBot
 from core.card_loader import CardError, PersonaLibrary, PresetError
 from core.clawd_soul import ClawdSoul
 from core.identity import PairingDesk, consume_pairing, format_code, read_owner, unpair
+from core.pair_phrase import make_greeting, make_phrase
 from core.memory_extractor import MemoryExtractor
 from core.prompt_builder import PromptBuilder
 from core.storage_manager import (
@@ -283,6 +284,10 @@ class App:
                 note = consume_pairing(self.pairing, line, source="cli")
                 if note is not None:
                     self.ui.line(note)
+                    if "配对完成" in note:
+                        # 认出来之后她得主动打招呼——这是「我认出你了」的实测证据，
+                        # 不是日志里一行 paired_at
+                        self.ui.line("  " + await make_greeting(self.bot.ask_once))
                     continue
                 await self.turn(line)
 
@@ -446,10 +451,11 @@ class App:
         if current is not None and current.stage == "unique":
             code = self.pairing.plaintext_code(current)
             self.ui.line(f"配对进行中：唯一来源 {current.source_key}，回填码 {format_code(code)}")
+            self.ui.line(f"  （这一场的口令是「{current.phrase}」，{current.seconds_left()} 秒后作废）")
             return True
         if current is not None:
             self.ui.line(f"已有一场配对在跑（{current.seconds_left()} 秒后作废）。"
-                         "把这句发给对方：你好溟汐，我是管理员")
+                         f"把这句发进来：{current.phrase}")
             return True
         if not settings.owner_enabled:
             self.ui.warn("OWNER_ENABLED=false，分层没开。要配对先在 .env 里打开。")
@@ -457,10 +463,14 @@ class App:
         if read_owner(settings) is not None:
             self.ui.warn("已经绑过管理者了。一个机器人只有一个——要换先 /unpair")
             return True
-        challenge = self.pairing.start(channel="cli")
-        self.ui.line(f"配对已开始，{self.pairing.ttl} 秒内有效，到点自动作废。")
-        self.ui.line(f"  下一步：把这一句当**普通消息**发进来 → 你好溟汐，我是管理员")
+        # 口令每场现生成：写死一句就等于把密码本印在仓库里，谁读了都能喊
+        phrase = await make_phrase(self.bot.ask_once)
+        challenge = self.pairing.start(channel="cli", phrase=phrase)
+        self.ui.line(f"配对已开始，{challenge.seconds_left()} 秒内有效，到点自动作废。")
+        self.ui.line(f"  下一步：把下面这句当**普通消息**发进来（一次生成，只此一场）")
+        self.ui.line(f"    【{challenge.phrase}】")
         self.ui.line(f"  来源必须唯一：同一时间只让一个通道在配（当前 {challenge.channel}）")
+        self.ui.line("  也可以从他手机上完成：同一句口令发进私聊即可，回填码在手机上回。")
         return True
 
     async def _sync(self, arg: str) -> bool:

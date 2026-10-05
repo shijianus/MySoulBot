@@ -308,6 +308,52 @@ class MySoulBot:
             self._pool_clients[route.client_id()] = client
         return client
 
+    async def ask_once(self, prompt: str, *, max_tokens: int = 120,
+                       timeout: float = 20.0) -> str:
+        """后台问一句，拿纯文本回来。给配对口令、招呼语这类短产出用。
+
+        刻意不复用对话那条链：那条要挂人格、要切档、要落历史，而这里要的只是
+        「按这个人的口气现编十个字」。失败就返回空串，由调用方决定兜底——
+        配对不能因为一次生成失败就卡死。
+        """
+        # 候选 = 对话线路池 + 抽取器那条线。后者才是这里该用的：cognition / recap /
+        # 记忆抽取这些后台生成都走 extractor_credentials()，它专挑便宜的小模型，
+        # 而对话池里的 glm 对「只给十个字」这种短提示会只思考不落正文。
+        candidates: list[tuple[str, str, str]] = [
+            (route.name, route.model, "") for route in self.routes.routes
+        ]
+        ex_key, ex_base = self._settings.extractor_credentials()
+        if ex_base:
+            candidates.append(("extractor",
+                               self._settings.extractor_model or self._settings.model, ex_base))
+
+        last_error = ""
+        for name, model, base in candidates:
+            try:
+                if base:
+                    client = AsyncOpenAI(api_key=ex_key or "EMPTY", base_url=base,
+                                         timeout=timeout, max_retries=0)
+                else:
+                    route = self.routes.route(name)
+                    if route is None:
+                        continue
+                    client = self.client_for(route)
+                completion = await asyncio.wait_for(
+                    client.chat.completions.create(
+                        model=model,
+                        messages=[{"role": "user", "content": prompt}],
+                        temperature=0.9, max_tokens=max_tokens,
+                    ), timeout=timeout)
+                body = str(completion.choices[0].message.content or "").strip()
+                if body:
+                    return body
+                last_error = f"{name} 回了空"
+            except Exception as exc:  # noqa: BLE001 - 换下一条线，别把配对卡死
+                last_error = f"{name}: {str(exc)[:100]}"
+            continue
+        logger.warning("现生成没成功（%s），交调用方兜底", last_error or "没有可用线路")
+        return ""
+
     def _route_client(self, route: Route) -> AsyncOpenAI:
         """取这条线的客户端；探针（`_client_hook`）接管时也要**按线路**各包一层。
 

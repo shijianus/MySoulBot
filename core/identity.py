@@ -22,6 +22,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import hmac
 import json
@@ -43,14 +44,16 @@ logger: Final = logging.getLogger("mysoulbot.identity")
 
 __all__ = [
     "Tier", "Identity", "Challenge", "OwnerRecord", "PairingError", "PairingDesk",
-    "OWNER_USER_ID", "ACTIVATION_PHRASE", "phrase_matches", "format_code", "consume_pairing",
+    "OWNER_USER_ID", "phrase_matches", "format_code", "consume_pairing",
     "owner_user_ids",
     "normalize_code", "read_owner", "resolve_identity", "unpair",
 ]
 
 # 引擎侧管理者固定用这个 user_id 落盘：不管他从哪个号来，资料夹只有一个
 OWNER_USER_ID: Final[str] = _OWNER_ID
-ACTIVATION_PHRASE: Final[str] = "你好溟汐，我是管理员"
+# 激活语**不再是固定的一句**：原来那句写在仓库里，等于把密码本公开了。
+# 现在每一场配对现生成一句 ≤10 字的短句，只出现在这一次的控制台输出里。
+# 见 core/pair_phrase.py。这里只留一个形状检查用的正则。
 # 易混字符一律不进码：OI01 在 QQ 里抄一次错一次
 _ALPHABET: Final[str] = "".join(c for c in string.ascii_uppercase + string.digits if c not in "OI01")
 _STRIP: Final[re.Pattern[str]] = re.compile(r"[\s\-_·．.,，。!！?？]+")
@@ -90,8 +93,11 @@ def normalize_phrase(text: str) -> str:
     return _STRIP.sub("", (text or "").strip().lower())
 
 
-def phrase_matches(text: str) -> bool:
-    return normalize_phrase(text) == normalize_phrase(ACTIVATION_PHRASE)
+def phrase_matches(text: str, want: str) -> bool:
+    """跟**这一场**的口令比。比的是归一化后的整句相等，不做包含匹配——
+    包含匹配会让一句长闲聊顺嘴把口令带进去。"""
+    body, target = normalize_phrase(text), normalize_phrase(want)
+    return bool(target) and body == target
 
 
 def normalize_code(raw: str) -> str:
@@ -213,11 +219,12 @@ def unpair(settings: Settings) -> OwnerRecord | None:
 
 def consume_pairing(desk: "PairingDesk", text: str, *, source: str,
                     qq: str = "", group: bool = False) -> str | None:
-    """有挑战挂起时，把激活语与回填码从对话里截走。没截走就返回 None。
+    """有挑战挂起时，把口令与回填码从对话里截走。没截走就返回 None。
 
-    两步都走这里：先认激活语（定来源），再认回填码（定身份）。
-    只在挑战开着的时候截——否则她连「你好溟汐，我是管理员」这句玩笑都不能说。
-    群聊来源一律放行给对话：群里喊这句话的人可以有一百个，那不是配对，是热闹。
+    两步都走这里：先认这一场的口令（定来源），再认回填码（定身份）。
+    只在挑战开着的时候截——口令是现生成的短句，平时她说到相近的词也不会被误截，
+    因为比的是**归一化后整句相等**，不是包含。
+    群聊来源一律放行给对话：群里说话的人可以有一百个，那不是配对，是热闹。
     """
     if group:
         return None
@@ -226,18 +233,18 @@ def consume_pairing(desk: "PairingDesk", text: str, *, source: str,
         return None
     body = (text or "").strip()
 
-    if phrase_matches(body):
+    if phrase_matches(body, challenge.phrase):
         challenge = desk.present(source=source, qq=qq) or challenge
         unique, keys = desk.check_unique(challenge)
         if not unique:
             if keys:
-                return (f"✗ 报激活语的来源有 {len(keys)} 个（{'、'.join(keys)}），"
+                return (f"✗ 报口令的来源有 {len(keys)} 个（{'、'.join(keys)}），"
                         f"这场作废。重新发起一次。")
             return "…（没认出来路，重来一次）"
         code = desk.plaintext_code(challenge)
         return (f"✓ 唯一来源确认：{keys[0]}\n"
-                f"  把下面这串码原样回到这里（{desk.ttl} 秒内，过期作废）："
-                f"{format_code(code) if code else '（码已不在内存里，重发一次）'}\n"
+                f"  把下面这串码原样发回来（{challenge.seconds_left()} 秒内，过期作废）："
+                f"{format_code(code) if code else '（口令已失效，重发一次）'}\n"
                 f"  短横可有可无，大小写不限。")
 
     # 回填码：只在唯一来源已确认之后才认，且形状必须像码——
@@ -247,15 +254,27 @@ def consume_pairing(desk: "PairingDesk", text: str, *, source: str,
             record = desk.submit_code(challenge, body, source=source)
         except PairingError as exc:
             return f"✗ {exc}"
-        return f"✓ 配对完成。管理者：{record.qq or record.binding_key()}（{record.paired_at}）"
+        # 招呼语不在这一层生成：安全模块不该依赖大模型调用。
+        # 调用方（CLI / 网桥）拿到成功回执后自己现生成一句发出去。
+        return (f"✓ 配对完成。管理者：{record.qq or record.binding_key()}"
+                f"（{record.paired_at}）")
     return None
 
 
 # ---------------------------------------------------------------- 挑战
 @dataclass
 class Challenge:
+    """一场配对。口令与回填码都以明文落盘，但文件权限锁到 0600。
+
+    为什么把明文写进文件而不是只留在内存：守护进程和 CLI 是**两个进程**，
+    只活在内存里就意味着「CLI 发起、手机上回填」这条路永远走不通——
+    而管理者真正会说话的地方就是他的手机。落盘 + 0600 + 2 分钟过期 +
+    完成即删，换来的是跨进程可完成，代价是可控的。
+    """
+
     id: str = ""
-    phrase: str = ACTIVATION_PHRASE
+    phrase: str = ""
+    code: str = ""
     code_hash: str = ""
     salt: str = ""
     created_at: float = 0.0
@@ -288,8 +307,6 @@ class PairingDesk:
 
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
-        # 明文码只活在内存里这一次：进程重启就得重新发起，不给它留盘
-        self._codes: dict[str, str] = {}
 
     @property
     def directory(self) -> Path:
@@ -300,8 +317,8 @@ class PairingDesk:
         return int(self._settings.pairing_ttl_seconds)
 
     # ------------------------------------------------------------ 发起
-    def start(self, *, channel: str = "cli") -> Challenge:
-        """人在控制台敲下配对命令才走到这里。"""
+    def start(self, *, channel: str = "cli", phrase: str = "") -> Challenge:
+        """人在控制台敲下配对命令才走到这里。`phrase` 是这一场现生成的口令。"""
         current = self.active()
         if current is not None:
             self.void(current.id)
@@ -310,6 +327,8 @@ class PairingDesk:
         now = _now()
         challenge = Challenge(
             id=f"PAIR-{int(now)}-{secrets.token_hex(2)}",
+            phrase=(phrase or "").strip(),
+            code=code,
             code_hash=_hash_code(code, salt),
             salt=salt,
             created_at=now,
@@ -317,7 +336,6 @@ class PairingDesk:
             channel=channel,
         )
         self._save(challenge)
-        self._codes[code] = challenge.id
         logger.info("配对挑战已发起（%s），%d 秒内有效", challenge.id, self._settings.pairing_ttl_seconds)
         return challenge
 
@@ -325,10 +343,7 @@ class PairingDesk:
         """把码念给控制台。唯一来源没确认之前，一个字都不给看。"""
         if challenge.stage != "unique" or not challenge.alive():
             return ""
-        for code, cid in self._codes.items():
-            if cid == challenge.id:
-                return code
-        return ""
+        return challenge.code
 
     # ------------------------------------------------------------ 读写
     def _path(self, challenge_id: str) -> Path:
@@ -337,8 +352,12 @@ class PairingDesk:
 
     def _save(self, challenge: Challenge) -> None:
         self.directory.mkdir(parents=True, exist_ok=True)
-        atomic_write(self._path(challenge.id),
-                     json.dumps(asdict(challenge), ensure_ascii=False, indent=2) + "\n")
+        path = self._path(challenge.id)
+        atomic_write(path, json.dumps(asdict(challenge), ensure_ascii=False, indent=2) + "\n")
+        # 里面躺着这一场的口令与回填码：只许本人读写。
+        # 原子写是先建临时文件再 rename，所以权限要在 rename 之后落到正式路径上。
+        with contextlib.suppress(OSError):
+            path.chmod(0o600)
 
     def _load(self, challenge_id: str) -> Challenge | None:
         path = self._path(challenge_id)
@@ -374,8 +393,10 @@ class PairingDesk:
         if challenge is None:
             return None
         challenge.stage = "void"
-        self._codes = {k: v for k, v in self._codes.items() if v != challenge_id}
-        self._save(challenge)
+        path = self._path(challenge_id)
+        # 作废就整张删掉：留一个已经废了的口令在盘上，只是多一个可撞的东西
+        with contextlib.suppress(OSError):
+            path.unlink()
         return challenge
 
     # ------------------------------------------------------------ 第一步：报激活语
@@ -445,7 +466,7 @@ class PairingDesk:
         record.history.append({"at": record.paired_at, "source": source, "qq": record.qq})
         write_owner(self._settings, record)
         challenge.stage = "verified"
-        self._save(challenge)
-        self._codes = {k: v for k, v in self._codes.items() if v != challenge.id}
+        with contextlib.suppress(OSError):
+            self._path(challenge.id).unlink()   # 用完即删，不在盘上留凭据
         logger.info("管理者配对成功：%s（来源 %s）", record.qq or "本机", source)
         return record
