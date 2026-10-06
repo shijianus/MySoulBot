@@ -427,9 +427,9 @@ class Settings(BaseSettings):
     )
     pair_phrase_route: str = Field(
         default="",
-        description="口令/招呼语点名叫哪条上游线路（填线路名，如 luna）。"
-        "点名就只打那一条、坏了再按池子顺序退；留空则所有线路同时问、谁先落正文用谁。"
-        "配一句十个字该用最快的那条，不该排在主力对话模型后面干等",
+        description="口令/招呼语点名叫哪条上游线路（填线路名，如 gem）。"
+        "点名 = 只问那一条、坏了再按池子顺序退；留空 = 所有线路同时问、谁先落正文用谁。"
+        "推荐留空：点名的那条一旦没额度，这一场就只剩本地现拼的那句",
     )
     owner_qq: str = Field(
         default="",
