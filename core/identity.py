@@ -33,6 +33,7 @@ import re
 import secrets
 import string
 import time
+import unicodedata
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
@@ -46,8 +47,8 @@ logger: Final = logging.getLogger("mysoulbot.identity")
 
 __all__ = [
     "Tier", "Identity", "Challenge", "OwnerRecord", "PairingError", "PairingDesk",
-    "OWNER_USER_ID", "phrase_matches", "format_code", "derive_code", "candidate_key",
-    "consume_pairing",
+    "OWNER_USER_ID", "phrase_matches", "format_code", "extract_code", "derive_code",
+    "candidate_key", "consume_pairing",
     "owner_user_ids",
     "normalize_code", "read_owner", "resolve_identity", "unpair",
 ]
@@ -59,11 +60,20 @@ OWNER_USER_ID: Final[str] = _OWNER_ID
 # 见 core/pair_phrase.py。这里只留一个形状检查用的正则。
 # 易混字符一律不进码：OI01 在 QQ 里抄一次错一次
 _ALPHABET: Final[str] = "".join(c for c in string.ascii_uppercase + string.digits if c not in "OI01")
+# 回填码是**从整句话里挑出来的**，不要求人家把整条消息正好写成码。
+# 手机上真实的回法是：复制整条气泡（带「（119 秒内，过期作废）：」）、中文输入法打出
+# 全角「－」、末尾顺手一个「。」、来一句「码：6WA-K8A」。原来那条整句形状检查
+# 对这些一律不回话——正确的码就这么掉进对话里，她还跟你扯两句，
+# 而日志里连一行都没有。挑不出码才是事故，挑得出就走正常比对。
+_CODE_CHARS: Final[str] = "A-HJ-NP-Z2-9a-hj-np-z2-9"   # 跟 _ALPHABET 同一个字符集（大小写都收）
+_CODE_CACHE: dict[int, re.Pattern[str]] = {}
+# 看着像码、却挑不出码（比如把 2 打成了 O，那不在字母表里）：提醒一句，别默默掉进对话。
+# 只认「五个起头的连续字母数字」或「一段-一段」这两种形状，免得他报个 QQ 号也被当码催
+_CODEISH: Final[re.Pattern[str]] = re.compile(
+    r"(?<![A-Za-z0-9])[A-Za-z0-9]{5,8}(?![A-Za-z0-9])"
+    r"|(?<![A-Za-z0-9])[A-Za-z0-9]{2,4}[-\s][A-Za-z0-9]{2,4}(?![A-Za-z0-9])")
 _STRIP: Final[re.Pattern[str]] = re.compile(r"[\s\-_·．.,，。!！?？]+")
 _CODE_STRIP: Final[re.Pattern[str]] = re.compile(r"[^A-Z0-9]")
-# 回填码的形状：字母数字，中间最多一个短横/空格。不卡形状的话，
-# 她随口回的一句「A1 一下」就会被当成码去试
-_CODE_LIKE: Final[re.Pattern[str]] = re.compile(r"^[A-Za-z0-9]{2,4}[- ]?[A-Za-z0-9]{2,4}$")
 
 # 挑战的三个阶段：等激活语 → 已确认唯一来源（此时才敢把码念出来）→ 终态
 _STAGE_OPEN: Final[frozenset[str]] = frozenset({"waiting", "unique"})
@@ -105,6 +115,34 @@ def phrase_matches(text: str, want: str) -> bool:
 
 def normalize_code(raw: str) -> str:
     return _CODE_STRIP.sub("", (raw or "").strip().upper())
+
+
+def code_pattern(chars: int) -> re.Pattern[str]:
+    """挑码的形状跟着 `format_code` 走：前 3 个一组、其余一组，中间至多一个短横或空格。
+
+    写死 3+3 的话，`PAIRING_CODE_CHARS` 一改（比如 5）显示与识别就对不上：
+    显示成 ABC-DE，而只认 3+3——正确的码照样会被当成一句闲话。
+    """
+    cached = _CODE_CACHE.get(chars)
+    if cached is None:
+        tail = max(1, chars - 3)
+        cached = re.compile(
+            rf"(?<![A-Za-z0-9])([{_CODE_CHARS}]{{3}})[-\s]?"
+            rf"([{_CODE_CHARS}]{{{tail}}})(?![A-Za-z0-9])")
+        _CODE_CACHE[chars] = cached
+    return cached
+
+
+def extract_code(raw: str, chars: int = 6) -> str:
+    """从一句话里挑出那串回填码；挑不出、或挑出**不一样的两串**，一律给空。
+
+    先过一遍 NFKC：全角「－」「ＷＡ」与全角空格都落回 ASCII，中文输入法那一套
+    怪形状不用我这边特判。给空不等于这一句不重要——是让它回到正常对话里去，
+    而不是我猜一个当码用。
+    """
+    body = unicodedata.normalize("NFKC", raw or "")
+    found = {normalize_code(f"{a}{b}") for a, b in code_pattern(chars).findall(body)}
+    return found.pop() if len(found) == 1 else ""
 
 
 def format_code(raw: str) -> str:
@@ -249,6 +287,7 @@ def consume_pairing(desk: "PairingDesk", text: str, *, source: str,
     if challenge is None:
         return None
     body = (text or "").strip()
+    key = candidate_key(source, qq)
 
     if phrase_matches(body, challenge.phrase):
         challenge = desk.present(source=source, qq=qq) or challenge
@@ -264,17 +303,25 @@ def consume_pairing(desk: "PairingDesk", text: str, *, source: str,
                 f"{format_code(code) if code else '（口令已失效，重发一次）'}\n"
                 f"  短横可有可无，大小写不限。")
 
-    # 回填码：只在唯一来源已确认之后才认，且形状必须像码——
-    # 不然她随便回一句「ABC-123」也可能把谁的话误当成码
-    if challenge.stage == "unique" and _CODE_LIKE.fullmatch(body):
-        try:
-            record = desk.submit_code(challenge, body, source=source, qq=qq)
-        except PairingError as exc:
-            return f"✗ {exc}"
-        # 招呼语不在这一层生成：安全模块不该依赖大模型调用。
-        # 调用方（CLI / 网桥）拿到成功回执后自己现生成一句发出去。
-        return (f"✓ 配对完成。管理者：{record.qq or record.binding_key()}"
-                f"（{record.paired_at}）")
+    # 回填码：只在唯一来源已确认之后才认。码是从整句话里挑的（见 extract_code），
+    # 所以「码：XXX-YYY。」「整条气泡粘回来」这些真实回法都还能完成配对
+    if challenge.stage == "unique":
+        attempt = extract_code(body, desk.code_chars)
+        if attempt:
+            try:
+                record = desk.submit_code(challenge, attempt, source=source, qq=qq)
+            except PairingError as exc:
+                return f"✗ {exc}"
+            # 招呼语不在这一层生成：安全模块不该依赖大模型调用。
+            # 调用方（CLI / 网桥）拿到成功回执后自己现生成一句发出去。
+            return (f"✓ 配对完成。管理者：{record.qq or record.binding_key()}"
+                    f"（{record.paired_at}）")
+        if key == challenge.source_key and _CODEISH.search(unicodedata.normalize("NFKC", body)):
+            # 他大概率是在回填，只是那串里没有我能认的字符（O/I/0/1 不进字母表）。
+            # 沉默地把它交给对话，就是他说的「回正确的码也验证失败」
+            return ("…这串我没当成码。码里不会出现 O、I、0、1 这四个字符，"
+                    f"把控制台那 {desk.code_chars} 个字符原样发来就行。")
+    logger.info("配对进行中（%s），这一句没截走：%r", key, body[:60])
     return None
 
 
@@ -333,6 +380,10 @@ class PairingDesk:
     @property
     def ttl(self) -> int:
         return int(self._settings.pairing_ttl_seconds)
+
+    @property
+    def code_chars(self) -> int:
+        return int(self._settings.pairing_code_chars)
 
     # ------------------------------------------------------------ 发起
     def start(self, *, channel: str = "cli", phrase: str = "") -> Challenge:

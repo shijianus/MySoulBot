@@ -419,6 +419,18 @@ class Settings(BaseSettings):
         description="配对挑战的有效期。到点自动作废，必须重新发起——不留长期有效的门",
     )
     pairing_code_chars: int = Field(default=6, ge=4, le=10, description="一次性数字字母密码长度（分组显示）")
+    pair_phrase_deadline_seconds: float = Field(
+        default=5.0, ge=0.0, le=30.0,
+        description="口令/招呼语这一类后台短产出的**整段预算**。到点还没拿到就本地现拼或随机取一句："
+        "免费小模型常先思考 40 秒不落正文，而发起配对的人就站在控制台前等。"
+        "0 表示完全不问模型，直接本地现拼",
+    )
+    pair_phrase_route: str = Field(
+        default="",
+        description="口令/招呼语点名叫哪条上游线路（填线路名，如 luna）。"
+        "点名就只打那一条、坏了再按池子顺序退；留空则所有线路同时问、谁先落正文用谁。"
+        "配一句十个字该用最快的那条，不该排在主力对话模型后面干等",
+    )
     owner_qq: str = Field(
         default="",
         description="管理者的 QQ 号。QQ 那侧进来的话会被折成 qq_private_<号>，"

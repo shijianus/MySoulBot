@@ -61,7 +61,9 @@ MODE: dict[str, Any] = {"pieces": list(REPLY_PIECES), "once": [], "echo": "",
               "reject_vision": False, "slow": 0.0, "lead": 0.0, "lead_once": 0.0,
               "think": 0, "blank_first": False, "lag_first": 0.0, "open_lag": 0.0,
               # 按模型名使坏的三档：验多线路选路与回退用（同一个假端口，两条线）
-              "bad_models": (), "think_models": {}, "cut_models": {}, "echo_map": {}}
+              "bad_models": (), "think_models": {}, "cut_models": {}, "echo_map": {},
+              # 非流式那一趟按模型名磨：验后台短产出（口令、招呼）谁先落正文用谁
+              "json_lag_models": {}}
 ORIGIN = "http://127.0.0.1:1"
 
 
@@ -137,6 +139,9 @@ class FakeOpenAI(BaseHTTPRequestHandler):
         else:
             pieces = [MODE["echo"]] if MODE["echo"] else list(MODE["pieces"])
         if not payload.get("stream"):
+            lag = MODE["json_lag_models"].get(model, 0.0)
+            if lag:
+                time.sleep(lag)
             self._json(
                 {
                     "id": "chatcmpl-fake",
@@ -574,6 +579,7 @@ def reset_model() -> None:
     MODE["think_models"] = {}
     MODE["cut_models"] = {}
     MODE["echo_map"] = {}
+    MODE["json_lag_models"] = {}
 
 
 # ---------------------------------------------------------------- 1. 纯函数层
@@ -3148,12 +3154,13 @@ async def pairing_checks(check: Checker) -> None:
                  not list(rig.settings.pairing_dir.glob("PAIR-*.json")),
                  [f.name for f in rig.settings.pairing_dir.glob("PAIR-*.json")])
 
-        # 管理者自己回填：码对了才成，成完之后先招呼一句
+        # 管理者自己回填：码对了才成，成完之后先招呼一句。
+        # 这里故意用**手机上最容易打出来的那一版**：全角短横（中文输入法默认给的就是它）
         challenge = desk.start(channel="cli", phrase=phrase)
         mine = derive_code(challenge.salt, challenge_id=challenge.id,
                            key=candidate_key("qq_private", str(admin)), chars=6)
-        first, done = await asyncio.to_thread(                      # 空格与大小写都不算输错
-            _exchange, [(phrase, admin, 9005), (f"{mine[:3]} {mine[3:]}".lower(), admin, 9006)])
+        _, done = await asyncio.to_thread(
+            _exchange, [(phrase, admin, 9005), (format_code(mine).replace("-", "－"), admin, 9006)])
         lines = texts(done)
         check.ok("管理者回填自己那份码，配对完成",
                  any("配对完成" in line for line in lines), lines)

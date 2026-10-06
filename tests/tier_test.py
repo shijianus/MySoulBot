@@ -273,6 +273,114 @@ def pairing_checks(check: Checker) -> None:
     wrong = ID.consume_pairing(d_c, "ZZZ-ZZZ", source="cli")
     check.ok("码不对即整场作废", wrong and "码不对" in wrong, wrong)
 
+    # 手机上真实的回法：整条气泡粘回来、中文输入法的全角「－」、末尾一个「。」、
+    # 「码：」起头——这些原来都过不了整句形状检查，正确的码就这么默默掉进对话里
+    def _opens(key_qq: str) -> tuple[ID.PairingDesk, Any, str]:
+        s = tier_settings(owner_enabled=True)
+        d = ID.PairingDesk(s)
+        made = d.start(channel="cli", phrase="半糖的锚还没凉")
+        ID.consume_pairing(d, "半糖的锚还没凉", source="qq_private", qq=key_qq)
+        return d, made, d.plaintext_code(d.active())
+
+    for label, form in (("整条气泡粘回来", "把下面这串码原样发回来（119 秒内，过期作废）：{c}\n短横可有可无。"),
+                        ("全角短横", "{c}".replace("-", "－")),
+                        ("末尾带句号", "{c}。"),
+                        ("「码：」起头", "码：{c}"),
+                        ("全角字母数字", "{c}".translate(str.maketrans("0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ",
+                                                                       "０１２３４５６７８９ＡＢＣＤＥＦＧＨＩＪＫＬＭＮＯＰＱＲＳＴＵＶＷＸＹＺ"))),
+                        ("整句就一个感叹号", "{c}！")):
+        d_r, _, code = _opens("1937490685")
+        body = form.format(c=ID.format_code(code))
+        verdict = ID.consume_pairing(d_r, body, source="qq_private", qq="1937490685")
+        check.ok(f"回填码认得出这一种回法：{label}",
+                 verdict is not None and "配对完成" in verdict, f"{body!r} -> {verdict}")
+
+    # 看着像码、可里面一个字符都不在字母表里（把 2 打成了 O）：得说一句话，
+    # 而不是沉默地把正确的东西交给对话——那是「回正确的码也验证失败」的另一半
+    d_w, _, _ = _opens("1937490685")
+    nag = ID.consume_pairing(d_w, "6WO-K8O", source="qq_private", qq="1937490685")
+    check.ok("认不出的码形状会提醒一句（不默默掉进对话）",
+             nag is not None and "没当成码" in nag, nag)
+    check.ok("提醒不作废这一场（他还有一次机会）", d_w.active() is not None, "")
+    other_person = ID.consume_pairing(d_w, "6WO-K8O", source="qq_private", qq="30003")
+    check.ok("旁人打趣一样的字符串不去催他（只管不管）", other_person is None, other_person)
+
+    # 码长是配置的：显示与识别必须跟着同一个形状走
+    for chars in (4, 5, 7, 10):
+        s_n = tier_settings(owner_enabled=True, pairing_code_chars=chars)
+        d_n = ID.PairingDesk(s_n)
+        made_n = d_n.start(channel="cli", phrase="锚还没归位")
+        ID.consume_pairing(d_n, "锚还没归位", source="cli")
+        code_n = d_n.plaintext_code(d_n.active())
+        shown = ID.format_code(code_n)
+        verdict = ID.consume_pairing(d_n, f"码：{shown}。", source="cli")
+        check.ok(f"码长 {chars} 时显示成 {shown!r} 也认得回来",
+                 len(code_n) == chars and verdict is not None and "配对完成" in verdict, verdict)
+
+    # 本地现拼的口令：每个选择都得是 secrets，且真的够散
+    seen_phrase = {PP.local_phrase() for _ in range(400)}
+    check.ok("本地现拼 400 句，散得开（不是十几句模板在转圈）",
+             len(seen_phrase) >= 300, len(seen_phrase))
+    check.ok("本地现拼出来的都在 10 字以内", all(len(p) <= 10 for p in seen_phrase),
+             max(seen_phrase, key=len))
+    check.ok("本地现拼也不含「管理员/验证/口令」这类通用词",
+             all(PP.phrase_ok(p) for p in seen_phrase), "")
+    spaces = 1
+    for pool in (PP._A, PP._B, PP._C, PP._D):
+        spaces *= len(pool)
+    check.ok("兜底语料的组合空间够撞不动（≥2^16）", spaces >= 65536, f"{spaces} 种")
+
+
+# ---------------------------------------------------------------- 2b. 口令的时间预算
+async def phrase_budget_checks(check: Checker) -> None:
+    """现生成一句口令最多等多久——这是「太久」那声抱怨的正面回答。"""
+    async def slow(prompt: str) -> str:
+        await asyncio.sleep(3.0)
+        return "热米饭不翻身"
+
+    async def broken(prompt: str) -> str:
+        raise RuntimeError("线路全死了")
+
+    t0 = time.monotonic()
+    got = await PP.make_phrase(slow, deadline=0.4)
+    took = time.monotonic() - t0
+    check.ok("模型磨到 3 秒，预算 0.4 秒就该撒手", took < 1.0, f"{took:.2f}s")
+    check.ok("撒手之后也有一句能用的口令", PP.phrase_ok(got) and got != "热米饭不翻身", got)
+
+    t0 = time.monotonic()
+    got2 = await PP.make_phrase(broken, deadline=0.4)
+    check.ok("线路全炸也不卡配对（立刻有一句兜底）",
+             time.monotonic() - t0 < 0.5 and PP.phrase_ok(got2), got2)
+
+    t0 = time.monotonic()
+    got3 = await PP.make_phrase(None, deadline=5.0)
+    check.ok("压根没模型时是立刻给，不是等满预算",
+             time.monotonic() - t0 < 0.2 and PP.phrase_ok(got3), got3)
+
+    t0 = time.monotonic()
+    got4 = await PP.make_phrase(slow, deadline=0.0)
+    check.ok("预算设 0 = 完全不问模型（本地现拼）",
+             time.monotonic() - t0 < 0.2 and PP.phrase_ok(got4), got4)
+
+    async def fast(prompt: str) -> str:
+        return "会发光的浮标归位了"
+    check.ok("模型在预算里答上了就用模型的（本地现拼不是默认）",
+             await PP.make_phrase(fast, deadline=5.0) == "会发光的浮标归位了", "")
+
+def phrase_wiring_checks(check: Checker) -> None:
+    """`short_ask` 那层接线：口令这一句该用哪种问法。"""
+    plain = PP.short_ask(lambda **kw: kw, tier_settings(owner_enabled=True))
+    check.ok("没点线路名就所有线路同时问（谁先落正文用谁）",
+             plain.keywords.get("race") is True and plain.keywords.get("max_tokens") == 48,
+             dict(plain.keywords))
+    named = PP.short_ask(lambda **kw: kw,
+                         tier_settings(owner_enabled=True, pair_phrase_route="luna"))
+    check.ok("点了线路名就只打那条、按顺序退（不铺开打一枪）",
+             named.keywords.get("prefer") == "luna" and named.keywords.get("race") is False,
+             dict(named.keywords))
+    check.ok("预算从配置里取，不是写死的", named.keywords.get("timeout") == 5.0,
+             named.keywords.get("timeout"))
+
     # 一次只许有一场：旧挑战 shadow 新的是真实事故（对着不作数的口令白喊 120 秒）
     s_d = tier_settings(owner_enabled=True)
     d_d = ID.PairingDesk(s_d)
@@ -542,6 +650,8 @@ async def main() -> int:
         tree_checks(check)
         owner_qq_checks(check)
         pairing_checks(check)
+        await phrase_budget_checks(check)
+        phrase_wiring_checks(check)
         account_gate_checks(check)
         await account_behavior_checks(check)
         judgment_checks(check)

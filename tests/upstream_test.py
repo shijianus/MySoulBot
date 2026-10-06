@@ -322,11 +322,65 @@ async def hedge_checks(check: Checker) -> None:
         server.shutdown()
 
 
+async def ask_once_checks(check: Checker) -> None:
+    """后台短产出（配对口令、招呼语）那条路：慢线路不能把预算吃光。
+
+    A 条磨 3 秒、B 条立刻答——串行时先等的那 3 秒是白等；同时赛跑就该 1 秒内拿到
+    B 的话。口令那一句还额外有条硬预算：到点没结果就本地现拼。
+    """
+    server, origin = T.serve_fake()
+    T.ORIGIN = origin
+    rig = _BotRig(origin)
+    try:
+        rig.reload_lines()
+        # 串行（默认，对话那一路的老行为不许变）：先问 A，A 磨 3 秒就真等 3 秒
+        T.reset_model()
+        T.MODE["json_lag_models"] = {"line-a": 3.0}
+        T.MODE["echo_map"] = {"line-a": "慢那条的话", "line-b": "快那条的话"}
+        t0 = time.monotonic()
+        serial = await rig.bot.ask_once("给一个词", timeout=8.0)
+        spent = time.monotonic() - t0
+        check.ok("串行时按池子顺序问（默认行为没变）", serial == "慢那条的话", serial)
+        check.ok("串行就要白等慢那条的 3 秒", spent >= 2.5, f"{spent:.2f}s")
+
+        # 赛跑：两条同时问，谁先落正文用谁
+        T.reset_model()
+        T.MODE["json_lag_models"] = {"line-a": 3.0}
+        T.MODE["echo_map"] = {"line-a": "慢那条的话", "line-b": "快那条的话"}
+        t0 = time.monotonic()
+        raced = await rig.bot.ask_once("给一个词", timeout=8.0, race=True)
+        spent = time.monotonic() - t0
+        check.ok("同时赛跑：先见字的那条算赢", raced == "快那条的话", raced)
+        check.ok("不等慢的那条（省下两秒以上）", spent < 1.5, f"{spent:.2f}s")
+
+        # prefer：指定线路排到最前（口令该用最快那条，不是主力对话模型）
+        T.reset_model()
+        T.MODE["echo_map"] = {"line-a": "A 的话", "line-b": "B 的话"}
+        check.ok("prefer 把指定线路挪到最前",
+                 await rig.bot.ask_once("给一个词", prefer="B", race=False) == "B 的话", "")
+
+        # 全炸：老实回空串，由调用方兜底——配对不能因为一次生成失败就卡死。
+        # 后台那条抽取用的线路也在候选里，要坏就连它一起坏，不然它算「答上了」
+        T.reset_model()
+        T.MODE["bad_models"] = tuple(sorted({
+            "line-a", "line-b",
+            str(rig.settings.extractor_model or ""), str(rig.settings.model or "")}))
+        t0 = time.monotonic()
+        check.ok("线路全坏时立刻给空串（不抛、也不耗预算）",
+                 await rig.bot.ask_once("给一个词", timeout=2.0, race=True) == ""
+                 and time.monotonic() - t0 < 2.5, "")
+        T.reset_model()
+    finally:
+        await rig.aclose()
+        server.shutdown()
+
+
 async def main() -> int:
     check = Checker()
     pool_checks(check)
     await failover_checks(check)
     await hedge_checks(check)
+    await ask_once_checks(check)
     print(f"\n共 {check.count} 项断言，失败 {len(check.failures)} 项")
     for name in check.failures:
         print(f"  ✗ {name}")

@@ -308,17 +308,10 @@ class MySoulBot:
             self._pool_clients[route.client_id()] = client
         return client
 
-    async def ask_once(self, prompt: str, *, max_tokens: int = 120,
-                       timeout: float = 20.0) -> str:
-        """后台问一句，拿纯文本回来。给配对口令、招呼语这类短产出用。
-
-        刻意不复用对话那条链：那条要挂人格、要切档、要落历史，而这里要的只是
-        「按这个人的口气现编十个字」。失败就返回空串，由调用方决定兜底——
-        配对不能因为一次生成失败就卡死。
-        """
-        # 候选 = 对话线路池 + 抽取器那条线。后者才是这里该用的：cognition / recap /
-        # 记忆抽取这些后台生成都走 extractor_credentials()，它专挑便宜的小模型，
-        # 而对话池里的 glm 对「只给十个字」这种短提示会只思考不落正文。
+    def _ask_candidates(self) -> list[tuple[str, str, str]]:
+        """后台短产出能走的线路：对话线路池 + 抽取器那条线。后者往往才是这里该用的：
+        cognition / recap / 记忆抽取都走 extractor_credentials()，它专挑便宜的小模型，
+        而对话池里的 glm 对「只给十个字」这种短提示会只思考不落正文。"""
         candidates: list[tuple[str, str, str]] = [
             (route.name, route.model, "") for route in self.routes.routes
         ]
@@ -326,31 +319,82 @@ class MySoulBot:
         if ex_base:
             candidates.append(("extractor",
                                self._settings.extractor_model or self._settings.model, ex_base))
+        return candidates
 
+    async def _ask_route(self, name: str, model: str, base: str, prompt: str, *,
+                         max_tokens: int, timeout: float) -> str:
+        """问一条线路。失败与空答都返回空串——调用方管换下一条，这里不抛。"""
+        try:
+            if base:
+                ex_key, _ = self._settings.extractor_credentials()
+                client = AsyncOpenAI(api_key=ex_key or "EMPTY", base_url=base,
+                                     timeout=timeout, max_retries=0)
+            else:
+                route = self.routes.route(name)
+                if route is None:
+                    return ""
+                client = self._route_client(route)
+            completion = await asyncio.wait_for(
+                client.chat.completions.create(
+                    model=model,
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=0.9, max_tokens=max_tokens,
+                ), timeout=timeout)
+            return str(completion.choices[0].message.content or "").strip()
+        except Exception as exc:  # noqa: BLE001 - 换下一条线，别把配对卡死
+            logger.debug("线路 %s 没成：%s", name, str(exc)[:120])
+            return ""
+
+    async def ask_once(self, prompt: str, *, max_tokens: int = 120,
+                       timeout: float = 20.0, prefer: str = "",
+                       race: bool = False) -> str:
+        """后台问一句，拿纯文本回来。给配对口令、招呼语这类短产出用。
+
+        刻意不复用对话那条链：那条要挂人格、要切档、要落历史，而这里要的只是
+        「按这个人的口气现编十个字」。失败就返回空串，由调用方决定兜底——
+        配对不能因为一次生成失败就卡死。
+
+        `prefer` 把某条线路排到最前（口令该用最快的那条，不是主力对话模型）。
+        `race` 是所有线路同时问、谁先落正文用谁——串行时第一条慢线路会把整个预算吃光，
+        后面那条本来 1 秒能答的永远轮不到。
+        """
+        candidates = self._ask_candidates()
+        if prefer:
+            candidates.sort(key=lambda item: 0 if item[0] == prefer else 1)
         last_error = ""
-        for name, model, base in candidates:
-            try:
-                if base:
-                    client = AsyncOpenAI(api_key=ex_key or "EMPTY", base_url=base,
-                                         timeout=timeout, max_retries=0)
-                else:
-                    route = self.routes.route(name)
-                    if route is None:
-                        continue
-                    client = self.client_for(route)
-                completion = await asyncio.wait_for(
-                    client.chat.completions.create(
-                        model=model,
-                        messages=[{"role": "user", "content": prompt}],
-                        temperature=0.9, max_tokens=max_tokens,
-                    ), timeout=timeout)
-                body = str(completion.choices[0].message.content or "").strip()
+        if race:
+            # 每条线各自问，谁先落正文用谁。带名字回，才知道该把账记在谁头上
+            async def tagged(name: str, model: str, base: str) -> tuple[str, str]:
+                body = await self._ask_route(name, model, base, prompt,
+                                             max_tokens=max_tokens, timeout=timeout)
+                return name, body
+
+            tasks = [asyncio.ensure_future(tagged(name, model, base))
+                     for name, model, base in candidates]
+            for future in asyncio.as_completed(tasks):
+                try:
+                    name, body = await future
+                except Exception as exc:  # noqa: BLE001 - 单条线炸了不算炸
+                    last_error = str(exc)[:80]
+                    continue
                 if body:
+                    for task in tasks:
+                        if not task.done():
+                            task.cancel()
                     return body
-                last_error = f"{name} 回了空"
-            except Exception as exc:  # noqa: BLE001 - 换下一条线，别把配对卡死
-                last_error = f"{name}: {str(exc)[:100]}"
-            continue
+                last_error = f"{name} 没落正文"
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            logger.warning("现生成没成功（%s），交调用方兜底", last_error or "线路都回了空")
+            return ""
+
+        for name, model, base in candidates:
+            body = await self._ask_route(name, model, base, prompt,
+                                         max_tokens=max_tokens, timeout=timeout)
+            if body:
+                return body
+            last_error = f"{name} 没落正文"
         logger.warning("现生成没成功（%s），交调用方兜底", last_error or "没有可用线路")
         return ""
 

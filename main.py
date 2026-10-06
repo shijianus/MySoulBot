@@ -36,6 +36,7 @@ import re
 import shlex
 import subprocess
 import sys
+import time
 from collections.abc import AsyncGenerator, Sequence
 from pathlib import Path
 from typing import Final
@@ -51,7 +52,7 @@ from core.bot import BotError, MySoulBot
 from core.card_loader import CardError, PersonaLibrary, PresetError
 from core.clawd_soul import ClawdSoul
 from core.identity import PairingDesk, consume_pairing, format_code, read_owner, unpair
-from core.pair_phrase import make_greeting, make_phrase
+from core.pair_phrase import make_greeting, make_phrase, short_ask
 from core.memory_extractor import MemoryExtractor
 from core.prompt_builder import PromptBuilder
 from core.storage_manager import (
@@ -287,7 +288,9 @@ class App:
                     if "配对完成" in note:
                         # 认出来之后她得主动打招呼——这是「我认出你了」的实测证据，
                         # 不是日志里一行 paired_at
-                        self.ui.line("  " + await make_greeting(self.bot.ask_once))
+                        self.ui.line("  " + await make_greeting(
+                            short_ask(self.bot.ask_once, self._settings),
+                            deadline=self._settings.pair_phrase_deadline_seconds))
                     continue
                 await self.turn(line)
 
@@ -464,15 +467,21 @@ class App:
         if read_owner(settings) is not None:
             self.ui.warn("已经绑过管理者了。一个机器人只有一个——要换先 /unpair")
             return True
-        # 口令每场现生成：写死一句就等于把密码本印在仓库里，谁读了都能喊
-        phrase = await make_phrase(self.bot.ask_once)
+        # 口令每场现生成，且**有硬预算**：人站在控制台前等，一条 40 秒不落正文的
+        # 免费线路不该把配对卡在那儿——到点就本地现拼一句真随机的
+        t0 = time.monotonic()
+        phrase = await make_phrase(short_ask(self.bot.ask_once, settings),
+                                   deadline=settings.pair_phrase_deadline_seconds)
+        spent = time.monotonic() - t0
         challenge = self.pairing.start(channel="cli", phrase=phrase)
-        self.ui.line(f"配对已开始，{challenge.seconds_left()} 秒内有效，到点自动作废。")
+        self.ui.line(f"配对已开始，{challenge.seconds_left()} 秒内有效，到点自动作废。"
+                     f"（口令现拼用了 {spent:.1f} 秒）")
         self.ui.line(f"  下一步：把下面这句当**普通消息**发进来（一次生成，只此一场）")
         self.ui.line(f"    【{challenge.phrase}】")
         self.ui.line(f"  来源必须唯一：同一时间只让一个通道在配（当前 {challenge.channel}）")
         self.ui.line("  也可以从他手机上完成：同一句口令发进私聊即可，回填码会直接回到那个号。")
         self.ui.line("  回填码是**按报口令的那个号算出来的**：换个号来填，填不进这一场。")
+        self.ui.line("  码那串怎么发都行：整条气泡粘回来、全角短横、末尾带个句号，我都挑得出来。")
         return True
 
     async def _sync(self, arg: str) -> bool:
