@@ -39,6 +39,10 @@ class Route:
     priority: int = 100
     vision_model: str = ""   # 带图的回合交给这条线时用哪个模型；空 = 就用 model
     timeout: float = 0.0     # 0 = 跟全局 REQUEST_TIMEOUT
+    # 原样转给上游请求体的附加字段。有些网关的「别思考，直接落正文」开关就靠它：
+    # 强制思考的免费模型会把整个额度花在思考上、一个字正文都不落，
+    # 不带上这个开关，那条线在短产出上等于不能用。
+    extra_body: dict[str, Any] = field(default_factory=dict)
 
     def client_id(self) -> str:
         return f"{self.base_url}|{self.api_key}"
@@ -203,10 +207,21 @@ def parse_routes(raw: str, settings: Any) -> list[Route]:  # noqa: ANN401
             priority=int(item.get("priority") or 100),
             vision_model=str(item.get("vision_model") or ""),
             timeout=float(item.get("timeout") or 0.0),
+            extra_body=_extra_body(name, item.get("extra_body")),
         ))
     if not rows:
         raise ValueError("ROUTES 解出来是空的：要么别配，要么至少给一条线")
     return rows
+
+
+def _extra_body(name: str, raw: Any) -> dict[str, Any]:  # noqa: ANN401 - 配置里是任意 JSON 节点
+    """`extra_body` 只收对象。写错一个中括号就报错——不然那条线会安静地不再带开关，
+    然后又是「想了半天一个字不落」那种查不出来的坏法。"""
+    if raw in (None, "", {}, []):
+        return {}
+    if not isinstance(raw, dict):
+        raise ValueError(f"ROUTES {name} 的 extra_body 不是对象：{type(raw).__name__}")
+    return {str(key): value for key, value in raw.items()}
 
 
 def _resolve_key(raw: str, settings: Any) -> str:  # noqa: ANN401

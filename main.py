@@ -52,7 +52,7 @@ from core.bot import BotError, MySoulBot
 from core.card_loader import CardError, PersonaLibrary, PresetError
 from core.clawd_soul import ClawdSoul
 from core.identity import PairingDesk, consume_pairing, format_code, read_owner, unpair
-from core.pair_phrase import make_greeting, make_phrase, short_ask
+from core.pair_phrase import make_greeting, make_phrase, short_ask, the_box
 from core.memory_extractor import MemoryExtractor
 from core.prompt_builder import PromptBuilder
 from core.storage_manager import (
@@ -290,7 +290,8 @@ class App:
                         # 不是日志里一行 paired_at
                         self.ui.line("  " + await make_greeting(
                             short_ask(self.bot.ask_once, self._settings),
-                            deadline=self._settings.pair_phrase_deadline_seconds))
+                            deadline=self._settings.pair_phrase_deadline_seconds,
+                            settings=self._settings))
                     continue
                 await self.turn(line)
 
@@ -384,7 +385,7 @@ class App:
             return await self._mode(rest)
         if name == "sync":
             return await self._sync(rest)
-        if name in {"pair", "unpair", "whoami-owner"}:
+        if name in {"pair", "unpair", "whoami-owner", "pairbox"}:
             return await self._pairing(name, rest)
         if name in MOVED:
             self.ui.line(f"  这个现在在 {MOVED[name]} 里", style="dim")
@@ -401,6 +402,7 @@ class App:
             ("/sync check", "同步前自查：体积闸门、忽略规则、凭据扫描"),
             ("/pair", "发起管理者配对（2 分钟有效）：一个机器人只能有一个管理者"),
             ("/unpair", "解绑管理者。改的是谁能管这台机器，想清楚再敲"),
+            ("/pairbox", "看配对用的话术本（密文）里各有几句；/pairbox 换钥匙 重抄一本"),
             ("/quit", "退出"),
         ]
         if self._settings.group_mode:
@@ -437,6 +439,19 @@ class App:
     async def _pairing(self, command: str, rest: str) -> bool:
         """管理者配对：发起、看进度、解绑。"""
         settings = self._settings
+        if command == "pairbox":
+            box = the_box(settings)
+            counts = {slot: len(box.pool(slot)) for slot in
+                      ("slot_a", "slot_b", "slot_c", "slot_d", "templates",
+                       "code_line", "done_line", "greet_line", "nudge_line")}
+            self.ui.line(f"话术本（密文）：{settings.pairing_box_path}")
+            self.ui.line(f"  里面：{counts}；钥匙：{settings.pairing_key_path}"
+                         f"（{settings.pairing_key_path.stat().st_size if settings.pairing_key_path.is_file() else 0} 字节）")
+            self.ui.line("  这一本是配对用的口令拼法与应答句，模型读不到它——AI 全断了配对也走得完。")
+            if rest.strip().lower() in {"rotate", "换钥匙", "重抄"}:
+                box.rotate()
+                self.ui.warn("已换一把主密钥重抄一遍；旧钥匙读不到这一本了。")
+            return True
         if command == "unpair":
             record = read_owner(settings)
             if record is None:
@@ -471,7 +486,8 @@ class App:
         # 免费线路不该把配对卡在那儿——到点就本地现拼一句真随机的
         t0 = time.monotonic()
         phrase = await make_phrase(short_ask(self.bot.ask_once, settings),
-                                   deadline=settings.pair_phrase_deadline_seconds)
+                                   deadline=settings.pair_phrase_deadline_seconds,
+                                   settings=settings)
         spent = time.monotonic() - t0
         challenge = self.pairing.start(channel="cli", phrase=phrase)
         self.ui.line(f"配对已开始，{challenge.seconds_left()} 秒内有效，到点自动作废。"

@@ -30,10 +30,13 @@ import re
 import secrets
 from typing import Any, Final
 
+from core.pair_box import SEED, PairBox, box_for
+
 logger: Final = logging.getLogger("mysoulbot.pairphrase")
 
 __all__ = ["MAX_PHRASE_CHARS", "make_phrase", "make_greeting", "phrase_ok",
-           "local_phrase", "short_ask"]
+           "local_phrase", "short_ask", "code_line", "done_line", "greet_line",
+           "nudge_line", "the_box"]
 
 # 目标 10 字，硬上限 15 字。超过 15 的一律当模型没听懂，走兜底。
 TARGET_PHRASE_CHARS: Final[int] = 10
@@ -77,7 +80,8 @@ def short_ask(ask: Any, settings: Any) -> Any:  # noqa: ANN401 - 引擎的 ask_o
                              prefer=route, race=not route)
 
 
-async def make_phrase(ask: Any = None, *, deadline: float = 5.0) -> str:  # noqa: ANN401 - async (str) -> str
+async def make_phrase(ask: Any = None, *, deadline: float = 5.0,
+                      settings: Any = None) -> str:  # noqa: ANN401 - async (str) -> str
     """要一句配对口令。`ask` 是可用的问模型函数；到点没拿到合规格的就本地现拼。
 
     `deadline` 是**整段预算**（含重试），不是每次尝试各给一份：
@@ -106,7 +110,7 @@ async def make_phrase(ask: Any = None, *, deadline: float = 5.0) -> str:  # noqa
                 return body
             if body:
                 logger.warning("现生成的口令不合规格（%d 字），再要一次", len(body))
-    return local_phrase()
+    return local_phrase(settings)
 
 _GREET_PROMPT: Final[str] = (
     "配对成功了——站在控制台前的这个人确认是你主人。主动跟他打个招呼。\n"
@@ -115,26 +119,85 @@ _GREET_PROMPT: Final[str] = (
     "按你自己的脾气说。\n"
 )
 
-# 兜底语料：槽位之间随机拼。刻意不含任何「管理员/验证/口令」字样，
-# 也不与旧那句固定话术重叠。四个槽的取值数相乘（再乘上模板数）≈ 2^17，
-# 手打的人不可能在 120 秒里试完——这才是这句要挡住的东西。
-_A: Final[tuple[str, ...]] = ("热的", "半糖的", "昨天的", "第三趟", "没睡醒的", "倒着游",
-                              "不打烊", "会发光", "没写完的", "赖床的", "逆流的", "迟到的",
-                              "结霜的", "走调的", "空转的", "没校准的", "靠岸的", "没人要的",
-                              "忘在桌上的", "记不清的")
-_B: Final[tuple[str, ...]] = ("鲸鱼", "水族箱", "米饭", "尾鳍", "潮汐", "夜航船", "珊瑚",
-                              "潜水钟", "海带", "声呐", "浮标", "深海灯", "灯塔", "末班车",
-                              "车站", "雨伞", "炉子", "粥", "月亮", "锚", "缆绳", "贝壳",
-                              "海图", "锅")
-_C: Final[tuple[str, ...]] = ("不翻身", "在等雨", "先熄灯", "记得喂", "别吵它", "归位了",
-                              "刚靠岸", "不上岸", "数到七", "留了灯", "不认路", "朝北游",
-                              "还没凉", "该关了", "早收了", "没上锁", "在漏水", "换了位",
-                              "认了人", "等潮来", "记错了", "靠得住", "没人管", "熄了一半")
-_D: Final[tuple[str, ...]] = ("吧", "呢", "来着", "不成", "是吧", "呀", "嘛", "记得", "快",
-                              "该管管", "还在", "没走")
-_TEMPLATES: Final[tuple[tuple[str, ...], ...]] = (
-    ("A", "B", "C"), ("B", "C"), ("B", "C", "D"), ("A", "B", "C", "D"), ("A", "B"))
-_SLOTS: Final[dict[str, tuple[str, ...]]] = {"A": _A, "B": _B, "C": _C, "D": _D}
+# 语料不写在源码里：它存在那盘密文里（core/pair_box）。下面这几个元组只是
+# **第一盘**的种子内容——盘一旦建好，真正用的是盘上那份密文，往里补的句子
+# 源码里查不到，模型也读不到。为什么这么办：口令与应答是「只有你我俩知道」的东西。
+_A: Final[tuple[str, ...]] = tuple(SEED["slot_a"])
+_B: Final[tuple[str, ...]] = tuple(SEED["slot_b"])
+_C: Final[tuple[str, ...]] = tuple(SEED["slot_c"])
+_D: Final[tuple[str, ...]] = tuple(SEED["slot_d"])
+_TEMPLATES: Final[tuple[str, ...]] = tuple(SEED["templates"])
+_SLOT_KEYS: Final[dict[str, str]] = {"a": "slot_a", "b": "slot_b", "c": "slot_c", "d": "slot_d"}
+_SEED_SLOTS: Final[dict[str, tuple[str, ...]]] = {
+    "a": _A, "b": _B, "c": _C, "d": _D}
+
+_BOX_CACHE: dict[str, PairBox] = {}
+
+
+def the_box(settings: Any) -> PairBox:
+    """这一台的话术本（同一份配置共用一盘，别每一步都重读文件）。
+
+    公开它是有道理的：控制台要数一数本里有几句、要换钥匙，
+    而**她**没有任何路径能读到内容——工具够不到 soul 目录以外的文件，
+    读到了也只是密文。
+    """
+    key = f"{settings.pairing_box_path}|{settings.pairing_key_path}"
+    box = _BOX_CACHE.get(key)
+    if box is None:
+        box = _BOX_CACHE[key] = box_for(settings)
+    return box
+
+
+def local_phrase(settings: Any = None) -> str:
+    """本地现拼一句口令：短、一次性、每个选择都来自 `secrets`。
+
+    给得出 settings 就从话术本取词；给不出就用第一盘的种子——
+    两条路都不欠网络，AI 全死了配对照样走得完。
+    """
+    box = the_box(settings) if settings is not None else None
+    for _ in range(30):
+        template = (box.pick("templates") if box else _pick(_TEMPLATES)) or "a b c"
+        body = "".join((box.pick(_SLOT_KEYS[slot]) if box else _pick(_SEED_SLOTS[slot]))
+                       for slot in template.split() if slot in _SLOT_KEYS)
+        if 4 <= len(body) <= TARGET_PHRASE_CHARS and phrase_ok(body):
+            return body
+    return _pick(_SEED_SLOTS["b"]) + _pick(_SEED_SLOTS["c"])
+
+
+# 内置应答：话术本读不到时（只读文件系统之类）用它，别让配对卡在「她不知道该说什么」
+_CODE_FALLBACK: Final[str] = ("…这话也就你说得出口。只有你我俩知道的那串码在下一行，"
+                              "{ttl} 秒内原样带回来，过点我就忘了。")
+_DONE_FALLBACK: Final[str] = "收到了。配对完成——从现在起这台机器归咱俩管，你说，我看着办。"
+_NUDGE_FALLBACK: Final[str] = ("…这串我没当成码。码里不会出现 O、I、0、1 这四个字符，"
+                               "把控制台那 {chars} 个原样发来就行。")
+
+
+def _fill(text: str, **kw: str) -> str:
+    for name, value in kw.items():
+        text = text.replace("{" + name + "}", value)
+    return re.sub(r"\{[a-z_]+\}", "", text)
+
+
+def code_line(settings: Any, ttl: int) -> str:
+    """交码那段话的前半句（本子怎么说）。码由调用方单列一行——
+    他要原样带回来的就是那一行，混进句子里容易抄漏半个字。"""
+    return _fill(the_box(settings).pick("code_line") or _CODE_FALLBACK, ttl=str(ttl))
+
+
+def done_line(settings: Any) -> str:
+    """码对上之后的应承。调用方拿「配对完成」当信号，所以每一句都得带上它——
+    本里漏了就用内置那句兜住。"""
+    text = the_box(settings).pick("done_line") or ""
+    return text if "配对完成" in text else _DONE_FALLBACK
+
+
+def greet_line(settings: Any) -> str:
+    """应承之后紧接着的那一句：她把身份交出来。AI 不在的时候也说得出人话。"""
+    return the_box(settings).pick("greet_line") or _pick(_GREET_FALLBACK)
+
+
+def nudge_line(settings: Any, chars: int) -> str:
+    return _fill(the_box(settings).pick("nudge_line") or _NUDGE_FALLBACK, chars=str(chars))
 
 _STRIP: Final[re.Pattern[str]] = re.compile(r"[\"“”‘’「」『』《》【】\[\]()（）。，！？!?,.;；:：\s]+")
 
@@ -161,15 +224,6 @@ def phrase_ok(text: str) -> bool:
     return True
 
 
-def local_phrase() -> str:
-    """本地现拼一句：短、一次性、每个选择都来自 `secrets`。"""
-    for _ in range(30):
-        body = "".join(_pick(_SLOTS[slot]) for slot in _pick(_TEMPLATES))
-        if 4 <= len(body) <= TARGET_PHRASE_CHARS and phrase_ok(body):
-            return body
-    return _pick(_B) + _pick(_C)
-
-
 _GREET_FALLBACK: Final[tuple[str, ...]] = (
     "行了，是我。往后的事你说，我看着办。",
     "认出你了。这台机器以后归咱俩管。",
@@ -180,7 +234,7 @@ _GREET_FALLBACK: Final[tuple[str, ...]] = (
 
 
 async def make_greeting(ask: Any = None, *, fallback: str = "",
-                        deadline: float = 5.0) -> str:  # noqa: ANN401
+                        deadline: float = 5.0, settings: Any = None) -> str:  # noqa: ANN401
     """配对成功后她跟管理者说的话。到点没生成出来，就随机取一句人话——
     「我认出你了」这件事不该被一条慢上游拖成一分钟的沉默。"""
     if ask is not None and deadline > 0:
@@ -194,4 +248,7 @@ async def make_greeting(ask: Any = None, *, fallback: str = "",
             raw = ""
         if raw:
             return re.sub(r"\s*\n\s*", " ", raw)[:120]
-    return fallback or _pick(_GREET_FALLBACK)
+    if fallback:
+        return fallback
+    # 招呼语用本里那句「把身份交出来」的话——应承那句已经在回执里说过了，别重复
+    return greet_line(settings) if settings is not None else _pick(_GREET_FALLBACK)

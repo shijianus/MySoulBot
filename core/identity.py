@@ -41,6 +41,8 @@ from pathlib import Path
 from typing import Any, Final
 
 from config import OWNER_USER_ID as _OWNER_ID, Settings
+from core.pair_phrase import code_line as _code_line, done_line as _done_line
+from core.pair_phrase import nudge_line as _nudge_line
 from core.storage_manager import atomic_write
 
 logger: Final = logging.getLogger("mysoulbot.identity")
@@ -298,10 +300,12 @@ def consume_pairing(desk: "PairingDesk", text: str, *, source: str,
                         f"这场作废。重新发起一次。")
             return "…（没认出来路，重来一次）"
         code = desk.plaintext_code(challenge)
-        return (f"✓ 唯一来源确认：{keys[0]}\n"
-                f"  把下面这串码原样发回来（{challenge.seconds_left()} 秒内，过期作废）："
-                f"{format_code(code) if code else '（口令已失效，重发一次）'}\n"
-                f"  短横可有可无，大小写不限。")
+        if not code:
+            return "…（这一场的码已经不在生效的范围里了，重来一次）"
+        # 仪式感在这儿：话是她接下去说的——本子在那盘密文里，AI 全断了也有得说，
+        # 而且模型读不到它。最后一行单独是那串码：他要原样带回来的就是这一行，
+        # 混在句子里反而容易抄漏半个字（那是上一轮「回正确的码也验证失败」的一半原因）
+        return desk.ceremony.code_line(challenge.seconds_left()) + "\n" + format_code(code)
 
     # 回填码：只在唯一来源已确认之后才认。码是从整句话里挑的（见 extract_code），
     # 所以「码：XXX-YYY。」「整条气泡粘回来」这些真实回法都还能完成配对
@@ -314,13 +318,13 @@ def consume_pairing(desk: "PairingDesk", text: str, *, source: str,
                 return f"✗ {exc}"
             # 招呼语不在这一层生成：安全模块不该依赖大模型调用。
             # 调用方（CLI / 网桥）拿到成功回执后自己现生成一句发出去。
-            return (f"✓ 配对完成。管理者：{record.qq or record.binding_key()}"
-                    f"（{record.paired_at}）")
+            # 「配对完成」这四个字留在句子里——它是调用方的信号
+            return (f"{desk.ceremony.done_line()}\n"
+                    f"  （记下了：{record.qq or record.binding_key()} · {record.paired_at}）")
         if key == challenge.source_key and _CODEISH.search(unicodedata.normalize("NFKC", body)):
             # 他大概率是在回填，只是那串里没有我能认的字符（O/I/0/1 不进字母表）。
             # 沉默地把它交给对话，就是他说的「回正确的码也验证失败」
-            return ("…这串我没当成码。码里不会出现 O、I、0、1 这四个字符，"
-                    f"把控制台那 {desk.code_chars} 个字符原样发来就行。")
+            return desk.ceremony.nudge_line()
     logger.info("配对进行中（%s），这一句没截走：%r", key, body[:60])
     return None
 
@@ -367,11 +371,33 @@ class Challenge:
         return keys[0] if self.stage == "unique" and len(keys) == 1 else ""
 
 
+class _Ceremony:
+    """把「怎么说」交给那盘加密的话术本。安全模块只管要句子，不管词从哪儿来。
+
+    为什么绕这一道：这些话是配对的一部分，不该由模型临场发挥（它会说漏、也会被绕），
+    也不该明文躺在源码里让谁都能背。本子在盘上是密文，AI 读不到；
+    于是**模型全断了，一场配对照样能走完**——口令、交码、应承、提醒，全是本地的。
+    """
+
+    def __init__(self, settings: Settings) -> None:
+        self._settings = settings
+
+    def code_line(self, ttl: int) -> str:
+        return _code_line(self._settings, ttl)
+
+    def done_line(self) -> str:
+        return _done_line(self._settings)
+
+    def nudge_line(self) -> str:
+        return _nudge_line(self._settings, int(self._settings.pairing_code_chars))
+
+
 class PairingDesk:
     """配对台账。挑战落盘 `storage/run/pairing/`，一次一张，过期即废。"""
 
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
+        self.ceremony = _Ceremony(settings)
 
     @property
     def directory(self) -> Path:

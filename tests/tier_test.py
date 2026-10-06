@@ -147,9 +147,10 @@ def pairing_checks(check: Checker) -> None:
              ID.consume_pairing(desk, "你好溟汐，我是管理员", source="cli") is None, "")
 
     note = ID.consume_pairing(desk, "鲸鱼今晚不翻身", source="cli")
-    check.ok("这一场的口令被截走并确认唯一来源", note and "唯一来源确认" in note, note)
     ch = desk.active()
     code = desk.plaintext_code(ch)
+    check.ok("口令被截走，回执里把码交出去了",
+             note is not None and code in note.replace("-", "") and len(note) > len(code), note)
     check.ok("确认后才吐码且是分组形状", len(code) == 6 and ID.format_code(code) == f"{code[:3]}-{code[3:]}",
              f"{code} / {ID.format_code(code)}")
     done = ID.consume_pairing(desk, ID.format_code(code), source="cli")
@@ -204,7 +205,7 @@ def pairing_checks(check: Checker) -> None:
     d3.start(channel="cli", phrase=ph3)
     a = ID.consume_pairing(d3, ph3, source="cli")
     b = ID.consume_pairing(d3, ph3, source="qq_private", qq="777")
-    check.ok("第二个来源进来就整场作废", a and "唯一来源确认" in a and b and "作废" in b, f"{a} / {b}")
+    check.ok("第二个来源进来就整场作废", a and b and "作废" in b, f"{a} / {b}")
     check.ok("作废后拿不到码", d3.active() is None or d3.plaintext_code(d3.active()) == "", "")
 
     # 大小写与短横都不该成为输错的理由
@@ -418,6 +419,96 @@ def phrase_wiring_checks(check: Checker) -> None:
              and ID.resolve_identity(s7, OWNER_USER_ID).tier is ID.Tier.INTERACTOR)
     check.ok("解绑顺手清掉残留挑战", not list(s7.pairing_dir.glob("PAIR-*.json")))
     check.ok("没绑定时解绑不炸", ID.unpair(s7) is None)
+
+
+# ---------------------------------------------------------------- 2c. 话术本（密文那一盘）
+def box_checks(check: Checker) -> None:
+    """配对要用的那些句子存在哪、锁不锁得住、AI 全断了能不能走完一场。
+
+    这一本的存在意义有两条：她说出口的话不该是模型临场发挥（会被绕、会说漏），
+    也不该明文躺在源码里让谁都能背；同时**网络死了配对也得能配完**。
+    """
+    s = tier_settings(owner_enabled=True)
+    desk = ID.PairingDesk(s)
+    box_path = Path(s.pairing_box_path)
+    key_path = Path(s.pairing_key_path)
+
+    line = desk.ceremony.done_line()
+    check.ok("话术本第一盘建起来了（本地，不问任何人）",
+             box_path.is_file() and "配对完成" in line, f"{line} / {box_path.is_file()}")
+    blob = box_path.read_bytes()
+    for probe in ("配对完成".encode(), "原样发来就行".encode(), "鲸鱼".encode()):
+        check.ok(f"盘上是密文，明文句子搜不到（{probe[:6]!r}…）", probe not in blob, len(blob))
+    check.ok("话术本 0600", (box_path.stat().st_mode & 0o777) == 0o600,
+             oct(box_path.stat().st_mode & 0o777))
+    check.ok("钥匙 0600 且是 32 字节", key_path.is_file()
+             and len(key_path.read_bytes()) == 32
+             and (key_path.stat().st_mode & 0o777) == 0o600,
+             oct(key_path.stat().st_mode & 0o777))
+
+    # 往里补一句：只有这台机器知道，源码里没有它
+    from core.pair_box import PairBox, SEED as BOX_SEED
+    extra = "行。配对完成了——这本子里刚多了一句只有我们知道的话。"
+    box = PairBox(box_path, key_path, __import__("core.pair_box", fromlist=["SEED"]).SEED)
+    check.ok("补进去的句子下一盘读得到", box.add("done_line", extra)
+             and extra in box.pool("done_line"), "")
+    fresh = PairBox(box_path, key_path, {})
+    check.ok("换一个实例（相当于重启进程）也读得到", extra in fresh.pool("done_line"), "")
+    check.ok("补完还是密文（明文不进盘）", extra.encode() not in box_path.read_bytes(), "")
+
+    # 动一个字节都得被发现：改过的本子宁可重建，也不拿着坏数据往下说
+    damaged = bytearray(box_path.read_bytes())
+    damaged[-40] ^= 0x01
+    box_path.write_bytes(bytes(damaged))
+    with __import__('contextlib').suppress(Exception):
+        again = PairBox(box_path, key_path, {"slot_a": ["甲"], "slot_b": ["鱼"], "slot_c": ["游"],
+                                             "slot_d": ["吧"], "templates": ["b c"],
+                                             "code_line": ["{code}"], "done_line": ["配对完成"],
+                                             "nudge_line": ["没当成码"]})
+        check.ok("密文被改过 → 校验没过就重建，不拿坏数据说话",
+                 again.pick("done_line") == "配对完成", again.pick("done_line"))
+
+    # 老本子遇上新版本：新槽位补进来，往里加过的句子一个字都不冲掉
+    s_up = tier_settings(owner_enabled=True)
+    up_first = PairBox(Path(s_up.pairing_box_path), Path(s_up.pairing_key_path),
+                       {k: v for k, v in BOX_SEED.items() if k != "greet_line"})
+    mine_line = up_first.pick("done_line")
+    box_checks_added = up_first.add("done_line", mine_line + "（这一句是本机自己加的）")
+    upgraded = PairBox(Path(s_up.pairing_box_path), Path(s_up.pairing_key_path), BOX_SEED)
+    check.ok("新版本新增的槽位会补进老本子", bool(upgraded.pool("greet_line")), "")
+    check.ok("补进新槽位时不覆盖本机加过的那句",
+             mine_line + "（这一句是本机自己加的）" in upgraded.pool("done_line"), "")
+
+    # 交码那句里只能有一个码形状：多一个挑码就ambiguate了，正确的回法会变成「没当成码」
+    box2 = PairBox(box_path, key_path, {})
+    for template in box2.pool("code_line"):
+        text = template.replace("{ttl}", "117")
+        # 句子里不许有字母数字：那会多出一个「像码的东西」，正确的回法就挑不出码了。
+        # 占位符 {ttl} 自己算例外（它填完就是秒数，本来就该是数字）
+        stripped = text.replace("{ttl}", "").replace("{code}", "")
+        check.ok(f"交码那句除了占位符不带别的字母数字：{text[:18]}…",
+                 not any(ch.isascii() and ch.isalnum() for ch in stripped), text)
+    for slot in ("done_line", "nudge_line"):
+        for text in box2.pool(slot):
+            check.ok(f"{slot} 里不该混进像码的东西",
+                     ID.extract_code(text) == "", text)
+
+    # AI 完全不可用：口令本地拼、回执本地说、一场配对照样走完
+    s_off = tier_settings(owner_enabled=True)
+    d_off = ID.PairingDesk(s_off)
+    phrase = PP.local_phrase(s_off)
+    made = d_off.start(channel="cli", phrase=phrase)
+    said = ID.consume_pairing(d_off, phrase, source="cli")
+    code = d_off.plaintext_code(d_off.active())
+    check.ok("没模型也有口令、有交码句（全程没出网络）",
+             PP.phrase_ok(phrase) and said is not None and code in ID.normalize_code(said),
+             f"{phrase} / {said!r}")
+    done = ID.consume_pairing(d_off, f"码：{ID.format_code(code)}。", source="cli")
+    record = ID.read_owner(s_off)
+    check.ok("没模型也能完成配对并落盘",
+             done is not None and "配对完成" in done and record is not None, done)
+    check.ok("完成那句还是她自己的话（不是打印腔）",
+             done is not None and "✓" not in done.splitlines()[0], done)
 
 
 # ---------------------------------------------------------------- 3. 账号能力放行
@@ -651,6 +742,7 @@ async def main() -> int:
         owner_qq_checks(check)
         pairing_checks(check)
         await phrase_budget_checks(check)
+        box_checks(check)
         phrase_wiring_checks(check)
         account_gate_checks(check)
         await account_behavior_checks(check)

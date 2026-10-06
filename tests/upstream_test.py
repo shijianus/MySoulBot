@@ -57,6 +57,24 @@ def pool_checks(check: Checker) -> None:
     ])
     pool = UpstreamPool(pool_settings(routes=text, base_url="https://a.invalid/v1"))
     check.ok("三条线都解出来了", len(pool.routes) == 3, pool.view())
+
+    # extra_body：免费网关的「别思考，直接落正文」开关只能靠它带过去。
+    # 不带开关的那条线会把整个额度花在思考上、一个字正文都不落——短产出等于废了
+    with_body = UpstreamPool(pool_settings(routes=json.dumps([
+        {"name": "wh", "base_url": "https://w.invalid/v1", "model": "glm-x",
+         "extra_body": {"chat_template_kwargs": {"enable_thinking": False}}}]),
+        base_url="https://a.invalid/v1"))
+    check.ok("extra_body 解出来了并原样带上",
+             with_body.route("wh").extra_body == {"chat_template_kwargs": {"enable_thinking": False}},
+             with_body.route("wh").extra_body)
+    check.ok("没写的线路是空（不影响老配置）", pool.route("fast").extra_body == {}, "")
+    try:
+        UpstreamPool(pool_settings(routes=json.dumps(
+            [{"name": "bad", "model": "m", "extra_body": [1, 2]}]), base_url="https://a.invalid/v1"))
+        check.ok("extra_body 写成不是对象要报错（不能安静地丢掉开关）", False, "竟然放过了")
+    except ValueError as exc:
+        check.ok("extra_body 写成不是对象要报错（不能安静地丢掉开关）",
+                 "extra_body" in str(exc), str(exc)[:60])
     check.ok("base_url 留空跟着主配置", pool.route("fast").base_url == "https://a.invalid/v1")
     check.ok("tiers 只给 full 的线不接短话",
              [r.name for r in pool.candidates("quick")] == ["fast", "backup"],

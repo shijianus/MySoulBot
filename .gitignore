@@ -15,6 +15,9 @@ __pycache__/
 .env.local
 *.env.secret
 storage/soul/*.key
+# 配对话术本（密文）与它的钥匙都是这台机器独有的：
+# 本子是拿本地钥匙加密的，提交上去别人也读不出来，只会多一份误导。
+storage/soul/PAIRING.box
 **/credentials*
 
 # 记忆资产里「可重建 / 体积大」的部分：逐轮日志、人格备份、工具产物

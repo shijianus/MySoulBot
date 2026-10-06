@@ -325,6 +325,9 @@ class MySoulBot:
                          max_tokens: int, timeout: float) -> str:
         """问一条线路。失败与空答都返回空串——调用方管换下一条，这里不抛。"""
         try:
+            kwargs: dict[str, Any] = {"model": model, "temperature": 0.9,
+                                      "max_tokens": max_tokens,
+                                      "messages": [{"role": "user", "content": prompt}]}
             if base:
                 ex_key, _ = self._settings.extractor_credentials()
                 client = AsyncOpenAI(api_key=ex_key or "EMPTY", base_url=base,
@@ -334,12 +337,12 @@ class MySoulBot:
                 if route is None:
                     return ""
                 client = self._route_client(route)
+                if route.extra_body:
+                    # 「别思考，直接落正文」那个开关就在这儿带上：强制思考的免费模型
+                    # 会把整个额度花在思考上、一个字正文都不落，短产出等于废掉这条线
+                    kwargs["extra_body"] = route.extra_body
             completion = await asyncio.wait_for(
-                client.chat.completions.create(
-                    model=model,
-                    messages=[{"role": "user", "content": prompt}],
-                    temperature=0.9, max_tokens=max_tokens,
-                ), timeout=timeout)
+                client.chat.completions.create(**kwargs), timeout=timeout)
             return str(completion.choices[0].message.content or "").strip()
         except Exception as exc:  # noqa: BLE001 - 换下一条线，别把配对卡死
             logger.debug("线路 %s 没成：%s", name, str(exc)[:120])
@@ -1080,6 +1083,10 @@ class MySoulBot:
                 "stream": True,
                 "timeout": target.timeout or self._settings.request_timeout,
             }
+            if target.extra_body:
+                # 有些网关的「别思考，直接落正文」开关就在这儿带着：
+                # 强制思考的免费模型能把整个额度花在思考上、一个字正文都不落
+                kwargs["extra_body"] = target.extra_body
             if tools:
                 kwargs["tools"] = tools
                 kwargs["tool_choice"] = "auto"

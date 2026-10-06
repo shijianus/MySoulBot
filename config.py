@@ -712,6 +712,17 @@ class Settings(BaseSettings):
         return self.storage_dir / "run" / "pairing"
 
     @property
+    def pairing_box_path(self) -> Path:
+        """配对话术本（密文）。口令怎么拼、确认后她怎么说、收到码怎么应——
+        全在这一本里，本地就有，AI 不在也能走完一场配对。"""
+        return self.soul_dir / "PAIRING.box"
+
+    @property
+    def pairing_key_path(self) -> Path:
+        """上面那本的钥匙：32 字节随机数，0600，只在 `storage/run/` 下待着（git 挡住）。"""
+        return self.storage_dir / "run" / "keys" / "pairing.box.key"
+
+    @property
     def judgment_path(self) -> Path:
         """后端灵魂写给人格的「怎么说话」判断册。
         人格决定说什么，这一册决定怎么说——它由相处结果攒出来，会改，且直接

@@ -1768,8 +1768,10 @@ class OneBotBridge:
             if "配对完成" in note:
                 # 认出来之后先打招呼，再报她能干什么——这是「我认出你了」的实测证据。
                 # 话是现生成的，不是模板；生成不出来就随机取一句人话兜底。
-                greet = await make_greeting(short_ask(self._bot.ask_once, self._settings),
-                                            deadline=self._settings.pair_phrase_deadline_seconds)
+                greet = await make_greeting(
+                    short_ask(self._bot.ask_once, self._settings),
+                    deadline=self._settings.pair_phrase_deadline_seconds,
+                    settings=self._settings)
                 await self._type_pause()
                 await self._send_bubble(connection, inbound, greet)
                 tools = await self._owner_capability_line(inbound)

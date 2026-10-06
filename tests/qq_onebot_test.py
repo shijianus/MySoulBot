@@ -3126,9 +3126,11 @@ async def pairing_checks(check: Checker) -> None:
             _exchange, [(phrase, admin, 9001), (phrase, stranger, 9002)])
         joined = "\n".join(texts(first))
         check.ok("口令从私聊被截走，回执里的码原样到了手机上",
-                 "唯一来源确认" in joined and format_code(code) in joined, joined)
+                 format_code(code) in joined and len(joined) > len(format_code(code)) + 20, joined)
         check.ok("回执没被出站的锁吃掉（这条就是那次事故）",
                  "已上锁" not in joined and "〔" not in joined, joined)
+        check.ok("交码那句是她说的话，不是系统腔（有仪式感那条要求）",
+                 "唯一来源确认" not in joined and "✓" not in joined and len(joined) > 20, joined)
         check.ok("认领这两句一个字都没送进模型", model_calls() == quiet_before,
                  f"{quiet_before} -> {model_calls()}")
         check.ok("第二个号来报口令，整场作废（唯一来源这条不是摆设）",
