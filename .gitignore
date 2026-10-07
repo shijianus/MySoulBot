@@ -27,6 +27,15 @@ storage/data/users/*/state.json
 storage/data/users/*/backups/
 storage/data/users/*/artifacts/
 storage/logs/
+# 管理者树同规则：OWNER.json 是配对事实（要跟踪），但 QZONE.json 和逐轮日志、
+# state、备份、产物是本机运行状态，和 users 树里同样的文件一个待遇。
+storage/data/owner/QZONE.json
+storage/data/owner/**/QZONE.json
+storage/data/owner/**/logs/
+storage/data/owner/**/state.json
+storage/data/owner/**/backups/
+storage/data/owner/**/artifacts/
+storage/data/owner/**/*.bak-*
 # 守护进程的运行痕迹（pidfile 与 server.out）——机器本地状态，不该进版本库
 storage/run/
 
