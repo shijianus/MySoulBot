@@ -419,6 +419,11 @@ class Settings(BaseSettings):
         description="配对挑战的有效期。到点自动作废，必须重新发起——不留长期有效的门",
     )
     pairing_code_chars: int = Field(default=6, ge=4, le=10, description="一次性数字字母密码长度（分组显示）")
+    pairing_grace_seconds: int = Field(
+        default=120, ge=0, le=600,
+        description="过期之后再留多久认一句「你来晚了」（0 = 过期即当没发生过）。"
+        "手机上抄码很容易踩线过去，而踩线之后她一句都不回是最坑人的坏法",
+    )
     pair_phrase_deadline_seconds: float = Field(
         default=5.0, ge=0.0, le=30.0,
         description="口令/招呼语这一类后台短产出的**整段预算**。到点还没拿到就本地现拼或随机取一句："

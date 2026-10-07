@@ -36,7 +36,7 @@ logger: Final = logging.getLogger("mysoulbot.pairphrase")
 
 __all__ = ["MAX_PHRASE_CHARS", "make_phrase", "make_greeting", "phrase_ok",
            "local_phrase", "short_ask", "code_line", "done_line", "greet_line",
-           "nudge_line", "the_box"]
+           "nudge_line", "restart_line", "late_line", "the_box"]
 
 # 目标 10 字，硬上限 15 字。超过 15 的一律当模型没听懂，走兜底。
 TARGET_PHRASE_CHARS: Final[int] = 10
@@ -134,24 +134,39 @@ _SEED_SLOTS: Final[dict[str, tuple[str, ...]]] = {
 _BOX_CACHE: dict[str, PairBox] = {}
 
 
-def the_box(settings: Any) -> PairBox:
+def the_box(settings: Any) -> PairBox | None:
     """这一台的话术本（同一份配置共用一盘，别每一步都重读文件）。
 
-    公开它是有道理的：控制台要数一数本里有几句、要换钥匙，
-    而**她**没有任何路径能读到内容——工具够不到 soul 目录以外的文件，
-    读到了也只是密文。
+    拿不到就返回 None——读不到的本子是环境问题，不是配对的终点：
+    调用方一律有内置的那几句兜着，配对不该因为一次 IO 失败就说不出话。
+
+    公开它是有道理的：控制台要数一数本里有几句、要换钥匙。
+    而**她**没有任何路径能读到内容——工具够不到那些目录，
+    面板的文档与静态资源都走白名单，读到了也只是密文。
     """
     key = f"{settings.pairing_box_path}|{settings.pairing_key_path}"
-    box = _BOX_CACHE.get(key)
-    if box is None:
-        box = _BOX_CACHE[key] = box_for(settings)
+    if key in _BOX_CACHE:
+        return _BOX_CACHE[key]
+    try:
+        box = box_for(settings)
+        box.corpus()            # 现在就验一次：坏在本子在这一步暴露，不在她开口那一步
+    except Exception as exc:  # noqa: BLE001 - 密文读不出来就用内置那几句，配对照走
+        logger.warning("配对话术本读不出来（%s），这一场用内置句子", type(exc).__name__)
+        return None
+    _BOX_CACHE[key] = box
     return box
+
+
+def _from_box(settings: Any, slot: str, default: str) -> str:
+    """本里取一句；本子读不出来或槽是空的，就用内置那句。"""
+    box = the_box(settings)
+    return (box.pick(slot) if box is not None else "") or default
 
 
 def local_phrase(settings: Any = None) -> str:
     """本地现拼一句口令：短、一次性、每个选择都来自 `secrets`。
 
-    给得出 settings 就从话术本取词；给不出就用第一盘的种子——
+    给得出 settings 就从话术本取词；给不出（或本子读不出来）就用第一盘的种子——
     两条路都不欠网络，AI 全死了配对照样走得完。
     """
     box = the_box(settings) if settings is not None else None
@@ -170,6 +185,10 @@ _CODE_FALLBACK: Final[str] = ("…这话也就你说得出口。只有你我俩�
 _DONE_FALLBACK: Final[str] = "收到了。配对完成——从现在起这台机器归咱俩管，你说，我看着办。"
 _NUDGE_FALLBACK: Final[str] = ("…这串我没当成码。码里不会出现 O、I、0、1 这四个字符，"
                                "把控制台那 {chars} 个原样发来就行。")
+_RESTART_FALLBACK: Final[str] = ("…这串我现在接不了——这一场还没到我报码那一步。"
+                                 "控制台上的口令可能换了，看最新那句重新来。")
+_LATE_FALLBACK: Final[str] = ("…我来晚了半步——那一场已经作废了，我这儿没记下任何东西。"
+                              "回控制台重新发起一次吧。")
 
 
 def _fill(text: str, **kw: str) -> str:
@@ -181,23 +200,33 @@ def _fill(text: str, **kw: str) -> str:
 def code_line(settings: Any, ttl: int) -> str:
     """交码那段话的前半句（本子怎么说）。码由调用方单列一行——
     他要原样带回来的就是那一行，混进句子里容易抄漏半个字。"""
-    return _fill(the_box(settings).pick("code_line") or _CODE_FALLBACK, ttl=str(ttl))
+    return _fill(_from_box(settings, "code_line", _CODE_FALLBACK), ttl=str(ttl))
 
 
 def done_line(settings: Any) -> str:
     """码对上之后的应承。调用方拿「配对完成」当信号，所以每一句都得带上它——
     本里漏了就用内置那句兜住。"""
-    text = the_box(settings).pick("done_line") or ""
+    text = _from_box(settings, "done_line", _DONE_FALLBACK)
     return text if "配对完成" in text else _DONE_FALLBACK
 
 
 def greet_line(settings: Any) -> str:
     """应承之后紧接着的那一句：她把身份交出来。AI 不在的时候也说得出人话。"""
-    return the_box(settings).pick("greet_line") or _pick(_GREET_FALLBACK)
+    return _from_box(settings, "greet_line", _pick(_GREET_FALLBACK))
+
+
+def late_line(settings: Any) -> str:
+    """那一场已经过期时说的那句（不作废谁，也不认任何东西——只是别再对着空气发码）。"""
+    return _from_box(settings, "late_line", _LATE_FALLBACK)
+
+
+def restart_line(settings: Any) -> str:
+    """他发来了串码，但这一场还在等口令时说的那句。不作废——他不是来捣乱的。"""
+    return _from_box(settings, "restart_line", _RESTART_FALLBACK)
 
 
 def nudge_line(settings: Any, chars: int) -> str:
-    return _fill(the_box(settings).pick("nudge_line") or _NUDGE_FALLBACK, chars=str(chars))
+    return _fill(_from_box(settings, "nudge_line", _NUDGE_FALLBACK), chars=str(chars))
 
 _STRIP: Final[re.Pattern[str]] = re.compile(r"[\"“”‘’「」『』《》【】\[\]()（）。，！？!?,.;；:：\s]+")
 

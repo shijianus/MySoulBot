@@ -574,10 +574,21 @@ class SoulServer:
         }
 
     def _health(self) -> dict[str, Any]:
+        # model 是配置里那个默认标识（酒馆那侧还拿它当模型名，别动）；
+        # model_active 才是「这一回合实际打哪条形线」——池子按优先级与实测速度排，
+        # 只看 model 会误以为主力还是那条不答话的
+        try:
+            active = {}
+            for tier in ("quick", "full"):
+                head = next(iter(self.bot.routes.candidates(tier)), None)
+                active[tier] = f"{head.name}/{head.model}" if head else "（没有可用线路）"
+        except Exception:  # noqa: BLE001 - 读不出健康读数不该把健康检查带崩
+            active = {}
         return {
             "ok": True,
             "engine": "MySoulBot",
             "model": self._settings.model,
+            "model_active": active,
             "storage": str(self._settings.storage_dir),
             "tools_enabled": self._settings.tools_enabled,
             "rapport_enabled": self._settings.rapport_enabled,

@@ -226,6 +226,17 @@ def pairing_checks(check: Checker) -> None:
     check.ok("口令嵌在长句里不算（整句相等才认）",
              ID.consume_pairing(d5, "我今天聊到声呐朝北游这件事", source="cli") is None, "")
 
+    # 口令也一样，全角与半角不该是「输错」：手机上打出来的常是全角
+    s_nf = tier_settings(owner_enabled=True)
+    d_nf = ID.PairingDesk(s_nf)
+    d_nf.start(channel="cli", phrase="粥还没凉透")
+    full = ID.consume_pairing(d_nf, "粥还没凉透？", source="cli")
+    check.ok("口令后面顺手一个全角问号，照样认（并交出码）",
+             full is not None and d_nf.active().stage == "unique"
+             and ID.extract_code(full, 6) != "", full)
+    miss = ID.consume_pairing(d_nf, "粥还没凉透啊", source="cli")
+    check.ok("差一个字不算口令（整句相等才认，全角也救不了错字）", miss is None, miss)
+
     # 群聊不配对
     s4 = tier_settings(owner_enabled=True)
     d4 = ID.PairingDesk(s4)
@@ -240,8 +251,10 @@ def pairing_checks(check: Checker) -> None:
     c6 = d6.start(channel="cli", phrase="逆流的珊瑚")
     d6._save(dataclasses.replace(d6.get(c6.id), expires_at=time.time() - 1))
     check.ok("过期挑战不再算活跃", d6.active() is None)
-    check.ok("过期即从盘上抹掉（明文口令不留过夜）", not list(s6.pairing_dir.glob("PAIR-*.json")),
-             [f.name for f in s6.pairing_dir.glob("PAIR-*.json")])
+    left6 = list(s6.pairing_dir.glob("PAIR-*.json"))
+    check.ok("过期之后明文口令从文件里抹掉（不留可猜的东西过夜）",
+             all(json.loads(f.read_text("utf8")).get("phrase", "") == "" for f in left6),
+             [json.loads(f.read_text("utf8")).get("phrase") for f in left6])
     check.ok("过期后口令不截", ID.consume_pairing(d6, "逆流的珊瑚", source="cli") is None)
 
     # 码绑人：同一场挑战，两个来源算出两个码——抄来的码在别人身上不成立
@@ -305,6 +318,18 @@ def pairing_checks(check: Checker) -> None:
     check.ok("提醒不作废这一场（他还有一次机会）", d_w.active() is not None, "")
     other_person = ID.consume_pairing(d_w, "6WO-K8O", source="qq_private", qq="30003")
     check.ok("旁人打趣一样的字符串不去催他（只管不管）", other_person is None, other_person)
+
+    # 控制台又 /pair 了一次（口令换了），他还拿着上一场的码来回填：要说一句话，别沉默
+    s_w = tier_settings(owner_enabled=True)
+    d_w2 = ID.PairingDesk(s_w)
+    d_w2.start(channel="cli", phrase="贝壳还没归位")
+    early = ID.consume_pairing(d_w2, "AB2-K9M", source="cli")
+    check.ok("还没到认码那一步就来回填，会被告知（不作废）",
+             early is not None and "控制台" in early and d_w2.active() is not None, early)
+    again = d_w2.start(channel="cli", phrase="贝壳该归位了")
+    stale = ID.consume_pairing(d_w2, "AB2-K9M", source="cli")
+    check.ok("口令换过一场之后，旧码发过来也不会石沉大海",
+             stale is not None and "控制台" in stale and again.id == d_w2.active().id, stale)
 
     # 码长是配置的：显示与识别必须跟着同一个形状走
     for chars in (4, 5, 7, 10):
@@ -421,6 +446,45 @@ def phrase_wiring_checks(check: Checker) -> None:
     check.ok("没绑定时解绑不炸", ID.unpair(s7) is None)
 
 
+# ---------------------------------------------------------------- 2b2. 过期之后的宽限
+def grace_checks(check: Checker) -> None:
+    """来晚了的那个人不该对着空气发码。
+
+    这是同一类坏法的最后一块：手机上打完口令再抄一串码，120 秒很容易踩过去；
+    踩过去之后她一句都不回、照常聊天，人就以为「码又不对了」。
+    """
+    s = tier_settings(owner_enabled=True, pairing_ttl_seconds=30, pairing_grace_seconds=120)
+    d = ID.PairingDesk(s)
+    made = d.start(channel="cli", phrase="海图该收起来了")
+    ID.consume_pairing(d, "海图该收起来了", source="qq_private", qq="1937490685")
+    code = d.plaintext_code(d.active())
+    d._save(dataclasses.replace(d.get(made.id), expires_at=time.time() - 1))
+    came = ID.consume_pairing(d, ID.format_code(code), source="qq_private", qq="1937490685")
+    check.ok("过期之后才把码发来，会听到「那一场已经作废」",
+             came is not None and ("作废" in came or "过期" in came), came)
+    check.ok("来晚了这一句不绑任何人", ID.read_owner(s) is None, "")
+    check.ok("别人拿一串不相干的码来撞宽限：不接（他没报过口令）",
+             ID.consume_pairing(d, "QQQ-QQQ", source="qq_private", qq="40004") is None, "")
+    check.ok("把这个号那份码拿到别的来源去撞宽限，一样不认",
+             ID.consume_pairing(d, ID.format_code(code), source="cli") is None, "")
+
+    d._save(dataclasses.replace(d.get(made.id), expires_at=time.time() - 300,
+                                grace_until=time.time() - 1))
+    path = Path(s.pairing_dir / f"{made.id}.json")
+    check.ok("宽限也过了：整张删掉（salt 不留过夜）",
+             d.get(made.id) is None and not path.exists(), str(path))
+
+    s0 = tier_settings(owner_enabled=True, pairing_ttl_seconds=30, pairing_grace_seconds=0)
+    d0 = ID.PairingDesk(s0)
+    m0 = d0.start(channel="cli", phrase="缆绳该解了")
+    ID.consume_pairing(d0, "缆绳该解了", source="cli")
+    code0 = d0.plaintext_code(d0.active())
+    d0._save(dataclasses.replace(d0.get(m0.id), expires_at=time.time() - 1))
+    check.ok("宽限设 0：过期即抹掉，来晚了只是不接（不炸）",
+             ID.consume_pairing(d0, ID.format_code(code0), source="cli") is None
+             and not list(s0.pairing_dir.glob("PAIR-*.json")), "")
+
+
 # ---------------------------------------------------------------- 2c. 话术本（密文那一盘）
 def box_checks(check: Checker) -> None:
     """配对要用的那些句子存在哪、锁不锁得住、AI 全断了能不能走完一场。
@@ -467,6 +531,38 @@ def box_checks(check: Checker) -> None:
                                              "nudge_line": ["没当成码"]})
         check.ok("密文被改过 → 校验没过就重建，不拿坏数据说话",
                  again.pick("done_line") == "配对完成", again.pick("done_line"))
+
+    # 本子读不出来（目录坏了、钥匙丢了、盘只读）都不该让配对说不出话
+    s_bad = tier_settings(owner_enabled=True)
+    # 把话术本所在的目录拧成只读：建不了、写不了、读不到——配对必须照样走完
+    Path(s_bad.soul_dir).mkdir(parents=True, exist_ok=True)
+    Path(s_bad.soul_dir).chmod(0o500)
+    d_bad = ID.PairingDesk(s_bad)
+    bad_phrase = PP.local_phrase(s_bad)
+    made_bad = d_bad.start(channel="cli", phrase=bad_phrase)
+    said_bad = ID.consume_pairing(d_bad, bad_phrase, source="cli")
+    code_bad = d_bad.plaintext_code(d_bad.active())
+    check.ok("话术本读不出来时用内置那几句（配对不卡在这）",
+             PP.phrase_ok(bad_phrase) and said_bad is not None
+             and code_bad in ID.normalize_code(said_bad), f"{bad_phrase} / {said_bad!r}")
+    done_bad = ID.consume_pairing(d_bad, ID.format_code(code_bad), source="cli")
+    check.ok("本子坏了也能一路走完到配对完成",
+             done_bad is not None and "配对完成" in done_bad, done_bad)
+    Path(s_bad.soul_dir).chmod(0o700)
+
+    # 换钥匙重抄：老钥匙读不到这一本，新钥匙读得到，句子没丢
+    s_rot = tier_settings(owner_enabled=True)
+    box_rot = PairBox(Path(s_rot.pairing_box_path), Path(s_rot.pairing_key_path), BOX_SEED)
+    kept = box_rot.pool("done_line")
+    box_rot.rotate()
+    old_key = box_rot.key_path.read_bytes()
+    fresh_rot = PairBox(Path(s_rot.pairing_box_path), Path(s_rot.pairing_key_path), {})
+    check.ok("重抄之后这一本还能读（新钥匙），句子一句没丢",
+             fresh_rot.pool("done_line") == kept, fresh_rot.pool("done_line")[:1])
+    broken_rot = PairBox(Path(s_rot.pairing_box_path), Path(s_rot.pairing_key_path), BOX_SEED)
+    broken_rot._key = old_key                        # 拿旧钥匙读新本子
+    check.ok("旧钥匙读新本子：过不了校验，重建而不是硬解",
+             isinstance(broken_rot.corpus(), dict) and "code_line" in broken_rot.corpus(), "")
 
     # 老本子遇上新版本：新槽位补进来，往里加过的句子一个字都不冲掉
     s_up = tier_settings(owner_enabled=True)
@@ -742,6 +838,7 @@ async def main() -> int:
         owner_qq_checks(check)
         pairing_checks(check)
         await phrase_budget_checks(check)
+        grace_checks(check)
         box_checks(check)
         phrase_wiring_checks(check)
         account_gate_checks(check)

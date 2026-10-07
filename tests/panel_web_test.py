@@ -599,6 +599,11 @@ async def panel_http_checks(check: Checker, settings: Any) -> None:
         health = json.loads(raw)
         check.ok("/healthz 报告面板与视觉", health["panel_enabled"] is True and health["vision_enabled"] is True, raw[:200])
         check.ok("/healthz 报积压", "memory_backlog" in health and "active_turns" in health, raw[:200])
+        # model_active：光看 model 会以为主力还是那条不答话的——面板与健康检查得说实际打谁
+        active = health.get("model_active") or {}
+        check.ok("/healthz 说得出这一档实际打哪条形线",
+                 set(active) == {"quick", "full"} and all("/" in v for v in active.values()),
+                 active)
 
         settings.panel_enabled = False
         code, text, _ = await asyncio.to_thread(http_get, f"{base}/panel")

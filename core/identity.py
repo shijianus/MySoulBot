@@ -43,6 +43,8 @@ from typing import Any, Final
 from config import OWNER_USER_ID as _OWNER_ID, Settings
 from core.pair_phrase import code_line as _code_line, done_line as _done_line
 from core.pair_phrase import nudge_line as _nudge_line
+from core.pair_phrase import late_line as _late_line
+from core.pair_phrase import restart_line as _restart_line
 from core.storage_manager import atomic_write
 
 logger: Final = logging.getLogger("mysoulbot.identity")
@@ -104,8 +106,12 @@ def _stamp(ts: float | None = None) -> str:
 
 
 def normalize_phrase(text: str) -> str:
-    """中文标点、全角空格、大小写都不该成为「输错」的理由。"""
-    return _STRIP.sub("", (text or "").strip().lower())
+    """中文标点、全角空格、大小写都不该成为「输错」的理由。
+
+    先过一遍 NFKC：手机上打出来的是全角「？」「　」与全角字母，
+    控制台上的口令是半角的——这层差别不该让一句正确的口令变成闲聊。
+    """
+    return _STRIP.sub("", unicodedata.normalize("NFKC", (text or "")).strip().lower())
 
 
 def phrase_matches(text: str, want: str) -> bool:
@@ -287,6 +293,9 @@ def consume_pairing(desk: "PairingDesk", text: str, *, source: str,
         return None
     challenge = desk.active()
     if challenge is None:
+        # 没有开着的挑战，但不该继续装没看见：他可能就是晚了那么几秒
+        if desk.late_attempt(text or "", source=source, qq=qq):
+            return desk.ceremony.late_line()
         return None
     body = (text or "").strip()
     key = candidate_key(source, qq)
@@ -309,8 +318,12 @@ def consume_pairing(desk: "PairingDesk", text: str, *, source: str,
 
     # 回填码：只在唯一来源已确认之后才认。码是从整句话里挑的（见 extract_code），
     # 所以「码：XXX-YYY。」「整条气泡粘回来」这些真实回法都还能完成配对
+    attempt = extract_code(body, desk.code_chars)
+    if challenge.stage != "unique" and attempt:
+        # 他确实是在回填，只是这一场还在等口令——多半是控制台又 /pair 了一次（口令换了），
+        # 或者过期后重开过。这一路最怕沉默：他以为自己发了、她以为没收到
+        return desk.ceremony.restart_line()
     if challenge.stage == "unique":
-        attempt = extract_code(body, desk.code_chars)
         if attempt:
             try:
                 record = desk.submit_code(challenge, attempt, source=source, qq=qq)
@@ -325,7 +338,9 @@ def consume_pairing(desk: "PairingDesk", text: str, *, source: str,
             # 他大概率是在回填，只是那串里没有我能认的字符（O/I/0/1 不进字母表）。
             # 沉默地把它交给对话，就是他说的「回正确的码也验证失败」
             return desk.ceremony.nudge_line()
-    logger.info("配对进行中（%s），这一句没截走：%r", key, body[:60])
+    # 只有正在配对那一个号的句子才值得记：别人聊天不该被抄进日志（那是要上锁的东西）
+    if challenge is not None and key == challenge.source_key:
+        logger.info("配对进行中（%s），这一句没截走：%d 个字", key, len(body))
     return None
 
 
@@ -353,6 +368,8 @@ class Challenge:
     candidates: dict[str, str] = field(default_factory=dict)
     stage: str = "waiting"
     attempts: int = 0
+    # 过期之后留一小段「认错码」的宽限：只留 salt，口令与来源照删（见 get()）
+    grace_until: float = 0.0
 
     def alive(self, now: float | None = None) -> bool:
         return self.expires_at > (now if now is not None else _now())
@@ -390,6 +407,12 @@ class _Ceremony:
 
     def nudge_line(self) -> str:
         return _nudge_line(self._settings, int(self._settings.pairing_code_chars))
+
+    def restart_line(self) -> str:
+        return _restart_line(self._settings)
+
+    def late_line(self) -> str:
+        return _late_line(self._settings)
 
 
 class PairingDesk:
@@ -478,9 +501,57 @@ class PairingDesk:
         # 口令是明文写的，过期了还留在盘上，只是多一个可撞的东西
         if not challenge.alive() and challenge.stage in _STAGE_OPEN:
             challenge.stage = "expired"
+            self._expire(challenge)
+            return challenge
+        if challenge.stage == "expired" and time.time() > challenge.grace_until:
+            # 宽限也过了：口令、salt、来源一个都不该留在盘上
             with contextlib.suppress(OSError):
                 self._path(challenge_id).unlink()
+            return None
         return challenge
+
+    def _expire(self, challenge: Challenge) -> None:
+        """过期不是消失：口令当场抹掉，salt 留 {ttl} 秒用来认一句「你来晚了」。
+
+        为什么要这一段：手机上打完那句口令再抄一串码，120 秒很容易踩线过去。
+        踩线之后他发的码就没人接了——她还跟他聊两句，那就是第二轮报障的现场。
+        """
+        grace = self._settings.pairing_grace_seconds
+        challenge.phrase = ""      # 口令当场作废：宽限期只用来认「你来晚了」，不再留着可猜的东西
+        challenge.grace_until = time.time() + grace if grace > 0 else 0.0
+        if challenge.grace_until > 0:
+            self._save(challenge)
+        else:
+            with contextlib.suppress(OSError):
+                self._path(challenge.id).unlink()
+
+    def late_attempt(self, text: str, *, source: str, qq: str = "") -> str:
+        """没有开着的挑战时，看这一句是不是**上一场来晚了**的码。是就返回那一场的 id。"""
+        chars = self.code_chars
+        attempt = extract_code(text or "", chars)
+        if not attempt:
+            return ""
+        key = candidate_key(source, qq)
+        now = time.time()
+        if not self.directory.is_dir():
+            return ""
+        for path in sorted(self.directory.glob("PAIR-*.json"), reverse=True):
+            challenge = self._load(path.stem)
+            if challenge is None:
+                with contextlib.suppress(OSError):
+                    path.unlink()
+                continue
+            if challenge.stage != "expired" or now > challenge.grace_until:
+                with contextlib.suppress(OSError):
+                    path.unlink()
+                continue
+            if key not in challenge.candidates:
+                continue
+            expected = derive_code(challenge.salt, challenge_id=challenge.id, key=key,
+                                   chars=chars)
+            if hmac.compare_digest(expected, attempt):
+                return challenge.id
+        return ""
 
     def active(self) -> Challenge | None:
         """当前这一场。取**最新**的那张，其余还开着的一律作废。
