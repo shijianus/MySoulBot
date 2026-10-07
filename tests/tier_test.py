@@ -276,7 +276,8 @@ def pairing_checks(check: Checker) -> None:
     check.ok("手机上看到的码，就是按那个号算出来的那一份", seen == mine, f"{seen} vs {mine}")
     stolen = ID.consume_pairing(d_b, seen, source="cli")
     check.ok("把这条码拿到别的来源去回填，不认",
-             stolen is not None and "不是报口令那一个号" in stolen, stolen)
+             stolen is not None and "码得发回那儿去" in stolen
+             and "qq_private|1937490685" in stolen and "cli|anon" in stolen, stolen)
     check.ok("抄码未遂之后这场已经作废，没留半条活路", d_b.active() is None, "")
 
     # 同一来源但码不对（他抄错了一位）：也是整场作废，不许试第二次

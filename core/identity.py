@@ -638,7 +638,10 @@ class PairingDesk:
         # 原来只比 `source` 前缀，等于「A 号报了口令，B 号抄到码就能认领」
         if key != candidate_key(source, qq):
             self.void(challenge.id)
-            raise PairingError("回填的不是报口令那一个号，这场作废了——从头再来")
+            raise PairingError(
+                f"这一场的口令是 {key} 报的，码得发回那儿去才算你——"
+                f"你现在从 {candidate_key(source, qq)} 发来，对不上。"
+                f"想在这头绑，就回控制台重新 /pair，口令也在这头说")
 
         attempt = normalize_code(code)
         challenge.attempts += 1

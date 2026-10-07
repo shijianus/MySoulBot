@@ -18,6 +18,12 @@ from __future__ import annotations
 
 import asyncio
 import datetime as dt
+import contextlib
+import os
+import pty
+import select
+import signal
+import time
 import json
 import re
 import shutil
@@ -664,6 +670,84 @@ async def tavern_checks(check: Checker, settings: Any) -> None:
 
 
 # ================================================================ 主流程
+def cli_exit_checks(check: Checker, root: Path) -> None:
+    """命令行退出路径：Ctrl-C 之后不许卡住，也不许甩一段 threading 的 traceback。
+
+    回归的是那个现场：读键盘的线程堵在 `input()` 里，而解释器退出时要把线程池的
+    线程一根根 join 完——于是「按了 Ctrl-C 退不掉，再按一次甩出 Exception ignored」。
+    """
+    # 空目录跑不起来（深层灵魂模板是启动的一部分），所以先用建测试档案那套种子铺好
+    make_settings(root, "http://127.0.0.1:1/v1")
+    env = dict(os.environ, STORAGE_DIR=str(root), ONEBOT_ENABLED="false", PANEL_ENABLED="false",
+               EXTRACTOR_ENABLED="false", TOOLS_ENABLED="false", LOG_LEVEL="CRITICAL",
+               API_KEY="sk-test", MODEL="chat-only", TERM="dumb", COLUMNS="100")
+
+    def run(steps: list[Any]) -> tuple[int | None, bool, str]:
+        """步骤是 ("quit",秒) / ("sigint",秒)。返回 (退出码, 结束时还活着吗, 输出)。"""
+        pid, fd = pty.fork()
+        if pid == 0:                                   # 子进程：跑真正的 CLI
+            os.chdir(str(PROJECT_ROOT))
+            os.execve(sys.executable, [sys.executable, "main.py", "--user", "cli_exit",
+                                       "--no-extract", "--no-tools"], env)
+        buf = b""
+
+        def slurp(wait: float) -> None:
+            nonlocal buf
+            deadline = time.time() + wait
+            while time.time() < deadline:
+                ready, _, _ = select.select([fd], [], [], 0.3)
+                if not ready:
+                    continue
+                try:
+                    chunk = os.read(fd, 65536)
+                except OSError:
+                    return
+                if not chunk:
+                    return
+                buf += chunk
+
+        def exit_code() -> int | None:
+            done, status = os.waitpid(pid, os.WNOHANG)
+            return os.waitstatus_to_exitcode(status) if done else None
+
+        slurp_until_banner = time.time() + 25.0
+        while time.time() < slurp_until_banner and b"MySoulBot" not in buf:
+            slurp(0.5)
+        for kind, wait in steps:
+            if kind == "sigint":
+                with contextlib.suppress(ProcessLookupError):
+                    os.kill(pid, signal.SIGINT)
+            else:
+                os.write(fd, b"/quit\r")
+            time.sleep(0.2)
+            slurp(wait)
+        code = None
+        for _ in range(30):                            # 最多再等 3 秒看它走不走
+            code = exit_code()
+            if code is not None:
+                break
+            slurp(0.1)
+        with contextlib.suppress(ProcessLookupError, OSError):
+            os.kill(pid, signal.SIGKILL)
+        with contextlib.suppress(Exception):
+            os.close(fd)
+        return code, code is None, buf.decode("utf-8", "replace")
+
+    code, alive, out = run([("quit", 2.0)])
+    check.ok("/quit 干净退出（不卡住、不甩 traceback）",
+             not alive and code == 0 and "Exception ignored" not in out and "Traceback" not in out,
+             f"code={code} alive={alive} 尾:{out[-80:]!r}")
+
+    code2, alive2, out2 = run([("sigint", 0.4), ("sigint", 1.0)])
+    check.ok("连按两次 Ctrl-C 立刻走（这是逃生口）",
+             not alive2 and code2 == 130 and "Exception ignored" not in out2,
+             f"code={code2} alive={alive2} 尾:{out2[-80:]!r}")
+
+    code3, alive3, out3 = run([("sigint", 1.2)])
+    check.ok("只按一下 Ctrl-C 是作废这一行，人还在命令行上",
+             alive3 and "已作废这一行" in out3, f"alive={alive3} 尾:{out3[-80:]!r}")
+
+
 async def main() -> int:
     server, base_url = serve_fake()
     roots: list[Path] = []
@@ -680,6 +764,7 @@ async def main() -> int:
     await prompt_injection_checks(check, fresh("mysoulbot-inject-"))
     await panel_checks(check, fresh("mysoulbot-panel-"))
     await tavern_checks(check, fresh("mysoulbot-tavern-", server_host="127.0.0.1"))
+    cli_exit_checks(check, Path(tempfile.mkdtemp(prefix="mysoulbot-cli-exit-")))
 
     # 越界 id 不许建目录
     from core.storage_manager import PathSafetyError, StorageManager

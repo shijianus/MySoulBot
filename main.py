@@ -34,8 +34,10 @@ import logging
 import os
 import re
 import shlex
+import signal
 import subprocess
 import sys
+import threading
 import time
 from collections.abc import AsyncGenerator, Sequence
 from pathlib import Path
@@ -218,6 +220,60 @@ class TerminalUI:
             return None
 
 
+class _StdinPump:
+    """一根**常驻 daemon 线程**读键盘，把行放进队列喂给事件循环。
+
+    为什么不用 `asyncio.to_thread(input)`：Ctrl-C 之后那个线程还堵在 `input()` 里，
+    而取消一个 to_thread 只是不要它的结果——线程照活。线程池的线程在解释器退出时
+    是要一根根 join 的，于是「按了 Ctrl-C 却退不掉，再按一次甩出
+    `Exception ignored in: <module 'threading'>`」。daemon 线程不参与那个 join，
+    而且全进程只有这一根读键盘的线。
+    """
+
+    def __init__(self, ui: "TerminalUI", prompt: str = "") -> None:
+        self._ui = ui
+        self._prompt = prompt
+        self._queue: asyncio.Queue[str | None] = asyncio.Queue()
+        self._thread: threading.Thread | None = None
+        self._loop: asyncio.AbstractEventLoop | None = None
+
+    def set_prompt(self, prompt: str) -> None:
+        self._prompt = prompt
+
+    def start(self) -> None:
+        if self._thread is not None:
+            return
+        self._loop = asyncio.get_running_loop()
+        self._thread = threading.Thread(target=self._pump, daemon=True, name="stdin")
+        self._thread.start()
+
+    def _push(self, line: str | None) -> None:
+        loop = self._loop
+        if loop is None:
+            return
+        with contextlib.suppress(RuntimeError):      # 循环已经关了就别再喊
+            loop.call_soon_threadsafe(self._queue.put_nowait, line)
+
+    def _pump(self) -> None:
+        while True:
+            try:
+                line = self._ui.ask(self._prompt)
+            except EOFError:
+                self._push(None)                   # Ctrl-D：到此为止
+                return
+            except KeyboardInterrupt:
+                # Ctrl-C 是「这一行作废」，不是退出：接着等下一行（真要走有 /quit，
+                # 或者连按两下——那一下走的是 _bail，不等任何东西）
+                self._push("")
+                continue
+            self._push(line)
+            if line is None:
+                return
+
+    async def get(self) -> str | None:
+        return await self._queue.get()
+
+
 class App:
     """CLI 应用：装配引擎、分发命令、对话主循环。"""
 
@@ -226,6 +282,10 @@ class App:
         self._args = args
         self.user_id: str = args.user or settings.default_user_id
         self.ui = TerminalUI(settings)
+        self._stdin: _StdinPump | None = None   # 读键盘的那根常驻线程
+        self._busy = False                      # Ctrl-C 落在这上面时该掐哪一样
+        self._turn_task: asyncio.Task[None] | None = None
+        self._last_sigint = 0.0
         self.storage = StorageManager(settings)
         self.clawd = ClawdSoul(settings)
         self.prompts = PromptBuilder(settings, self.storage, self.clawd)
@@ -254,7 +314,29 @@ class App:
         if self.extractor.enabled:
             self.extractor.start()
 
+    def _install_signals(self) -> None:
+        """把 Ctrl-C 变成控制台该有的样子：一次作废手上这行，两次立刻走。
+
+        默认的 SIGINT 会把 KeyboardInterrupt 掷进事件循环里——那正是
+        「按了没退成、再按一次甩一段 threading traceback」的来源。
+        """
+        def handle(signum: int, frame: Any) -> None:   # noqa: ANN001 - 信号处理的原型
+            now = time.monotonic()
+            if now - self._last_sigint < 1.5:
+                _bail(self.ui)
+            self._last_sigint = now
+            if self._busy and self._turn_task is not None and not self._turn_task.done():
+                # 掷 KeyboardInterrupt 会落在事件循环当前那句 C 代码上——从那儿漏出去
+                # 就是整个进程被打断。取消这一回合的任务才是这一回合自己的事
+                self._turn_task.cancel()
+                self.ui.line("  掐掉这一句了。")
+                return
+            self.ui.line("  已作废这一行。退出：/quit 或 Ctrl-D（连按两次 Ctrl-C 直接走）")
+        with contextlib.suppress(ValueError):       # 不在主线程（测试里可能）就不装
+            signal.signal(signal.SIGINT, handle)
+
     async def run(self) -> None:
+        self._install_signals()
         meta = await self.storage.read_persona_meta(self.user_id)
         self.ui.banner(self.user_id, str(meta.get("name") or ""))
         if self._settings.group_mode:
@@ -293,15 +375,26 @@ class App:
                             deadline=self._settings.pair_phrase_deadline_seconds,
                             settings=self._settings))
                     continue
-                await self.turn(line)
+                # 包成任务：Ctrl-C 才只掐这一回合，而不是把整个事件循环打断
+                self._turn_task = asyncio.ensure_future(self.turn(line))
+                try:
+                    await self._turn_task
+                except asyncio.CancelledError:
+                    self.ui.line("  （这一句没说完，算了）")
+                finally:
+                    self._turn_task = None
 
     async def _read_line(self) -> str | None:
-        prompt = "你 ▸ " if not self._settings.group_mode else "群 ▸ "
+        """从键盘取一行。读的那根线程是常驻 daemon 线程（见 `_StdinPump`）：
+        Ctrl-C 不该留下一根堵在 input() 上、退出时非 join 不可的线。"""
+        if self._stdin is None:
+            self._stdin = _StdinPump(self.ui)
+            self._stdin.start()
+        self._stdin.set_prompt("群 ▸ " if self._settings.group_mode else "你 ▸ ")
         try:
-            return await asyncio.to_thread(self.ui.ask, prompt)
-        except KeyboardInterrupt:
-            self.ui.warn("已中断（退出用 Ctrl+D 或 /quit）")
-            return ""
+            return await self._stdin.get()
+        except asyncio.CancelledError:
+            raise
         except Exception as exc:  # noqa: BLE001 - 终端故障不抛 traceback
             logger.debug("读取输入失败", exc_info=True)
             self.ui.error(f"读取输入失败：{exc}")
@@ -316,6 +409,13 @@ class App:
 
     # ------------------------------------------------------------ 一轮对话
     async def turn(self, text: str) -> None:
+        self._busy = True
+        try:
+            return await self._turn_body(text)
+        finally:
+            self._busy = False
+
+    async def _turn_body(self, text: str) -> None:
         speakers = _speakers_of(text) if self._settings.group_mode else None
         words, shots = find_sources(text)
         if shots:
@@ -470,6 +570,10 @@ class App:
             code = self.pairing.plaintext_code(current)
             self.ui.line(f"配对进行中：唯一来源 {current.source_key}，他那份回填码 {format_code(code)}")
             self.ui.line(f"  （码是按来源算的：{current.source_key} 回填才对得上，别人的号填不进来）")
+            if current.source_key != "cli|anon":
+                # 现场踩过：口令在手机上报了，码却抄回命令行——两边都对不上，还以为是坏了
+                self.ui.line(f"  （这一场挂在 {current.source_key} 上：码要发回那个号，"
+                             "在这条命令行里发不算数）")
             self.ui.line(f"  （这一场的口令是「{current.phrase}」，{current.seconds_left()} 秒后作废）")
             return True
         if current is not None:
@@ -1056,10 +1160,26 @@ def main(argv: Sequence[str] | None = None) -> int:
     settings.apply_logging(terminal_info=settings.diagnostics)
     ui = TerminalUI(settings)
     try:
-        return asyncio.run(_amain(settings, args, ui))
+        code = asyncio.run(_amain(settings, args, ui))
     except KeyboardInterrupt:
-        ui.line("已强制退出")
+        ui.line("已中断")
+        _bail(ui)                                  # 不等任何线程：直接走
         return 130
+    except Exception as exc:  # noqa: BLE001 - CLI 不做未处理 traceback
+        logger.debug("CLI 崩了", exc_info=True)
+        ui.error(f"出了点意外：{type(exc).__name__}: {exc}")
+        code = 1
+    with contextlib.suppress(Exception):
+        sys.stdout.flush()
+        sys.stderr.flush()
+    # 读键盘那根 daemon 线程没法被 join，也不该被 join：
+    # 用 os._exit 收尾，解释器退出时就不会再走到 threading 的那一串 join
+    os._exit(code)
+
+
+# 收尾最多等多久。记忆都是原子写落盘的，超时的代价只是「这一段余温没攒上」，
+# 而不是「按了 Ctrl-C 退不掉」——后者才是那截 traceback 的来处
+EXIT_GRACE_SECONDS: Final[float] = 8.0
 
 
 async def _amain(settings: Settings, args: argparse.Namespace, ui: TerminalUI) -> int:
@@ -1072,9 +1192,33 @@ async def _amain(settings: Settings, args: argparse.Namespace, ui: TerminalUI) -
     except (PathSafetyError, StorageError) as exc:
         ui.error(str(exc))
         return 2
-    await app.run()
-    await app.shutdown()
-    return 0
+    interrupted = False
+    try:
+        await app.run()
+    except (KeyboardInterrupt, asyncio.CancelledError):
+        # 掷进事件循环的那一下：别当场散架，先把记忆落盘再走
+        interrupted = True
+        ui.line("已中断，正在收尾…")
+    with contextlib.suppress(ValueError):        # 不在主线程（测试里可能）就不装
+        signal.signal(signal.SIGINT, lambda *_: _bail(ui))
+    try:
+        await asyncio.wait_for(app.shutdown(), timeout=EXIT_GRACE_SECONDS)
+    except asyncio.TimeoutError:
+        ui.warn(f"收尾超过 {EXIT_GRACE_SECONDS:.0f} 秒，不接着等了（该落盘的都已原子落盘）")
+    except (KeyboardInterrupt, asyncio.CancelledError):
+        ui.warn("收尾被打断，不接着等了")
+    except Exception as exc:  # noqa: BLE001 - 收尾失败只少点余温，别甩 traceback
+        logger.debug("收尾没走完", exc_info=True)
+        ui.warn(f"收尾没走完：{type(exc).__name__}")
+    return 130 if interrupted else 0
+
+
+def _bail(ui: TerminalUI) -> None:
+    """硬退出：flush 之后直接走，绕开解释器退出时那一串线程 join。"""
+    with contextlib.suppress(Exception):
+        sys.stdout.flush()
+        sys.stderr.flush()
+    os._exit(130)
 
 
 if __name__ == "__main__":
