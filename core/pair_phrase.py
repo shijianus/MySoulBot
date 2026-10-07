@@ -36,7 +36,8 @@ logger: Final = logging.getLogger("mysoulbot.pairphrase")
 
 __all__ = ["MAX_PHRASE_CHARS", "make_phrase", "make_greeting", "phrase_ok",
            "local_phrase", "short_ask", "code_line", "done_line", "greet_line",
-           "nudge_line", "restart_line", "late_line", "the_box"]
+           "nudge_line", "restart_line", "late_line", "phrase_here_line",
+           "code_there_line", "the_box"]
 
 # 目标 10 字，硬上限 15 字。超过 15 的一律当模型没听懂，走兜底。
 TARGET_PHRASE_CHARS: Final[int] = 10
@@ -181,12 +182,19 @@ def local_phrase(settings: Any = None) -> str:
 
 # 内置应答：话术本读不到时（只读文件系统之类）用它，别让配对卡在「她不知道该说什么」
 _CODE_FALLBACK: Final[str] = ("…这话也就你说得出口。只有你我俩知道的那串码在下一行，"
-                              "{ttl} 秒内原样带回来，过点我就忘了。")
+                              "贴回你启动配对那一头（控制台或面板），{ttl} 秒内，过点我就忘了。")
+# 交码那句必须把人指回控制台。方向说反的模板（老本子里那句「把它还给我」）留着，
+# 只会继续制造「码我发给她了怎么没成」——不合这一条的当它不存在，用内置那句
+_TO_CONSOLE: Final[tuple[str, ...]] = ("控制台", "命令行", "面板", "那头", "贴回")
 _DONE_FALLBACK: Final[str] = "收到了。配对完成——从现在起这台机器归咱俩管，你说，我看着办。"
 _NUDGE_FALLBACK: Final[str] = ("…这串我没当成码。码里不会出现 O、I、0、1 这四个字符，"
                                "把控制台那 {chars} 个原样发来就行。")
 _RESTART_FALLBACK: Final[str] = ("…这串我现在接不了——这一场还没到我报码那一步。"
                                  "控制台上的口令可能换了，看最新那句重新来。")
+_PHRASE_HERE_FALLBACK: Final[str] = ("这句在这儿说不算——它是你从自己那个 QQ 号发给我看的。"
+                                     "拿手机发过来，我再认你。")
+_CODE_THERE_FALLBACK: Final[str] = ("这串不是发给我看的——回你启动配对的那一头"
+                                    "（命令行或面板）贴进去，我在那儿等。")
 _LATE_FALLBACK: Final[str] = ("…我来晚了半步——那一场已经作废了，我这儿没记下任何东西。"
                               "回控制台重新发起一次吧。")
 
@@ -198,9 +206,12 @@ def _fill(text: str, **kw: str) -> str:
 
 
 def code_line(settings: Any, ttl: int) -> str:
-    """交码那段话的前半句（本子怎么说）。码由调用方单列一行——
-    他要原样带回来的就是那一行，混进句子里容易抄漏半个字。"""
-    return _fill(_from_box(settings, "code_line", _CODE_FALLBACK), ttl=str(ttl))
+    """交码那段话（本子怎么说）。码由调用方单列一行——他要贴回控制台的就是那一行，
+    混进句子里容易抄漏半个字。方向说反的模板一律不用。"""
+    text = _from_box(settings, "code_line", _CODE_FALLBACK)
+    if not any(mark in text for mark in _TO_CONSOLE):
+        text = _CODE_FALLBACK
+    return _fill(text, ttl=str(ttl))
 
 
 def done_line(settings: Any) -> str:
@@ -218,6 +229,16 @@ def greet_line(settings: Any) -> str:
 def late_line(settings: Any) -> str:
     """那一场已经过期时说的那句（不作废谁，也不认任何东西——只是别再对着空气发码）。"""
     return _from_box(settings, "late_line", _LATE_FALLBACK)
+
+
+def phrase_here_line(settings: Any) -> str:
+    """口令在控制台上敲了时说的那句（不作废——他只是走错了门）。"""
+    return _from_box(settings, "phrase_here_line", _PHRASE_HERE_FALLBACK)
+
+
+def code_there_line(settings: Any) -> str:
+    """码被发回手机这头时说的那句：那一步在控制台，不认也不作废。"""
+    return _from_box(settings, "code_there_line", _CODE_THERE_FALLBACK)
 
 
 def restart_line(settings: Any) -> str:

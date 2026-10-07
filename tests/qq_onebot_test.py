@@ -3086,25 +3086,28 @@ async def server_checks(check: Checker) -> None:
         shutil.rmtree(root_bad, ignore_errors=True)
 
 
-# ---------------------------------------------------------------- 11. 配对握手（真 socket）
+# ---------------------------------------------------------------- 11. 配对（真 socket）
 async def pairing_checks(check: Checker) -> None:
-    """管理者配对走网桥那一路：口令进来、**码真发得出去**、回填后他先被招呼一句。
+    """管理者配对按流程走一遍：口令 控制台→QQ，码 QQ→控制台。
 
-    这里验的就是那次事故本身：回填码长成 `JKH-5FL` 那个形状，出站那道锁把这个
-    形状整个吃掉，于是手机上永远等不到码。锁该拦的是模型把秘密说出去，
-    不是安全模块自己发出去的回执。
+    验四件事：
+      · 回执里的码真发到了手机上（出站的锁不许吃安全模块自己的回执）；
+      · 码贴回手机这头不算数——那一步在控制台；
+      · 口令被第二个号报了就整场作废，抄码插不进来；
+      · 控制台贴完码即成，绑的是**报口令那一个号**，并且她随后**主动**在 QQ 上打招呼
+        （心跳路过看到字条就送，那是跨进程的那一半：贴码的可能是另一个进程的 CLI）。
     """
-    from core.identity import PairingDesk, candidate_key, derive_code, format_code, read_owner
+    from core.identity import (PairingDesk, candidate_key, consume_pairing, derive_code,
+                               format_code, read_owner)
 
     rig = Rig(owner_enabled=True)
     port = await rig.start()
-    desk = PairingDesk(rig.settings)
+    desk = PairingDesk(rig.settings)          # 另一个「进程」：同一目录，各自实例
     phrase = "塔尖那点光还没灭"
     admin = 1937490685
     stranger = 20002
 
     def _exchange(steps: list[tuple[str, int, int]]) -> list[list[dict[str, Any]]]:
-        """一条连接上走几步：[(文本, 谁的 qq, 消息 id)]，每一步收回来的动作。"""
         client = QQ(port, timeout=30.0)
         try:
             client.handshake("qq-test-token")
@@ -3116,6 +3119,19 @@ async def pairing_checks(check: Checker) -> None:
         finally:
             client.closes()
 
+    def _heartbeat_then_greeting(qq: int, mid: int) -> list[dict[str, Any]]:
+        """发一次心跳，把「该去打招呼」这件事催起来；收回来的动作就是招呼本身。"""
+        client = QQ(port, timeout=30.0)
+        try:
+            client.handshake("qq-test-token")
+            client.send_json({"post_type": "meta_event", "meta_event_type": "heartbeat",
+                              "time": int(time.time()), "self_id": 70001})
+            time.sleep(0.4)
+            client.event(**private_event("（这一句只是让心跳继续跑）", user_id=qq, message_id=mid))
+            return client.pump(20.0)
+        finally:
+            client.closes()
+
     try:
         reset_model()
         quiet_before = model_calls()
@@ -3123,65 +3139,54 @@ async def pairing_checks(check: Checker) -> None:
         code = derive_code(challenge.salt, challenge_id=challenge.id,
                            key=candidate_key("qq_private", str(admin)), chars=6)
         first, second = await asyncio.to_thread(
-            _exchange, [(phrase, admin, 9001), (phrase, stranger, 9002)])
+            _exchange, [(phrase, admin, 9001), (format_code(code), admin, 9002)])
         joined = "\n".join(texts(first))
         check.ok("口令从私聊被截走，回执里的码原样到了手机上",
                  format_code(code) in joined and len(joined) > len(format_code(code)) + 20, joined)
-        check.ok("回执没被出站的锁吃掉（这条就是那次事故）",
-                 "已上锁" not in joined and "〔" not in joined, joined)
-        check.ok("交码那句是她说的话，不是系统腔（有仪式感那条要求）",
-                 "唯一来源确认" not in joined and "✓" not in joined and len(joined) > 20, joined)
-        check.ok("认领这两句一个字都没送进模型", model_calls() == quiet_before,
-                 f"{quiet_before} -> {model_calls()}")
+        check.ok("回执没被出站的锁吃掉（那条事故）", "〔" not in joined and "已上锁" not in joined, joined)
+        check.ok("交码那句是她的话、且指回控制台",
+                 "唯一来源确认" not in joined and "✓" not in joined
+                 and ("贴回" in joined or "那头" in joined or "控制台" in joined), joined)
+        hijack_back = "\n".join(texts(second))
+        check.ok("码贴到手机这头不算：指路，不作废，这一场还在",
+                 "配对完成" not in hijack_back and desk.active() is not None, hijack_back)
+        (third,) = await asyncio.to_thread(_exchange, [(phrase, stranger, 9003)])
         check.ok("第二个号来报口令，整场作废（唯一来源这条不是摆设）",
-                 "作废" in "\n".join(texts(second)), texts(second))
-        check.ok("作废后挑战文件从盘上没了",
-                 not list(rig.settings.pairing_dir.glob("PAIR-*.json")),
-                 [f.name for f in rig.settings.pairing_dir.glob("PAIR-*.json")])
+                 "作废" in "\n".join(texts(third)) and desk.active() is None, texts(third))
 
-        # 同一场里两个号两份码：抄来的那份在别人身上不成立
+        # 重开一场：口令在手机上说，码贴回控制台（这里用同一个 settings 的另一个 desk 代表控制台）
+        desk.sweep()
         challenge = desk.start(channel="cli", phrase=phrase)
         mine = derive_code(challenge.salt, challenge_id=challenge.id,
                            key=candidate_key("qq_private", str(admin)), chars=6)
         theirs = derive_code(challenge.salt, challenge_id=challenge.id,
                              key=candidate_key("qq_private", str(stranger)), chars=6)
         check.ok("同一场里两个号两份码，抄来的不通用", mine != theirs, f"{mine} vs {theirs}")
-        got, hijack = await asyncio.to_thread(
-            _exchange, [(phrase, admin, 9003), (format_code(theirs), stranger, 9004)])
-        check.ok("只有他那一个号看得到他那一份码",
-                 format_code(mine) in "\n".join(texts(got)), texts(got))
-        check.ok("别人拿自己的那份码来插这一场，插不进来",
-                 "配对完成" not in "\n".join(texts(hijack)), texts(hijack))
-        check.ok("插进来失败的这一场已经作废，没留半条活路",
-                 not list(rig.settings.pairing_dir.glob("PAIR-*.json")),
-                 [f.name for f in rig.settings.pairing_dir.glob("PAIR-*.json")])
-
-        # 管理者自己回填：码对了才成，成完之后先招呼一句。
-        # 这里故意用**手机上最容易打出来的那一版**：全角短横（中文输入法默认给的就是它）
-        challenge = desk.start(channel="cli", phrase=phrase)
-        mine = derive_code(challenge.salt, challenge_id=challenge.id,
-                           key=candidate_key("qq_private", str(admin)), chars=6)
-        _, done = await asyncio.to_thread(
-            _exchange, [(phrase, admin, 9005), (format_code(mine).replace("-", "－"), admin, 9006)])
-        lines = texts(done)
-        check.ok("管理者回填自己那份码，配对完成",
-                 any("配对完成" in line for line in lines), lines)
-        check.ok("配完之后主动招呼了一句（回执之外还有别的气泡）",
-                 len([line for line in lines if "配对完成" not in line]) >= 1, lines)
+        await asyncio.to_thread(_exchange, [(phrase, admin, 9004)])
+        done = consume_pairing(desk, format_code(mine), source="cli")   # ← 控制台那头贴回去
         record = read_owner(rig.settings)
-        check.ok("落盘的管理者就是他那个号", record is not None and record.qq == str(admin),
-                 record.binding_key() if record else None)
+        check.ok("码贴回控制台这一步才算成，且绑的是报口令那一个号",
+                 done is not None and "配对完成" in done and record is not None
+                 and record.qq == str(admin), f"{done} / {record.qq if record else '没绑上'}")
+        check.ok("贴码这一步一个字都没惊动模型", model_calls() == quiet_before,
+                 f"{quiet_before} -> {model_calls()}")
+        check.ok("成了之后留了张该打招呼的字条",
+                 [h["qq"] for h in desk.pending_hellos()] == [str(admin)], desk.pending_hellos())
+
+        greeted = await asyncio.to_thread(_heartbeat_then_greeting, admin, 9005)
+        pushes = [f for f in greeted
+                  if f.get("action") == "send_private_msg"
+                  and str(f.get("params", {}).get("user_id")) == str(admin)]
+        said = "\n".join(texts(pushes))
+        check.ok("心跳路过就把招呼送到他手机上（不是固定那句）",
+                 bool(pushes) and len(said) > 4, texts(greeting_only(pushes)) if False else said)
+        check.ok("招呼发出去之后字条销掉了", desk.pending_hellos() == [], desk.pending_hellos())
         check.ok("配对结束后挑战文件被删（不在盘上留凭据）",
                  not list(rig.settings.pairing_dir.glob("PAIR-*.json")),
                  [f.name for f in rig.settings.pairing_dir.glob("PAIR-*.json")])
-        chat_before = model_calls()
-        chatted = await asyncio.to_thread(_exchange, [("今天吃米饭", admin, 9007)])
-        flat = [frame for round_ in chatted for frame in round_]
-        check.ok("配完之后他说的话正常进对话（不再被截走）",
-                 model_calls() == chat_before + 1 and one_turn(flat),
-                 f"{chat_before} -> {model_calls()} / {texts(flat)}")
     finally:
         await rig.stop()
+
 
 # ---------------------------------------------------------------- 主流程
 async def main() -> int:

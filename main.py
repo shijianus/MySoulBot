@@ -568,17 +568,15 @@ class App:
         current = self.pairing.active()
         if current is not None and current.stage == "unique":
             code = self.pairing.plaintext_code(current)
-            self.ui.line(f"配对进行中：唯一来源 {current.source_key}，他那份回填码 {format_code(code)}")
-            self.ui.line(f"  （码是按来源算的：{current.source_key} 回填才对得上，别人的号填不进来）")
-            if current.source_key != "cli|anon":
-                # 现场踩过：口令在手机上报了，码却抄回命令行——两边都对不上，还以为是坏了
-                self.ui.line(f"  （这一场挂在 {current.source_key} 上：码要发回那个号，"
-                             "在这条命令行里发不算数）")
+            self.ui.line(f"配对进行中：口令是 {current.source_key} 报的，他那一份码是 {format_code(code)}")
+            self.ui.line(f"  下一步就一件事：把上面那串码贴回这里（贴错不发紧，贴错一次整场作废）")
+            self.ui.line(f"  （码贴到手机那头去不算——那一步在控制台；口令也只在 {current.source_key} 那儿说过一次）")
             self.ui.line(f"  （这一场的口令是「{current.phrase}」，{current.seconds_left()} 秒后作废）")
             return True
         if current is not None:
             self.ui.line(f"已有一场配对在跑（{current.seconds_left()} 秒后作废）。"
-                         f"把这句发进来：{current.phrase}")
+                         f"把这句从你自己的 QQ 发给机器人：{current.phrase}")
+            self.ui.line("  机器人会回一串码；把那串码**贴回这里**才算完成。")
             return True
         if not settings.owner_enabled:
             self.ui.warn("OWNER_ENABLED=false，分层没开。要配对先在 .env 里打开。")
@@ -596,12 +594,14 @@ class App:
         challenge = self.pairing.start(channel="cli", phrase=phrase)
         self.ui.line(f"配对已开始，{challenge.seconds_left()} 秒内有效，到点自动作废。"
                      f"（口令现拼用了 {spent:.1f} 秒）")
-        self.ui.line(f"  下一步：把下面这句当**普通消息**发进来（一次生成，只此一场）")
-        self.ui.line(f"    【{challenge.phrase}】")
-        self.ui.line(f"  来源必须唯一：同一时间只让一个通道在配（当前 {challenge.channel}）")
-        self.ui.line("  也可以从他手机上完成：同一句口令发进私聊即可，回填码会直接回到那个号。")
-        self.ui.line("  回填码是**按报口令的那个号算出来的**：换个号来填，填不进这一场。")
-        self.ui.line("  码那串怎么发都行：整条气泡粘回来、全角短横、末尾带个句号，我都挑得出来。")
+        self.ui.line("  ① 把下面这句从**你自己的 QQ**发给机器人（在这儿敲不算数）：")
+        self.ui.line(f"      【{challenge.phrase}】")
+        self.ui.line("  ② 机器人会在 QQ 那头回你一串配对码（只回给报口令的那一个号）。")
+        self.ui.line("  ③ 把那串码**贴回这里**再回车 —— 三个方向都对上，这一场才完成。")
+        self.ui.line(f"  来源必须唯一：同一时间只有一个号在配（口令在谁那儿说过，就绑谁）")
+        self.ui.line("  提示：码贴错一次整场作废，重来一遍就行；口令打错她只会当闲聊。")
+        return True
+
         return True
 
     async def _sync(self, arg: str) -> bool:

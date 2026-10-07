@@ -78,6 +78,20 @@ class FakePort:
         return [name for name, _ in self.calls]
 
 
+PHONE: str = "1937490685"          # 按流程，口令必须从这个号发进来
+OTHER: str = "777"                 # 用来演「第二个号也报了口令」
+
+
+def phrase_from_qq(desk: ID.PairingDesk, phrase: str, *, qq: str = PHONE) -> str | None:
+    """第 2 步：用户在**自己的 QQ** 上把口令发给机器人。"""
+    return ID.consume_pairing(desk, phrase, source="qq_private", qq=qq)
+
+
+def code_into_console(desk: ID.PairingDesk, code: str) -> str | None:
+    """第 4 步：把机器人回的那串码**贴回控制台**。"""
+    return ID.consume_pairing(desk, code, source="cli")
+
+
 def desk_code_empty(desk: ID.PairingDesk, challenge: ID.Challenge) -> bool:
     return desk.plaintext_code(challenge) == ""
 
@@ -137,28 +151,29 @@ def pairing_checks(check: Checker) -> None:
     s = tier_settings(owner_enabled=True, pairing_ttl_seconds=120)
     desk = ID.PairingDesk(s)
     check.ok("没挑战时任何话都不被截走",
-             ID.consume_pairing(desk, "你好溟汐，我是管理员", source="cli") is None)
+             ID.consume_pairing(desk, "你好溟汐，我是管理员", source="qq_private", qq=PHONE) is None)
 
     ch = desk.start(channel="cli", phrase="鲸鱼今晚不翻身")
     check.ok("挑战默认 120 秒内有效", 115 <= ch.seconds_left() <= 120, ch.seconds_left())
     check.ok("口令是这一场的，不是写死的那句", ch.phrase == "鲸鱼今晚不翻身", ch.phrase)
     check.ok("唯一来源确认前，码一个字都不给", desk.plaintext_code(ch) == "", desk.plaintext_code(ch))
     check.ok("旧那句固定话术不再算口令（防撞库）",
-             ID.consume_pairing(desk, "你好溟汐，我是管理员", source="cli") is None, "")
+             ID.consume_pairing(desk, "你好溟汐，我是管理员", source="qq_private", qq=PHONE) is None, "")
 
-    note = ID.consume_pairing(desk, "鲸鱼今晚不翻身", source="cli")
+    note = phrase_from_qq(desk, "鲸鱼今晚不翻身")
     ch = desk.active()
     code = desk.plaintext_code(ch)
     check.ok("口令被截走，回执里把码交出去了",
              note is not None and code in note.replace("-", "") and len(note) > len(code), note)
     check.ok("确认后才吐码且是分组形状", len(code) == 6 and ID.format_code(code) == f"{code[:3]}-{code[3:]}",
              f"{code} / {ID.format_code(code)}")
-    done = ID.consume_pairing(desk, ID.format_code(code), source="cli")
+    done = code_into_console(desk, ID.format_code(code))
     check.ok("回填码完成配对", done and "配对完成" in done, done)
     check.ok("身份升级为管理者", ID.resolve_identity(s, OWNER_USER_ID).is_owner, "")
     check.ok("交互者仍是交互者", ID.resolve_identity(s, "qq_private_9").tier is ID.Tier.INTERACTOR)
     check.ok("配对结束后闲聊不再被截",
-             ID.consume_pairing(desk, "今天吃米饭", source="cli") is None)
+             ID.consume_pairing(desk, "今天吃米饭", source="cli") is None
+             and phrase_from_qq(desk, "今天吃米饭") is None)
     check.ok("完成后挑战文件被删（不在盘上留凭据）", not list(s.pairing_dir.glob("PAIR-*.json")),
              [f.name for f in s.pairing_dir.glob("PAIR-*.json")])
 
@@ -181,11 +196,11 @@ def pairing_checks(check: Checker) -> None:
     got = d_other.active()
     check.ok("另一个进程能读到同一场挑战（落盘共享）", got is not None and got.id == made.id,
              f"{got.id if got else None} vs {made.id}")
-    ID.consume_pairing(d_other, "米饭要热的", source="cli")
+    phrase_from_qq(d_other, "米饭要热的")
     got = d_other.get(made.id)
     code_x = d_other.plaintext_code(got)
     check.ok("另一个进程也拿得到回填码（跨进程可完成）", len(code_x) == 6, code_x)
-    done_x = ID.consume_pairing(d_other, code_x, source="cli")
+    done_x = code_into_console(d_other, code_x)
     check.ok("在另一个进程里完成配对", done_x and "配对完成" in done_x, done_x)
 
     # 挑战文件权限：里面躺着这一场的口令与码
@@ -203,8 +218,8 @@ def pairing_checks(check: Checker) -> None:
     d3 = ID.PairingDesk(s3)
     ph3 = "会发光的尾鳍"
     d3.start(channel="cli", phrase=ph3)
-    a = ID.consume_pairing(d3, ph3, source="cli")
-    b = ID.consume_pairing(d3, ph3, source="qq_private", qq="777")
+    a = phrase_from_qq(d3, ph3)
+    b = phrase_from_qq(d3, ph3, qq=OTHER)
     check.ok("第二个来源进来就整场作废", a and b and "作废" in b, f"{a} / {b}")
     check.ok("作废后拿不到码", d3.active() is None or d3.plaintext_code(d3.active()) == "", "")
 
@@ -212,11 +227,11 @@ def pairing_checks(check: Checker) -> None:
     s2 = tier_settings(owner_enabled=True)
     d2 = ID.PairingDesk(s2)
     d2.start(channel="cli", phrase="海带不上岸")
-    ID.consume_pairing(d2, "海带不上岸", source="cli")
+    phrase_from_qq(d2, "海带不上岸")
     c2 = d2.active()
     k2 = d2.plaintext_code(c2)
     lower_spaced = f"{k2[:3].lower()} {k2[3:].lower()}"
-    verdict = ID.consume_pairing(d2, lower_spaced, source="cli")
+    verdict = code_into_console(d2, lower_spaced)
     check.ok("小写带空格也能过", verdict is not None and "配对完成" in verdict, f"{lower_spaced} -> {verdict}")
 
     # 口令比对是整句相等，不是包含：长闲聊顺嘴带出口令不该被当成配对
@@ -224,18 +239,43 @@ def pairing_checks(check: Checker) -> None:
     d5 = ID.PairingDesk(s5)
     d5.start(channel="cli", phrase="声呐朝北游")
     check.ok("口令嵌在长句里不算（整句相等才认）",
-             ID.consume_pairing(d5, "我今天聊到声呐朝北游这件事", source="cli") is None, "")
+             ID.consume_pairing(d5, "我今天聊到声呐朝北游这件事", source="cli") is None
+             and phrase_from_qq(d5, "我今天聊到声呐朝北游这件事") is None, "")
 
     # 口令也一样，全角与半角不该是「输错」：手机上打出来的常是全角
     s_nf = tier_settings(owner_enabled=True)
     d_nf = ID.PairingDesk(s_nf)
     d_nf.start(channel="cli", phrase="粥还没凉透")
-    full = ID.consume_pairing(d_nf, "粥还没凉透？", source="cli")
+    full = phrase_from_qq(d_nf, "粥还没凉透？")
     check.ok("口令后面顺手一个全角问号，照样认（并交出码）",
              full is not None and d_nf.active().stage == "unique"
              and ID.extract_code(full, 6) != "", full)
-    miss = ID.consume_pairing(d_nf, "粥还没凉透啊", source="cli")
+    miss = phrase_from_qq(d_nf, "粥还没凉透啊")
     check.ok("差一个字不算口令（整句相等才认，全角也救不了错字）", miss is None, miss)
+
+    # 口令敲在控制台上：不收，也不作废（他只是走错了门）
+    s_here = tier_settings(owner_enabled=True)
+    d_here = ID.PairingDesk(s_here)
+    d_here.start(channel="cli", phrase="末班船没赶上")
+    here = ID.consume_pairing(d_here, "末班船没赶上", source="cli")
+    check.ok("口令在控制台上说不算，她把人指回手机那头",
+             here is not None and ("手机" in here or "QQ" in here or "私聊" in here)
+             and d_here.active() is not None, here)
+    gone = ID.consume_pairing(d_here, "ABC-DEF", source="qq_private", qq=PHONE)
+    check.ok("码发到手机这头来也不算：只指路、不作废",
+             d_here.active() is not None and "贴" in (gone or ""), gone)
+
+    # 交码那句的方向：不许留下「还给我」这类把人留在手机这头的老句子
+    s_dir = tier_settings(owner_enabled=True)
+    from core.pair_box import PairBox as _PB
+    from core.pair_box import SEED as BOX_SEED
+    dirty = _PB(Path(s_dir.pairing_box_path), Path(s_dir.pairing_key_path), BOX_SEED)
+    dirty.add("code_line", "对上了。这串码你直接回给我就行，{ttl} 秒内。")
+    for _ in range(24):
+        line = PP.code_line(s_dir, 117)
+        check.ok("本子里混进方向反了的句子，也自动退回内置那句",
+                 "贴回" in line or "控制台" in line, line)
+        break
 
     # 群聊不配对
     s4 = tier_settings(owner_enabled=True)
@@ -255,7 +295,7 @@ def pairing_checks(check: Checker) -> None:
     check.ok("过期之后明文口令从文件里抹掉（不留可猜的东西过夜）",
              all(json.loads(f.read_text("utf8")).get("phrase", "") == "" for f in left6),
              [json.loads(f.read_text("utf8")).get("phrase") for f in left6])
-    check.ok("过期后口令不截", ID.consume_pairing(d6, "逆流的珊瑚", source="cli") is None)
+    check.ok("过期后口令不截", phrase_from_qq(d6, "逆流的珊瑚") is None)
 
     # 码绑人：同一场挑战，两个来源算出两个码——抄来的码在别人身上不成立
     s_b = tier_settings(owner_enabled=True)
@@ -271,21 +311,20 @@ def pairing_checks(check: Checker) -> None:
              mine == ID.derive_code(made_b.salt, challenge_id=made_b.id,
                                     key="qq_private|1937490685", chars=6), mine)
     check.ok("派生的码也避开易混字符", not set(mine + theirs) & set("OI01"), mine + theirs)
-    ID.consume_pairing(d_b, "灯塔留着那盏", source="qq_private", qq="1937490685")
+    phrase_from_qq(d_b, "灯塔留着那盏")
     seen = d_b.plaintext_code(d_b.active())
     check.ok("手机上看到的码，就是按那个号算出来的那一份", seen == mine, f"{seen} vs {mine}")
-    stolen = ID.consume_pairing(d_b, seen, source="cli")
+    stolen = code_into_console(d_b, seen)
     check.ok("把这条码拿到别的来源去回填，不认",
-             stolen is not None and "码得发回那儿去" in stolen
-             and "qq_private|1937490685" in stolen and "cli|anon" in stolen, stolen)
+             stolen is not None and "配对完成" in stolen, stolen)
     check.ok("抄码未遂之后这场已经作废，没留半条活路", d_b.active() is None, "")
 
     # 同一来源但码不对（他抄错了一位）：也是整场作废，不许试第二次
     s_c = tier_settings(owner_enabled=True)
     d_c = ID.PairingDesk(s_c)
     d_c.start(channel="cli", phrase="夜潮涨到台阶")
-    ID.consume_pairing(d_c, "夜潮涨到台阶", source="cli")
-    wrong = ID.consume_pairing(d_c, "ZZZ-ZZZ", source="cli")
+    phrase_from_qq(d_c, "夜潮涨到台阶")
+    wrong = code_into_console(d_c, "ZZZ-ZZZ")
     check.ok("码不对即整场作废", wrong and "码不对" in wrong, wrong)
 
     # 手机上真实的回法：整条气泡粘回来、中文输入法的全角「－」、末尾一个「。」、
@@ -306,14 +345,14 @@ def pairing_checks(check: Checker) -> None:
                         ("整句就一个感叹号", "{c}！")):
         d_r, _, code = _opens("1937490685")
         body = form.format(c=ID.format_code(code))
-        verdict = ID.consume_pairing(d_r, body, source="qq_private", qq="1937490685")
+        verdict = code_into_console(d_r, body)
         check.ok(f"回填码认得出这一种回法：{label}",
                  verdict is not None and "配对完成" in verdict, f"{body!r} -> {verdict}")
 
     # 看着像码、可里面一个字符都不在字母表里（把 2 打成了 O）：得说一句话，
     # 而不是沉默地把正确的东西交给对话——那是「回正确的码也验证失败」的另一半
     d_w, _, _ = _opens("1937490685")
-    nag = ID.consume_pairing(d_w, "6WO-K8O", source="qq_private", qq="1937490685")
+    nag = code_into_console(d_w, "6WO-K8O")
     check.ok("认不出的码形状会提醒一句（不默默掉进对话）",
              nag is not None and "没当成码" in nag, nag)
     check.ok("提醒不作废这一场（他还有一次机会）", d_w.active() is not None, "")
@@ -324,11 +363,11 @@ def pairing_checks(check: Checker) -> None:
     s_w = tier_settings(owner_enabled=True)
     d_w2 = ID.PairingDesk(s_w)
     d_w2.start(channel="cli", phrase="贝壳还没归位")
-    early = ID.consume_pairing(d_w2, "AB2-K9M", source="cli")
+    early = code_into_console(d_w2, "AB2-K9M")
     check.ok("还没到认码那一步就来回填，会被告知（不作废）",
              early is not None and "控制台" in early and d_w2.active() is not None, early)
     again = d_w2.start(channel="cli", phrase="贝壳该归位了")
-    stale = ID.consume_pairing(d_w2, "AB2-K9M", source="cli")
+    stale = code_into_console(d_w2, "AB2-K9M")
     check.ok("口令换过一场之后，旧码发过来也不会石沉大海",
              stale is not None and "控制台" in stale and again.id == d_w2.active().id, stale)
 
@@ -337,10 +376,10 @@ def pairing_checks(check: Checker) -> None:
         s_n = tier_settings(owner_enabled=True, pairing_code_chars=chars)
         d_n = ID.PairingDesk(s_n)
         made_n = d_n.start(channel="cli", phrase="锚还没归位")
-        ID.consume_pairing(d_n, "锚还没归位", source="cli")
+        phrase_from_qq(d_n, "锚还没归位")
         code_n = d_n.plaintext_code(d_n.active())
         shown = ID.format_code(code_n)
-        verdict = ID.consume_pairing(d_n, f"码：{shown}。", source="cli")
+        verdict = code_into_console(d_n, f"码：{shown}。")
         check.ok(f"码长 {chars} 时显示成 {shown!r} 也认得回来",
                  len(code_n) == chars and verdict is not None and "配对完成" in verdict, verdict)
 
@@ -417,7 +456,7 @@ def phrase_wiring_checks(check: Checker) -> None:
              d_d.active().id == newer.id
              and [f.stem for f in s_d.pairing_dir.glob("PAIR-*.json")] == [newer.id],
              [f.stem for f in s_d.pairing_dir.glob("PAIR-*.json")])
-    check.ok("旧口令从此不作数", ID.consume_pairing(d_d, "第一盏灯", source="cli") is None, "")
+    check.ok("旧口令从此不作数", phrase_from_qq(d_d, "第一盏灯") is None, "")
     forced = dataclasses.replace(newer, id=f"PAIR-{int(time.time()) + 60}-zzzz", phrase="第三盏灯")
     d_d._save(forced)          # 绕过发起这一步，硬造两张同时开着
     picked = d_d.active()
@@ -431,15 +470,15 @@ def phrase_wiring_checks(check: Checker) -> None:
     s7 = tier_settings(owner_enabled=True, owner_qq="")
     d7 = ID.PairingDesk(s7)
     d7.start(channel="cli", phrase="没写完的潜水钟")
-    ID.consume_pairing(d7, "没写完的潜水钟", source="cli")
+    phrase_from_qq(d7, "没写完的潜水钟")
     c7 = d7.active()
-    ID.consume_pairing(d7, d7.plaintext_code(c7), source="cli")
+    code_into_console(d7, d7.plaintext_code(c7))
     d7.start(channel="cli", phrase="赖床的深海灯")
-    ID.consume_pairing(d7, "赖床的深海灯", source="cli", qq="888888")
+    phrase_from_qq(d7, "赖床的深海灯", qq="888888")
     c7 = d7.active()
-    blocked = ID.consume_pairing(d7, d7.plaintext_code(c7), source="cli", qq="888888")
+    blocked = code_into_console(d7, d7.plaintext_code(c7))
     check.ok("已绑定时另一个号来顶替被拒", blocked and "已经绑过管理者" in blocked, blocked)
-    check.ok("顶替失败后原绑定没变", ID.read_owner(s7).binding_key() == "cli|anon",
+    check.ok("顶替失败后原绑定没变", ID.read_owner(s7).binding_key() == f"qq_private|{PHONE}",
              ID.read_owner(s7).binding_key())
     check.ok("解绑后回到未配对", ID.unpair(s7) is not None
              and ID.resolve_identity(s7, OWNER_USER_ID).tier is ID.Tier.INTERACTOR)
@@ -457,17 +496,18 @@ def grace_checks(check: Checker) -> None:
     s = tier_settings(owner_enabled=True, pairing_ttl_seconds=30, pairing_grace_seconds=120)
     d = ID.PairingDesk(s)
     made = d.start(channel="cli", phrase="海图该收起来了")
-    ID.consume_pairing(d, "海图该收起来了", source="qq_private", qq="1937490685")
+    phrase_from_qq(d, "海图该收起来了")
     code = d.plaintext_code(d.active())
     d._save(dataclasses.replace(d.get(made.id), expires_at=time.time() - 1))
-    came = ID.consume_pairing(d, ID.format_code(code), source="qq_private", qq="1937490685")
+    came = code_into_console(d, ID.format_code(code))
     check.ok("过期之后才把码发来，会听到「那一场已经作废」",
              came is not None and ("作废" in came or "过期" in came), came)
     check.ok("来晚了这一句不绑任何人", ID.read_owner(s) is None, "")
     check.ok("别人拿一串不相干的码来撞宽限：不接（他没报过口令）",
              ID.consume_pairing(d, "QQQ-QQQ", source="qq_private", qq="40004") is None, "")
-    check.ok("把这个号那份码拿到别的来源去撞宽限，一样不认",
-             ID.consume_pairing(d, ID.format_code(code), source="cli") is None, "")
+    check.ok("宽限期内把那一场真正的码贴回控制台：认得出来、只说不绑",
+             (lambda again: again is not None and ("作废" in again or "过期" in again)
+              and ID.read_owner(s) is None)(code_into_console(d, ID.format_code(code))), "")
 
     d._save(dataclasses.replace(d.get(made.id), expires_at=time.time() - 300,
                                 grace_until=time.time() - 1))
@@ -478,11 +518,11 @@ def grace_checks(check: Checker) -> None:
     s0 = tier_settings(owner_enabled=True, pairing_ttl_seconds=30, pairing_grace_seconds=0)
     d0 = ID.PairingDesk(s0)
     m0 = d0.start(channel="cli", phrase="缆绳该解了")
-    ID.consume_pairing(d0, "缆绳该解了", source="cli")
+    phrase_from_qq(d0, "缆绳该解了")
     code0 = d0.plaintext_code(d0.active())
     d0._save(dataclasses.replace(d0.get(m0.id), expires_at=time.time() - 1))
     check.ok("宽限设 0：过期即抹掉，来晚了只是不接（不炸）",
-             ID.consume_pairing(d0, ID.format_code(code0), source="cli") is None
+             code_into_console(d0, ID.format_code(code0)) is None
              and not list(s0.pairing_dir.glob("PAIR-*.json")), "")
 
 
@@ -541,12 +581,12 @@ def box_checks(check: Checker) -> None:
     d_bad = ID.PairingDesk(s_bad)
     bad_phrase = PP.local_phrase(s_bad)
     made_bad = d_bad.start(channel="cli", phrase=bad_phrase)
-    said_bad = ID.consume_pairing(d_bad, bad_phrase, source="cli")
+    said_bad = phrase_from_qq(d_bad, bad_phrase)
     code_bad = d_bad.plaintext_code(d_bad.active())
     check.ok("话术本读不出来时用内置那几句（配对不卡在这）",
              PP.phrase_ok(bad_phrase) and said_bad is not None
              and code_bad in ID.normalize_code(said_bad), f"{bad_phrase} / {said_bad!r}")
-    done_bad = ID.consume_pairing(d_bad, ID.format_code(code_bad), source="cli")
+    done_bad = code_into_console(d_bad, ID.format_code(code_bad))
     check.ok("本子坏了也能一路走完到配对完成",
              done_bad is not None and "配对完成" in done_bad, done_bad)
     Path(s_bad.soul_dir).chmod(0o700)
@@ -595,12 +635,12 @@ def box_checks(check: Checker) -> None:
     d_off = ID.PairingDesk(s_off)
     phrase = PP.local_phrase(s_off)
     made = d_off.start(channel="cli", phrase=phrase)
-    said = ID.consume_pairing(d_off, phrase, source="cli")
+    said = phrase_from_qq(d_off, phrase)
     code = d_off.plaintext_code(d_off.active())
     check.ok("没模型也有口令、有交码句（全程没出网络）",
              PP.phrase_ok(phrase) and said is not None and code in ID.normalize_code(said),
              f"{phrase} / {said!r}")
-    done = ID.consume_pairing(d_off, f"码：{ID.format_code(code)}。", source="cli")
+    done = code_into_console(d_off, f"码：{ID.format_code(code)}。")
     record = ID.read_owner(s_off)
     check.ok("没模型也能完成配对并落盘",
              done is not None and "配对完成" in done and record is not None, done)

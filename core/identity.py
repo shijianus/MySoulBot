@@ -5,17 +5,20 @@
 
 四件事是硬的：
 
-1. **配对只能由人在 CLI/管理面板上发起。** 她自己没有路径调到 `start()`，
-   也不能续期，更不能从提示词或任何工具输出里读到那个码——
-   否则「谁能当主人」就又变成模型说了算。
-2. **唯一来源。** 挑战有效期内，报出激活语的来源必须**恰好一个**。多一个就整场作废、
+1. **两步各走一条通道，方向相反。** 口令在控制台/面板上生成，必须由本人从**他自己的
+   QQ** 发给机器人（在控制台上敲口令不算）；机器人把码回给那个号，再由人**贴回控制台**
+   （贴到 QQ 那头不算）。两个方向都跨过通道，证的才是「会操作这台机器的人 && 那个号的
+   主人」是同一个人才拿得下。她自己没有路径调 `start()`、不能续期，也从提示词或任何
+   工具输出里读不到那个码——否则「谁能当主人」就又变成模型说了算。
+2. **唯一来源。** 挑战有效期内，报出口令的 QQ 来源必须**恰好一个**。多一个就整场作废、
    从头再来：宁可让人多试一次，也不给「谁喊得响谁当主人」留缝。
 3. **群聊不配对。** 群里喊这句话的人可以有一百个，而且那头的真人并不知道自己
-   被一个模型审核过。配对只认一对一的来源。
+   被一个模型审核过。配对只认一对一的私聊。
 4. **码是从「谁来认」算出来的，不是抽出来的。** 一场挑战只有一把主密钥，
-   回填码 = `HMAC(主密钥, 挑战 id | 来源 key)`：同一个来源每次算出同一个码，
-   不同来源算出不同的码。所以别人即使看见了这条码，从他那个来源也填不进来——
-   码本身就是身份的函数。主密钥以 0600 落盘（跨进程要能算），2 分钟过期即删。
+   码 = `HMAC(主密钥, 挑战 id | 来源 key)`：同一个号每次算出同一个码，
+   换个号就是另一串。所以别人即使看见了这条码，从他那儿也填不进这一场。
+   主密钥以 0600 落盘（跨进程要能算），2 分钟过期，过期后再留 2 分钟只用来
+   认一句「你来晚了」——口令当场抹掉，宽限一过整张删除。
 
 分层落到目录上就是两棵树：`storage/data/owner/` 与 `storage/data/users/`。
 交互者那条路径上的任何工具、检索、白名单都够不到另一棵——越界与否由路径本身决定，
@@ -41,8 +44,11 @@ from pathlib import Path
 from typing import Any, Final
 
 from config import OWNER_USER_ID as _OWNER_ID, Settings
-from core.pair_phrase import code_line as _code_line, done_line as _done_line
+from core.pair_phrase import code_line as _code_line
+from core.pair_phrase import code_there_line as _code_there_line
+from core.pair_phrase import done_line as _done_line
 from core.pair_phrase import nudge_line as _nudge_line
+from core.pair_phrase import phrase_here_line as _phrase_here_line
 from core.pair_phrase import late_line as _late_line
 from core.pair_phrase import restart_line as _restart_line
 from core.storage_manager import atomic_write
@@ -79,6 +85,10 @@ _CODEISH: Final[re.Pattern[str]] = re.compile(
 _STRIP: Final[re.Pattern[str]] = re.compile(r"[\s\-_·．.,，。!！?？]+")
 _CODE_STRIP: Final[re.Pattern[str]] = re.compile(r"[^A-Z0-9]")
 
+# 配对的两条通道：口令只能从 QQ 私聊进来，码只能贴回控制台。
+# 两个方向各跨一次通道，证的才是「控制台前这个人 && 那个 QQ 号的主人」是同一个人才拿得下：
+# 口令 控制台→QQ（他有机器权限、也把话送进了那个号），码 QQ→控制台（号上看到的字回到了机器这头）。
+_CONSOLE: Final[frozenset[str]] = frozenset({"cli", "panel", "dashboard"})
 # 挑战的三个阶段：等激活语 → 已确认唯一来源（此时才敢把码念出来）→ 终态
 _STAGE_OPEN: Final[frozenset[str]] = frozenset({"waiting", "unique"})
 
@@ -272,7 +282,8 @@ def unpair(settings: Settings) -> OwnerRecord | None:
         settings.owner_record_path.unlink()
     except FileNotFoundError:
         return None
-    for stale in settings.pairing_dir.glob("PAIR-*.json"):
+    for stale in list(settings.pairing_dir.glob("PAIR-*.json")) + list(
+            settings.pairing_dir.glob("HELLO-*.json")):
         try:
             stale.unlink()
         except OSError:
@@ -294,13 +305,18 @@ def consume_pairing(desk: "PairingDesk", text: str, *, source: str,
     challenge = desk.active()
     if challenge is None:
         # 没有开着的挑战，但不该继续装没看见：他可能就是晚了那么几秒
-        if desk.late_attempt(text or "", source=source, qq=qq):
+        if desk.late_attempt(text or ""):
             return desk.ceremony.late_line()
         return None
     body = (text or "").strip()
     key = candidate_key(source, qq)
 
+    console = source in _CONSOLE
     if phrase_matches(body, challenge.phrase):
+        if console:
+            # 口令在这儿敲不算：那样等于「谁能碰控制台谁就是主人」，
+            # 而这一场要额外证明的是那个 QQ 号也在同一双手里
+            return desk.ceremony.phrase_here_line()
         challenge = desk.present(source=source, qq=qq) or challenge
         unique, keys = desk.check_unique(challenge)
         if not unique:
@@ -312,21 +328,24 @@ def consume_pairing(desk: "PairingDesk", text: str, *, source: str,
         if not code:
             return "…（这一场的码已经不在生效的范围里了，重来一次）"
         # 仪式感在这儿：话是她接下去说的——本子在那盘密文里，AI 全断了也有得说，
-        # 而且模型读不到它。最后一行单独是那串码：他要原样带回来的就是这一行，
-        # 混在句子里反而容易抄漏半个字（那是上一轮「回正确的码也验证失败」的一半原因）
+        # 而且模型读不到它。码单列一行：那是要**贴回控制台**的，混进句子里容易抄漏
         return desk.ceremony.code_line(challenge.seconds_left()) + "\n" + format_code(code)
 
-    # 回填码：只在唯一来源已确认之后才认。码是从整句话里挑的（见 extract_code），
-    # 所以「码：XXX-YYY。」「整条气泡粘回来」这些真实回法都还能完成配对
+    # 回填码：只在唯一来源已确认之后才认，而且只认控制台那头发来的。
+    # 码是从整句话里挑的（见 extract_code），所以「码：XXX-YYY。」「整条气泡粘回来」
+    # 这些真实回法都还能用
     attempt = extract_code(body, desk.code_chars)
-    if challenge.stage != "unique" and attempt:
+    if attempt and not console:
+        # 他把码发到手机这头来了——那一步在控制台，无论走到哪儿都不该我收
+        return desk.ceremony.code_there_line()
+    if attempt and challenge.stage != "unique":
         # 他确实是在回填，只是这一场还在等口令——多半是控制台又 /pair 了一次（口令换了），
         # 或者过期后重开过。这一路最怕沉默：他以为自己发了、她以为没收到
         return desk.ceremony.restart_line()
-    if challenge.stage == "unique":
+    if challenge.stage == "unique" and console:
         if attempt:
             try:
-                record = desk.submit_code(challenge, attempt, source=source, qq=qq)
+                record = desk.submit_code(challenge, attempt)
             except PairingError as exc:
                 return f"✗ {exc}"
             # 招呼语不在这一层生成：安全模块不该依赖大模型调用。
@@ -334,7 +353,7 @@ def consume_pairing(desk: "PairingDesk", text: str, *, source: str,
             # 「配对完成」这四个字留在句子里——它是调用方的信号
             return (f"{desk.ceremony.done_line()}\n"
                     f"  （记下了：{record.qq or record.binding_key()} · {record.paired_at}）")
-        if key == challenge.source_key and _CODEISH.search(unicodedata.normalize("NFKC", body)):
+        if _CODEISH.search(unicodedata.normalize("NFKC", body)):
             # 他大概率是在回填，只是那串里没有我能认的字符（O/I/0/1 不进字母表）。
             # 沉默地把它交给对话，就是他说的「回正确的码也验证失败」
             return desk.ceremony.nudge_line()
@@ -350,9 +369,9 @@ class Challenge:
     """一场配对。口令与主密钥以明文落盘，但文件权限锁到 0600。
 
     为什么把明文写进文件而不是只留在内存：守护进程和 CLI 是**两个进程**，
-    只活在内存里就意味着「CLI 发起、手机上回填」这条路永远走不通——
-    而管理者真正会说话的地方就是他的手机。落盘 + 0600 + 2 分钟过期 +
-    完成即删，换来的是跨进程可完成，代价是可控的。
+    而这一场天生要跨两个进程走完——口令从他手机上发进来（只有网桥那个进程看得见），
+    码贴回控制台（只有那个进程在听键盘）。只活在内存里，这条路一步都走不通。
+    落盘 + 0600 + 2 分钟过期 + 完成即删，换来的是跨进程可完成，代价是可控的。
 
     盘上没有现成的码，只有算码的那把主密钥：读文件的人能为任意来源算出码，
     但拿到聊天里那条码的人反过来推不出别的来源的码——抄来的码在别人身上不成立。
@@ -410,6 +429,12 @@ class _Ceremony:
 
     def restart_line(self) -> str:
         return _restart_line(self._settings)
+
+    def phrase_here_line(self) -> str:
+        return _phrase_here_line(self._settings)
+
+    def code_there_line(self) -> str:
+        return _code_there_line(self._settings)
 
     def late_line(self) -> str:
         return _late_line(self._settings)
@@ -525,13 +550,16 @@ class PairingDesk:
             with contextlib.suppress(OSError):
                 self._path(challenge.id).unlink()
 
-    def late_attempt(self, text: str, *, source: str, qq: str = "") -> str:
-        """没有开着的挑战时，看这一句是不是**上一场来晚了**的码。是就返回那一场的 id。"""
+    def late_attempt(self, text: str) -> str:
+        """没有开着的挑战时，看这一句是不是**上一场来晚了**的码。是就返回那一场的 id。
+
+        比的是「那一场登记过的来源」派生出来的码——贴码的人本来就在控制台这头，
+        他的键跟口令来源不是一回事（口令从 QQ 进来，码从控制台回去）。
+        """
         chars = self.code_chars
         attempt = extract_code(text or "", chars)
         if not attempt:
             return ""
-        key = candidate_key(source, qq)
         now = time.time()
         if not self.directory.is_dir():
             return ""
@@ -545,12 +573,11 @@ class PairingDesk:
                 with contextlib.suppress(OSError):
                     path.unlink()
                 continue
-            if key not in challenge.candidates:
-                continue
-            expected = derive_code(challenge.salt, challenge_id=challenge.id, key=key,
-                                   chars=chars)
-            if hmac.compare_digest(expected, attempt):
-                return challenge.id
+            for key in challenge.candidates:
+                expected = derive_code(challenge.salt, challenge_id=challenge.id,
+                                       key=key, chars=chars)
+                if hmac.compare_digest(expected, attempt):
+                    return challenge.id
         return ""
 
     def active(self) -> Challenge | None:
@@ -583,6 +610,46 @@ class PairingDesk:
                 self.void(challenge.id)
                 cleared += 1
         return cleared
+
+    # ---------------------------------------------------------- 招呼字条（跨进程）
+    def _hello_path(self, qq: str) -> Path:
+        safe = re.sub(r"[^A-Za-z0-9\-]", "", str(qq or "")) or "anon"
+        return self.directory / f"HELLO-{safe}.json"
+
+    def _leave_hello(self, source: str, qq: str, challenge_id: str) -> None:
+        if source != "qq_private" or not qq:
+            return                             # 本机命令行上绑的，没有 QQ 可打招呼
+        self.directory.mkdir(parents=True, exist_ok=True)
+        note = {"qq": qq, "at": _stamp(), "challenge": challenge_id, "born": _now()}
+        path = self._hello_path(qq)
+        atomic_write(path, json.dumps(note, ensure_ascii=False, indent=2) + "\n")
+        with contextlib.suppress(OSError):
+            path.chmod(0o600)
+
+    def pending_hellos(self, max_age: float = 600.0) -> list[dict[str, Any]]:
+        """还没送出去的招呼。过期的直接抹掉——那场配对早就翻篇了。"""
+        if not self.directory.is_dir():
+            return []
+        out: list[dict[str, Any]] = []
+        for path in sorted(self.directory.glob("HELLO-*.json")):
+            try:
+                raw: dict[str, Any] = json.loads(path.read_text("utf8"))
+            except (json.JSONDecodeError, OSError):
+                with contextlib.suppress(OSError):
+                    path.unlink()
+                continue
+            if not isinstance(raw, dict) or _now() - float(raw.get("born") or 0) > max_age:
+                with contextlib.suppress(OSError):
+                    path.unlink()
+                continue
+            qq = str(raw.get("qq") or "")
+            if qq:
+                out.append({"qq": qq, "at": str(raw.get("at") or "")})
+        return out
+
+    def ack_hello(self, qq: str) -> None:
+        with contextlib.suppress(OSError):
+            self._hello_path(qq).unlink()
 
     def void(self, challenge_id: str) -> Challenge | None:
         challenge = self._load(challenge_id)
@@ -618,9 +685,13 @@ class PairingDesk:
         return True, keys
 
     # ------------------------------------------------------------ 第二步：回填码
-    def submit_code(self, challenge: Challenge, code: str, *, source: str,
-                    qq: str = "") -> OwnerRecord:
-        """码对了才升级成管理者。答错即作废，必须从头再来。"""
+    def submit_code(self, challenge: Challenge, code: str) -> OwnerRecord:
+        """把码贴回控制台才算数。码不对即作废，必须从头再来。
+
+        认的是**那一个 QQ 来源派生出来的码**（口令是谁报的，就绑谁），
+        所以提交者是谁不重要——能往这头打字的人本来就有机器权限，
+        这一场要证的是他同时拿着那个号。
+        """
         if challenge.stage not in ("waiting", "unique"):
             raise PairingError("这场配对已经结束了，重新发起一次")
         if not challenge.alive():
@@ -630,23 +701,16 @@ class PairingDesk:
         unique, keys = self.check_unique(challenge)
         if not unique:
             raise PairingError(
-                f"报激活语的来源有 {len(keys)} 个，这场作废了"
-                if keys else "还没人报激活语——控制台上的那句口令，原样发进来")
+                f"报口令的来源有 {len(keys)} 个，这场作废了"
+                if keys else "还没人报口令——把控制台那句口令发到你的 QQ 上")
 
         key = keys[0]
-        # 比的是**整把键**，不是只比通道名：同是 qq_private，换一个号就不是同一个人。
-        # 原来只比 `source` 前缀，等于「A 号报了口令，B 号抄到码就能认领」
-        if key != candidate_key(source, qq):
+        if key in _CONSOLE or key.startswith("cli|"):
             self.void(challenge.id)
-            raise PairingError(
-                f"这一场的口令是 {key} 报的，码得发回那儿去才算你——"
-                f"你现在从 {candidate_key(source, qq)} 发来，对不上。"
-                f"想在这头绑，就回控制台重新 /pair，口令也在这头说")
-
+            raise PairingError("口令得从那个 QQ 号发到机器人那儿去，在控制台上说不算")
         attempt = normalize_code(code)
         challenge.attempts += 1
-        # 码是**按 key 算出来的**：只有当初报激活语的那一个来源算得出他这一份。
-        # 别人抄到这条码，从他自己的来源回填也对不上
+        # 码是按 key 算的：手机上看到的那一份，只有这一场那一个号对得上
         expected = derive_code(challenge.salt, challenge_id=challenge.id, key=key,
                                chars=self._settings.pairing_code_chars)
         right = bool(attempt) and hmac.compare_digest(expected, attempt)
@@ -655,23 +719,27 @@ class PairingDesk:
             raise PairingError("码不对，这场作废了——从头再来")
 
         record = read_owner(self._settings) or OwnerRecord()
-        qq = key.partition("|")[2]
-        qq = "" if qq == "anon" else qq
+        bound_source, _, bound_qq = key.partition("|")
+        qq = "" if bound_qq == "anon" else bound_qq
         # 「一个机器人只有一个管理者」要比来源，不能只比 QQ 号：
         # 先在本机命令行上绑过（qq 为空）再拿某个 QQ 号来，是同一场顶替——
         # 只查 `record.qq` 的话那条判断永远不成立，等于没闸。
-        claimed = key
+        claimed = key                       # 绑的是报口令那一个号，不是敲码这台键盘
         if record.paired_at and record.binding_key() != claimed:
             raise PairingError(f"已经绑过管理者（{record.binding_key()}）。一个机器人只有一个，"
                                "要换先在命令行上解绑")
         record.qq = qq or record.qq
-        record.source = source
+        record.source = bound_source
         record.user_id = OWNER_USER_ID
         record.paired_at = _stamp()
-        record.history.append({"at": record.paired_at, "source": source, "qq": record.qq})
+        record.history.append({"at": record.paired_at, "source": record.source, "qq": record.qq})
         write_owner(self._settings, record)
         challenge.stage = "verified"
         with contextlib.suppress(OSError):
             self._path(challenge.id).unlink()   # 用完即删，不在盘上留凭据
-        logger.info("管理者配对成功：%s（来源 %s）", record.qq or "本机", source)
+        # 码是在控制台这头贴进来的，可「我认出你了」那一句得从 QQ 那头说——
+        # 而能发 QQ 的是另一个进程。留一张字条，网桥下次心跳看见就去打招呼，
+        # 发成功才销掉（没发出去就还在那儿，下回再试）
+        self._leave_hello(bound_source, qq, challenge.id)
+        logger.info("管理者配对成功：%s（来源 %s）", record.qq or "本机", record.source)
         return record

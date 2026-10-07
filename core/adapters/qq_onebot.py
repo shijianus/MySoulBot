@@ -1609,10 +1609,51 @@ class OneBotBridge:
         if self._settings.onebot_apply_profile_on_boot and not self._profile_pushed:
             self._profile_pushed = True
             connection.track(self.apply_profile(reason="boot"))
+        # 码是在控制台那头贴进来的，招呼却得从这头说：字条是 core/identity 留的，
+        # 心跳路过就送去（先 glob 一下，没字条不起趟）
+        if self._pairing.pending_hellos():
+            connection.track(self._drain_hellos(connection))
         if self.bot_names or self._whoami_tries >= 3:
             return
         self._whoami_tries += 1
         connection.track(self._whoami(connection))
+
+    async def _push_text(self, connection: _Connection, qq: str, text: str) -> bool:
+        """没有来话可回的时候，主动往某个号发一条私聊。"""
+        body = self._outbound_filter(text).strip()
+        if not body:
+            return False
+        answered, reply = await self._request(
+            connection, "send_private_msg",
+            {"user_id": _as_id(qq) or qq, "message": [{"type": "text", "data": {"text": body}}]},
+            timeout=8.0)
+        ok = bool(answered) and int((reply or {}).get("retcode", -1) or 0) == 0
+        if not ok:
+            # 协议端没接这条不算引擎出错：那是「这会儿递不出去」，字条留着下回再试
+            logger.info("主动招呼没送到 %s（%s）", qq, "没答话" if not answered else str(reply)[:60])
+        return ok
+
+    async def _drain_hellos(self, connection: _Connection) -> None:
+        """配对是在控制台那头完成的 → 这头补上「我认出你了」那一句。
+
+        发成功才销条。协议端不在或者那条号发不出去，字条留着，下次心跳再试
+        （字条本身有 10 分钟有效期，不会一直挂着）。
+        """
+        if not connection.alive:
+            return
+        for hello in self._pairing.pending_hellos():
+            qq = hello["qq"]
+            greet = await make_greeting(short_ask(self._bot.ask_once, self._settings),
+                                        deadline=self._settings.pair_phrase_deadline_seconds,
+                                        settings=self._settings)
+            if not await self._push_text(connection, qq, greet):
+                continue
+            self._pairing.ack_hello(qq)
+            logger.info("配对后的招呼已送到 %s", qq)
+            await self._type_pause()
+            tools = await self._owner_capability_line(f"qq_private_{qq}")
+            if tools:
+                await self._push_text(connection, qq, tools)
 
     async def _whoami(self, connection: _Connection) -> None:
         data = await self._call(connection, "get_login_info", {}, timeout=_LOGIN_TIMEOUT)
@@ -1624,10 +1665,10 @@ class OneBotBridge:
             self.bot_names = (nickname, *self.bot_names)
         logger.info("协议端报来的身份：%s（%s）", nickname or "无名", self.bot_id or "未知号")
 
-    async def _owner_capability_line(self, inbound: Inbound) -> str:
+    async def _owner_capability_line(self, user_id: str) -> str:
         """配对成功后告诉她自己：现在手上多了哪些活。用真实注册表数，不写死。"""
         try:
-            registry = self._bot.registry(inbound.engine_user_id)
+            registry = self._bot.registry(user_id)
         except Exception:  # noqa: BLE001 - 自述失败不影响配对本身成立
             return ""
         names = [name for name in registry.names if name.startswith("qq_")]
@@ -1774,7 +1815,7 @@ class OneBotBridge:
                     settings=self._settings)
                 await self._type_pause()
                 await self._send_bubble(connection, inbound, greet)
-                tools = await self._owner_capability_line(inbound)
+                tools = await self._owner_capability_line(inbound.engine_user_id)
                 if tools:
                     await self._type_pause()
                     await self._send_bubble(connection, inbound, tools)
