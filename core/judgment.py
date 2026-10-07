@@ -17,6 +17,10 @@
    提示词是稀缺资源，写满等于没写。
 3. **只认量得出的信号。** 对面回没回、隔多久、多长、有没有接着问——
    这些从逐轮日志里数得出来。「她今天心情不好」这种数不出来的东西不进门。
+4. **「没回」必须被主动量出来。** 只在对面开口那一刻记账的话，`replied` 永远是
+   真的、接话率永远 100%——那本册子会拿假统计攒出「没人理我也要把话说透」这种
+   被伪数据撑腰的规则。所以每一句说出去的话先挂在 `_pending` 里等结果：
+   等来了话就记「接住」，等超时了就记「被晾着」（见 `track_reply` / `sweep_silence`）。
 
 模型只负责把统计出来的事实**说成人话规则**；事实本身由 `observe()` 算，
 不由模型回忆——模型记不准自己上上次说过多长。
@@ -25,24 +29,33 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import fcntl
 import json
 import logging
 import re
 import time
+from collections import deque
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Final
+from typing import Any, Final, Iterator
 
 from config import Settings
 from core.storage_manager import StorageManager, atomic_write
 
 logger: Final = logging.getLogger("mysoulbot.judgment")
 
-__all__ = ["Outcome", "Rule", "JudgmentLedger", "JudgmentLoop", "observe"]
+__all__ = ["Outcome", "Rule", "OpenReply", "JudgmentLedger", "JudgmentLoop", "observe"]
 
 _MAX_RULES: Final[int] = 12
 _LINE_CHARS: Final[int] = 140
+# `_PROMPT` 让模型把正文压在 60 字内，但那只是请求、不是强制。
+# 收进来这一步得自己封顶：一句 140 字的「判断」进提示词，挤掉的是一段真话。
+_RULE_CHARS: Final[int] = 96
+# 掉到这条线以下的判断在下一趟 `apply` 里退场。原来 `reinforce` 自己会删条：
+# 一次打脸就足以把一条 20 分上下的判断静默抹掉，册子于是变成「谁最巧谁活」。
+_RETIRE_CONFIDENCE: Final[int] = 15
 _RULE_RE: Final[re.Pattern[str]] = re.compile(
     r"^- (?P<text>[^\[\]]+?)\s*\[k=(?P<kind>\w+) c=(?P<conf>\d{1,3}) n=(?P<seen>\d+)\]$")
 # 判据不许写成一句口号：这些词一出现就说明它在表态而不是在给标准
@@ -101,6 +114,36 @@ def observe(*, user_id: str, our_text: str, our_bubbles: int,
 
 
 @dataclass
+class OpenReply:
+    """她说完了、还没等到结果的那一句。挂着，事后结掉。
+
+    为什么要单独一个结构而不是当场记账：这一层的信号有一半是「没发生的事」，
+    而没发生的事不会触发任何调用——不主动去收，「被晾着」这一格就永远是空的。
+    """
+
+    user_id: str
+    started_at: float
+    our_chars: int
+    our_bubbles: int = 1
+    group: bool = False
+    woke_us: bool = False
+    rapport_delta: int = 0
+
+
+def _close(item: OpenReply, *, their_text: str, at: float, replied: bool) -> Outcome:
+    """把挂着的那一句结掉：接住了，还是没接。"""
+    their = (their_text or "").strip()
+    return Outcome(
+        user_id=item.user_id, at=at,
+        our_chars=item.our_chars, our_bubbles=item.our_bubbles,
+        their_chars=len(their), replied=replied,
+        reply_seconds=max(0.0, at - item.started_at),
+        asked_back=bool(replied and ("?" in their or "？" in their)),
+        group=item.group, woke_us=item.woke_us, rapport_delta=item.rapport_delta,
+    )
+
+
+@dataclass
 class Rule:
     """一条判断标准。带出处、带置信度、带最后确认时间——不然它只是一句口号。"""
 
@@ -153,8 +196,7 @@ class Stats:
         lines = [
             f"最近 {self.turns} 轮：接话率 {rate}%，接住率 {land}%，"
             f"说多了 {self.over_talked} 次，被晾 {self.slow} 次，对方回问 {self.asked_back} 次",
-            f"我方平均 {self.avg_our_chars:.0f} 字，对方平均 {self.avg_their_chars:.0f} 字，"
-            f"熟络度净变化 {self.rapport_delta:+d}",
+            f"我方平均 {self.avg_our_chars:.0f} 字，对方平均 {self.avg_their_chars:.0f} 字",
         ]
         for uid, bucket in sorted(self.per_user.items())[:6]:
             lines.append(f"  {uid}: {bucket.get('turns', 0)} 轮，"
@@ -163,7 +205,7 @@ class Stats:
 
 
 class JudgmentLedger:
-    """`storage/soul/JUDGMENT.md` 的读写。纯 md、固定不动偏差，是后端的地基。"""
+    """`storage/soul/JUDGMENT.md` 的读写。纯 md、固定不动偏差，是后端的地皮。"""
 
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
@@ -171,6 +213,31 @@ class JudgmentLedger:
     @property
     def path(self) -> Path:
         return self._settings.judgment_path
+
+    @contextlib.contextmanager
+    def _locked(self) -> Iterator[None]:
+        """跨进程互斥。控制台那头和守护进程那头共用这一本册子。
+
+        为什么在这里自己拿 flock 而不走 `StorageManager._critical`：那把锁是 async 的，
+        而 `read_text()` 在提示词装配的同步段里被调用（`prompt_builder.py:599`）——
+        为了塞进一把锁把整条读取链改成 async，代价比这笔买卖大。
+        临界区只有几 KB 的读写，和 `atomic_write` 自己在事件循环里 fsync 是同一量级。
+        """
+        lock_path = self.path.with_name(f".{self.path.name}.lock")
+        handle = None
+        try:
+            lock_path.parent.mkdir(parents=True, exist_ok=True)
+            handle = open(lock_path, "w", encoding="utf8")  # noqa: SIM115 - 交给 finally
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        except OSError:
+            handle = None                      # 拿不到锁不拦她说话：册子照常读写
+        try:
+            yield
+        finally:
+            if handle is not None:
+                with contextlib.suppress(OSError):
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+                    handle.close()
 
     def rules(self) -> list[Rule]:
         if not self.path.is_file():
@@ -202,54 +269,71 @@ class JudgmentLedger:
         body = "\n".join(rule.line() for rule in rules) or "（还没有攒出判断——刚开张。）"
         atomic_write(self.path, head + body + "\n")
 
+    def seed(self) -> bool:
+        """册子还不存在时先立一个空壳。返回是否真的新建了。
+
+        空文件比缺文件诚实：这一层要能在 `git status` 里看见，
+        才谈得上「她真的在改自己」，而不是某句写在人格里的自我宣称。
+        """
+        if self.path.is_file():
+            return False
+        self._write([])
+        return True
+
     def apply(self, proposed: list[Rule]) -> tuple[int, int]:
         """把新提的判断并进去：同一条加置信度，冲突的挤掉最弱的，总量封顶。
 
         返回 (新增, 更替/退掉)。这里刻意不做「只追加」——
         只追加的册子三个月后就是一本没人读的经书。
+        退场也只在这一步发生：`reinforce` 只改分不删条，删条得连着统计一起走，
+        免得一次打脸就把一条刚攒起来的判断静默抹掉。
         """
-        existing = self.rules()
-        index = {rule.text: rule for rule in existing}
-        added = revised = 0
-        for incoming in proposed:
-            text = incoming.text.strip()
-            if not text or _VAGUE.match(text):
-                continue
-            twin = next((key for key in index if _similar(key, text)), "")
-            if twin:
-                kept = index[twin]
-                kept.confidence = min(100, kept.confidence + 10)
-                kept.seen += 1
-                kept.updated_at = time.time()
-                revised += 1
-            else:
-                fresh = Rule(text=text[:_LINE_CHARS], kind=incoming.kind,
-                             confidence=max(35, min(70, incoming.confidence)), seen=1)
-                index[fresh.text] = fresh
-                added += 1
-        merged = sorted(index.values(), key=lambda r: (r.confidence, r.seen, r.updated_at), reverse=True)
-        dropped = max(0, len(merged) - _MAX_RULES)
-        self._write(merged[:_MAX_RULES])
+        with self._locked():
+            existing = self.rules()
+            index = {rule.text: rule for rule in existing}
+            added = revised = 0
+            for incoming in proposed:
+                text = incoming.text.strip()
+                if not text or _VAGUE.match(text) or len(text) > _RULE_CHARS:
+                    continue
+                twin = next((key for key in index if _similar(key, text)), "")
+                if twin:
+                    kept = index[twin]
+                    kept.confidence = min(100, kept.confidence + 10)
+                    kept.seen += 1
+                    kept.updated_at = time.time()
+                    revised += 1
+                else:
+                    fresh = Rule(text=text[:_LINE_CHARS], kind=incoming.kind,
+                                 confidence=max(35, min(70, incoming.confidence)), seen=1)
+                    index[fresh.text] = fresh
+                    added += 1
+            alive = [rule for rule in index.values() if rule.confidence >= _RETIRE_CONFIDENCE]
+            merged = sorted(alive, key=lambda r: (r.confidence, r.seen, r.updated_at), reverse=True)
+            dropped = len(index) - len(merged)
+            dropped += max(0, len(merged) - _MAX_RULES)
+            self._write(merged[:_MAX_RULES])
         return added, revised + dropped
 
     def reinforce(self, outcome: Outcome) -> None:
         """拿新观测去核对旧判断：支持的加分，打脸的扣分。册子因此才会自己动。"""
-        rules = self.rules()
-        if not rules:
-            return
-        changed = False
-        for rule in rules:
-            hit = _supports(rule, outcome)
-            if hit is True:
-                rule.confidence = min(100, rule.confidence + 4)
-                rule.seen += 1
-                changed = True
-            elif hit is False:
-                rule.confidence = max(0, rule.confidence - 6)
-                changed = True
-        keep = [rule for rule in rules if rule.confidence >= 20]
-        if changed:
-            self._write(keep)
+        with self._locked():
+            rules = self.rules()
+            if not rules:
+                return
+            changed = False
+            for rule in rules:
+                hit = _supports(rule, outcome)
+                if hit is True:
+                    rule.confidence = min(100, rule.confidence + 4)
+                    rule.seen += 1
+                    changed = True
+                elif hit is False:
+                    rule.confidence = max(0, rule.confidence - 6)
+                    changed = True
+            if changed:
+                # 全量写回，不在这一步删条：退场由 apply 的置信度下限统一裁
+                self._write(rules)
 
     def stats(self, window: list[Outcome]) -> Stats:
         if not window:
@@ -288,18 +372,23 @@ def _similar(left: str, right: str) -> bool:
 
 
 def _supports(rule: Rule, outcome: Outcome) -> bool | None:
-    """这条判断和这次观测是同向、反向，还是不相干。"""
+    """这条判断和这次观测是同向、反向，还是不相干。
+
+    顺序按「特殊到一般」排：一句带「长」又带「问」的判断，先按长短算——
+    原来 `"问"` 这一支排在群/慢之前，等于把一条讲篇幅的判断拿去对上回没回问，
+    同一条规则会被两个不相干的信号来回打分。
+    """
     text = rule.text
     if "长" in text and ("晾" in text or "没人看" in text or "嫌多" in text or "说多" in text):
         return outcome.over_talked if outcome.replied else None
     if "短" in text and ("接" in text or "回" in text):
         return outcome.landed if outcome.replied else None
-    if "问" in text:
-        return outcome.asked_back
     if "群" in text:
         return (not outcome.group) if outcome.replied else None
     if "慢" in text or "等" in text:
         return not outcome.slow
+    if "问" in text:
+        return outcome.asked_back
     return None
 
 
@@ -326,22 +415,80 @@ class JudgmentLoop:
         self._storage = storage
         self.ledger = ledger or JudgmentLedger(settings)
         self._window: list[Outcome] = []
+        # 不动的流水（最多 120 条）：给试验期对比、给控制台「她最近怎么样」看
+        self._trail: deque[Outcome] = deque(maxlen=120)
+        # 说出去还没等到结果的那些话：user_id → 那一句
+        self._pending: dict[str, OpenReply] = {}
         self._task: asyncio.Task[None] | None = None
-        self.stats: dict[str, int] = {"spins": 0, "added": 0, "revised": 0, "skipped": 0}
+        self.stats: dict[str, int] = {"spins": 0, "added": 0, "revised": 0, "skipped": 0,
+                                      "silenced": 0}
+
+    # ------------------------------------------------------------ 记账
+    def track_reply(self, *, user_id: str, our_text: str, our_bubbles: int,
+                    group: bool = False, woke_us: bool = False,
+                    rapport_delta: int = 0, now: float | None = None) -> None:
+        """这一句说完了，挂起来等结果。结果可能是对面的话，也可能是一片安静。"""
+        if not self._settings.judgment_enabled or not user_id:
+            return
+        moment = time.time() if now is None else float(now)
+        self.sweep_silence(now=moment)
+        self._pending[user_id] = OpenReply(
+            user_id=user_id, started_at=moment,
+            our_chars=len((our_text or "").strip()),
+            our_bubbles=max(1, int(our_bubbles or 1)),
+            group=group, woke_us=woke_us, rapport_delta=int(rapport_delta or 0),
+        )
+
+    def note_arrived(self, *, user_id: str, their_text: str,
+                     now: float | None = None) -> Outcome | None:
+        """对面来话了：把挂着的那一句结掉。没挂着东西（第一回合、或她没接）就返回 None。"""
+        open_item = self._pending.pop(user_id, None)
+        self.sweep_silence(now=now)
+        if open_item is None:
+            return None
+        moment = time.time() if now is None else float(now)
+        outcome = _close(open_item, their_text=their_text, at=moment, replied=True)
+        self.note(outcome)
+        return outcome
+
+    def sweep_silence(self, *, now: float | None = None) -> int:
+        """太久没人接的那些，结掉记为「没接」。被晾着这件事只有在这儿量得出来。"""
+        if not self._pending:
+            return 0
+        moment = time.time() if now is None else float(now)
+        horizon = float(self._settings.judgment_silence_seconds)
+        stale = [uid for uid, item in self._pending.items() if moment - item.started_at >= horizon]
+        for uid in stale:
+            item = self._pending.pop(uid)
+            self.note(_close(item, their_text="", at=moment, replied=False))
+            self.stats["silenced"] += 1
+        return len(stale)
+
+    def pending_count(self) -> int:
+        return len(self._pending)
 
     def note(self, outcome: Outcome) -> None:
         """每轮记一条，并立刻拿它去核对已有判断。"""
         if not self._settings.judgment_enabled:
             return
         self._window.append(outcome)
-        if len(self._window) > self._settings.judgment_lookback * 3:
-            self._window = self._window[-self._settings.judgment_lookback * 3:]
+        # 另一条不动的流水：`_window` 会被 `reflect` 消费掉，而人格自改的试验期
+        # 要拿「改之前 vs 改之后」的同一条序列比，不能是被抽干过的那一份
+        self._trail.append(outcome)
+        cap = max(self._settings.judgment_lookback, self._settings.judgment_every_turns)
+        if len(self._window) > cap:
+            self._window = self._window[-cap:]
         try:
             self.ledger.reinforce(outcome)
         except OSError as exc:
             logger.debug("判断册核对失败（忽略）：%s", exc)
         if len(self._window) >= self._settings.judgment_every_turns and self._task is None:
             self._task = asyncio.create_task(self._spin())
+
+    def trail(self, user_id: str = "", *, limit: int = 24) -> list[Outcome]:
+        """最近这些观测。给试验期前后对比用，不被任何消费方清空。"""
+        items = [item for item in self._trail if not user_id or item.user_id == user_id]
+        return items[-max(1, int(limit)):]
 
     async def _spin(self) -> None:
         try:
@@ -352,12 +499,18 @@ class JudgmentLoop:
             self._task = None
 
     async def reflect(self) -> dict[str, int]:
-        window, self._window = self._window, []
+        take = max(1, self._settings.judgment_lookback)
+        window = self._window[-take:]
+        # 这一趟把看过的消费掉，下一趟只算新观测：同一条结果不该被统计两次
+        del self._window[:len(self._window) - len(window)]
         stats = self.ledger.stats(window)
         if not window:
             self.stats["skipped"] += 1
             return self.stats
         self.stats["spins"] += 1
+        # 册子第一次跑就落盘，哪怕一条都没有：这一层要能在 git 里看见，
+        # 才谈得上「她真的在改自己」。空文件比缺文件诚实。
+        self.ledger.seed()
         existing = self.ledger.read_text() or "（还没有）"
         body = await self._ask(_PROMPT.replace("{existing}", existing).replace("{stats}", stats.render()))
         if not body:
@@ -379,6 +532,17 @@ class JudgmentLoop:
 
     async def _ask(self, prompt: str) -> str:
         """问一次模型。没有可用后端就返回空串——回路照跑，只是这轮不产出。"""
+        ask = getattr(self, "_ask_fn", None)
+        if ask is not None:
+            try:
+                body = await asyncio.wait_for(
+                    ask(prompt, max_tokens=400, temperature=0.3,
+                        timeout=self._settings.judgment_timeout),
+                    timeout=self._settings.judgment_timeout + 2.0)
+                return str(body or "").strip()
+            except Exception as exc:  # noqa: BLE001 - 攒判断失败不是谁的错
+                logger.debug("判断循环没问出东西：%s", exc)
+                return ""
         client = getattr(self, "_client", None)
         if client is None:
             return ""
@@ -393,6 +557,15 @@ class JudgmentLoop:
         except Exception as exc:  # noqa: BLE001 - 攒判断失败不是谁的错
             logger.debug("判断循环没问出东西：%s", exc)
             return ""
+
+    def bind_ask(self, ask: Any) -> None:  # noqa: ANN401 - 「按提示词问一句」的可调用
+        """把攒判断那一问接到引擎的上游池上去。
+
+        生产路径该用这个而不是 `bind_client`：换家、按实测速度挑线、同时赛跑
+        都在 `bot.ask_once` 那条链上，直接绑一个 `AsyncOpenAI` 等于把这一层的
+        延迟工程整个绕过去——攒一次判断堵住后台二十秒，得不偿失。
+        """
+        self._ask_fn = ask
 
     def bind_client(self, client: Any, model: str = "") -> None:  # noqa: ANN401
         """引擎起来之后把上游客户端接上。没接上时循环只做核对、不做新判断。"""

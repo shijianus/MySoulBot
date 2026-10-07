@@ -31,7 +31,8 @@ DEFAULT_REMOTE: Final[str] = "https://github.com/shijianus/ClawdSoul.git"
 DEFAULT_BRANCH: Final[str] = "soul"
 
 # 进灵魂仓库的东西：灵魂与人格档案，不含逐轮日志与运行态
-_SOUL_FILES: Final[tuple[str, ...]] = ("CLAWD.md", "MOOD.md")
+# JUDGMENT.md 是她自己攒出来的「怎么说才有效」——换了机器没这一本，她就又是刚开张的样子
+_SOUL_FILES: Final[tuple[str, ...]] = ("CLAWD.md", "MOOD.md", "JUDGMENT.md")
 _USER_DOCS: Final[tuple[str, ...]] = ("SOUL.md", "USER.md", "MEMORY.md", "RELATIONS.md", "persona.json")
 _USER_DIRS: Final[tuple[str, ...]] = ("presets",)
 
@@ -89,6 +90,14 @@ def _collect(settings: Settings, staging: Path) -> list[str]:
     # 漏了它就会出现「交互者的灵魂资产天天同步、管理者自己的反而不备」这种荒唐结果
     owner_root = settings.owner_dir
     if owner_root.is_dir():
+        # 树根上那几份不是目录：OWNER.json 是配对事实，丢了就得重新配对一次
+        for name in ("OWNER.json",):
+            src = owner_root / name
+            if src.is_file():
+                dst = staging / "owner" / name
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(src, dst)
+                copied.append(f"owner/{name}")
         for user in sorted(path for path in owner_root.iterdir() if path.is_dir()):
             for name in _USER_DOCS:
                 src = user / name

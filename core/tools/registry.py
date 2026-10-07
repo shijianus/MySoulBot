@@ -26,6 +26,7 @@ from core.tools.base import Tool, ToolContext, ToolResult
 from core.tools.git import GitSync
 from core.tools.host import HostStats, ScratchList, ScratchRead, ScratchWrite
 from core.tools.media import ImageGen, SeeImage, Snapshot
+from core.tools.persona import PersonaAdopt, PersonaRewrite
 from core.tools.protocol import Directive
 from core.tools.qq_account import ACCOUNT_TOOLS
 from core.tools.query import QUERY_TOOLS
@@ -43,6 +44,10 @@ DEFAULT_TOOLS: Final[tuple[type[Tool], ...]] = (
     Snapshot,
     GitSync,
     Reflect,
+    # 自我塑造两只：改人格、换人格。都是 sensitive——改的是她下一轮被喂进去的东西，
+    # 靠别名或模糊匹配触发不能接受（`resolve()` 对 sensitive 只认实名）
+    PersonaRewrite,
+    PersonaAdopt,
     HostStats,
     ScratchWrite,
     ScratchRead,

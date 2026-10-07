@@ -451,8 +451,8 @@ async def tool_checks(check: Checker, settings: Any, site: str, chat_base: str, 
              set(registry.names) == {
                  "web_browse", "web_search", "weather_now", "stock_quote", "exchange_rate",
                  "train_query", "hot_list", "egress_ip", "image_gen", "see_image", "snapshot",
-                 "git_sync", "reflect", "host_stats", "scratch_write", "scratch_read",
-                 "scratch_list",
+                 "git_sync", "reflect", "persona_rewrite", "persona_adopt",
+                 "host_stats", "scratch_write", "scratch_read", "scratch_list",
              }, str(registry.names))
     check.ok("搜索只剩一条，不留两个一样的让模型挑",
              [n for n in registry.names if "search" in n] == ["web_search"], str(registry.names))

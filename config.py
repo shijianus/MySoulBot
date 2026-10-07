@@ -271,6 +271,49 @@ class Settings(BaseSettings):
     )
     judgment_timeout: float = Field(default=20.0, gt=0, description="问一次判断的超时；失败就这轮不产出")
     judgment_model: str = Field(default="", description="攒判断走哪个模型，留空跟着抽取器/主模型")
+    judgment_silence_seconds: float = Field(
+        default=180.0, gt=0,
+        description="说完这么久还没等到对面回话，就把这一条结掉记为「没接」——"
+        "「被晾着」这件事只有在这里量得出来。原来那个调用点只在对面的话进来时才跑，"
+        "于是 replied 永远是真的、接话率恒等于 100%，判断回路会拿假统计攒出歪规则",
+    )
+    # ---------------- 自我塑造：人格可改，灵魂不可改 ----------------
+    persona_self_edit: bool = Field(
+        default=True,
+        description="允许她自己改写本棵树的 SOUL.md（人格）。这是红线配置下她唯一能塑自己的面："
+        "`SOUL_FILES_ONLY=true` 时事实轨与动态轨不进提示词，「我是谁」只由这几份文件决定。"
+        "锚点守卫与试验期回滚兜住护栏，改坏了不必人救",
+    )
+    persona_edit_min_gap_minutes: float = Field(
+        default=15.0, ge=0.0,
+        description="两次人格自改之间至少隔多少分钟。她可以连着想，但不能一句话改一次自己——"
+        "上一笔还在观察期就急着改第二笔，等于把试验期作废",
+    )
+    persona_trial_turns: int = Field(
+        default=12, ge=1,
+        description="改完之后观察多少轮。这段里的实测结果拿去跟改动前的基线比",
+    )
+    persona_trial_degrade_ratio: float = Field(
+        default=1.6, gt=1.0, le=5.0,
+        description="恶化倍数：试验期里「说多了」的比例超过基线这个倍数就自动还原改动前的备份",
+    )
+    persona_auto_switch: bool = Field(
+        default=True,
+        description="允许她按情境（时段/熟络阶段/群私/刷屏）自己换人格——只在白名单内，切完当天不再切",
+    )
+    persona_switch_allowlist: str = Field(
+        default="default,butler_kane,hacker_echo,witch_morgana",
+        description="她可以自己切进去的人格 slug（逗号分隔）。内置那几套是出厂就允许的；"
+        "想让某个导入的人格对她开放，把 slug 加进来",
+    )
+    persona_switch_cooldown_hours: float = Field(
+        default=10.0, ge=0.0,
+        description="自切一次之后的冷却小时数。换人格要清近程上下文，一天换三四次等于没有性格",
+    )
+    persona_switch_lock: bool = Field(
+        default=False,
+        description="人在控制台上锁定人格：她自己不许再切也不许再改，直到解锁。给「这段时间别闹」用",
+    )
     # ---------------- 向量检索：记忆按「像不像」取，不按「新不新」取 ----------------
     embed_provider: str = Field(
         default="off", description="off | cohere | openai。openai 指任何 OpenAI 兼容网关"

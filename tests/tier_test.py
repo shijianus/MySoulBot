@@ -838,7 +838,152 @@ async def judgment_loop_checks(check: Checker) -> None:
     check.ok("关掉开关后一律不记也不跑", quiet._window == [] and quiet.stats["spins"] == 0, quiet.stats)
 
 
+def channel_neutral_checks(check: Checker) -> None:
+    """QQ 只是第一个通道。身份层不许认识任何具体通道——除了那一条历史回落。
+
+    原来三处硬编码（`qq_private_` 前缀、`startswith("qq_private_")`、
+    招呼字条只认 `source == "qq_private"`）在接第二个通道时会出两种事故：
+    同一个人换个入口变回路人；或者更糟——那边一个撞号的陌生人变成管理者。
+    """
+    s = tier_settings(owner_enabled=True, owner_qq="")
+    ID.write_owner(s, ID.OwnerRecord(user_id=OWNER_USER_ID, qq="123456789",
+                                     source="tg_private", paired_at="2026-10-08T00:00:00"))
+    aliases = ID.owner_aliases(s)
+    check.ok("新通道绑上的就是那个通道的身份",
+             ID.resolve_identity(s, "tg_private_123456789").is_owner, aliases)
+    check.ok("数字撞上 QQ 号也不串权限（这条是命门）",
+             ID.resolve_identity(s, "qq_private_123456789").tier is ID.Tier.INTERACTOR, aliases)
+    check.ok("别名表里带得出他在通道内的原生号",
+             aliases.get("tg_private_123456789") == "123456789", aliases)
+
+    both = tier_settings(owner_enabled=True, owner_qq="")
+    ID.write_owner(both, ID.OwnerRecord(
+        user_id=OWNER_USER_ID, qq="777", source="qq_private", paired_at="2026-10-06T00:00:00",
+        history=[{"at": "2026-10-06T00:00:00", "source": "qq_private", "qq": "777"},
+                 {"at": "2026-10-08T00:00:00", "source": "feishu_private", "qq": "u_9"}]))
+    ids = ID.owner_user_ids(both)
+    check.ok("一个人从两个入口进来都是管理者",
+             {"qq_private_777", "feishu_private_u_9"} <= ids, ids)
+    check.ok("换入口不改资料树：两边都落进 owner 那棵树",
+             ID.resolve_identity(both, "feishu_private_u_9").folder == "owner"
+             and ID.resolve_identity(both, "qq_private_777").folder == "owner")
+
+    # 历史回落：只在命令行上绑过一次，当年能报口令的通道只有 QQ 私聊
+    legacy = tier_settings(owner_enabled=True, owner_qq="")
+    ID.write_owner(legacy, ID.OwnerRecord(user_id=OWNER_USER_ID, qq="777", source="cli",
+                                          paired_at="2026-10-06T00:00:00"))
+    check.ok("控制台来源的旧记录仍按 QQ 认（不破坏既有绑定）",
+             ID.resolve_identity(legacy, "qq_private_777").is_owner, ID.owner_aliases(legacy))
+
+    desk = ID.PairingDesk(both)
+    desk._leave_hello("tg_private", "123456789", "PAIR-x")
+    desk._leave_hello("cli", "333", "PAIR-y")
+    notes = desk.pending_hellos()
+    check.ok("招呼字条记着是谁家的通道", [h["source"] for h in notes] == ["tg_private"], notes)
+    check.ok("命令行上绑的不留招呼字条", all(h["qq"] != "333" for h in notes), notes)
+    desk.ack_hello("123456789")            # 旧调用方还是只给号
+    check.ok("只给号也销得掉", desk.pending_hellos() == [], desk.pending_hellos())
+
+
 # ---------------------------------------------------------------- 5. 提示词吃到判断
+async def judgment_sensors_checks(check: Checker) -> None:
+    """传感器的对错：被晾着必须量得出来，接话率必须能低于 100%。
+
+    这一组钉的是判断回路的**地基**——原来只在对面的话进来时记账，
+    `replied` 于是永远是真，而 `_PROMPT` 明令「只提由这些数字撑得住的规则」：
+    接上模型只会拿假统计攒出歪规则。
+    """
+    s = tier_settings(judgment_enabled=True, judgment_every_turns=3,
+                      judgment_silence_seconds=30.0)
+    loop = J.JudgmentLoop(s, StorageManager(s))
+    loop.track_reply(user_id="u1", our_text="一" * 120, our_bubbles=2, group=False)
+    check.ok("说出去的话先挂着等结果", loop.pending_count() == 1, loop.pending_count())
+
+    out = loop.note_arrived(user_id="u1", their_text="好，那就这么定？", now=time.time() + 5)
+    check.ok("对面来话就结掉，记为接了", out is not None and out.replied and out.asked_back,
+             "" if out is None else f"{out.replied}/{out.asked_back}")
+    check.ok("隔多久回的量得出来", out is not None and 4.0 < out.reply_seconds < 6.0,
+             "" if out is None else out.reply_seconds)
+    check.ok("结掉之后不再挂着", loop.pending_count() == 0, loop.pending_count())
+    check.ok("没挂着的会话不硬造观测",
+             loop.note_arrived(user_id="nobody", their_text="喂") is None)
+
+    # 安静：没人回话不会触发任何调用，只有主动收才量得出来
+    loop.track_reply(user_id="u2", our_text="一" * 200, our_bubbles=3)
+    check.ok("收早了不算晾着", loop.sweep_silence(now=time.time() + 5) == 0)
+    silenced = loop.sweep_silence(now=time.time() + 40)
+    check.ok("超时没接的这一句被收掉", silenced == 1, silenced)
+    check.ok("被晾着记为没接", loop._window and loop._window[-1].replied is False
+             and loop._window[-1].their_chars == 0, loop._window[-1:])
+    check.ok("晾着的账也进了计数器", loop.stats["silenced"] == 1, loop.stats)
+
+    stats = loop.ledger.stats(loop._window)
+    check.ok("接话率终于能低于百分之百",
+             stats.turns == 2 and stats.replied == 1 and stats.landed == 1
+             and stats.over_talked == 1, stats)
+    check.ok("晾着这件事说得出人话", "接话率 50%" in stats.render(), stats.render())
+    check.ok("温度不写进攒判断的材料（她不该学讨好）",
+             "熟络度" not in stats.render(), stats.render())
+
+    # 晾到很久才算被晾：90 秒是 `Outcome.slow` 的线，跟回没回是两件事
+    loop.track_reply(user_id="u3", our_text="一" * 80, our_bubbles=1)
+    loop.sweep_silence(now=time.time() + 200)
+    stale = loop._window[-1]
+    check.ok("晾过 90 秒这一条记为慢", stale.slow and not stale.replied, f"{stale.slow}/{stale.replied}")
+
+    # 册子必须真的存在、真的会动
+    s2 = tier_settings(judgment_enabled=True, judgment_every_turns=3)
+    ledger2 = J.JudgmentLedger(s2)
+    loop2 = J.JudgmentLoop(s2, StorageManager(s2), ledger=ledger2)
+    check.ok("攒判断之前册子还不存在", not ledger2.path.is_file())
+    loop2.note(J.Outcome(user_id="u", at=time.time(), our_chars=200, their_chars=3, replied=True))
+    await loop2.reflect()
+    check.ok("跑过一趟就把册子立起来（空册子也要在盘上）",
+             ledger2.path.is_file() and "JUDGMENT · 怎么说话才有效" in ledger2.path.read_text("utf8"),
+             ledger2.path.exists())
+    check.ok("模型那一问接上了才真能产出规则", loop2.stats["added"] == 0, loop2.stats)
+
+    heard = ["- 长解释容易被晾着，先给一句短的 [k=pace c=60 n=1]"]
+
+    async def fake_ask(prompt: str, **kwargs: Any) -> str:
+        fake_ask.seen = prompt
+        return "\n".join(heard)
+
+    loop3 = J.JudgmentLoop(s2, StorageManager(s2), ledger=J.JudgmentLedger(s2))
+    loop3.bind_ask(fake_ask)
+    loop3.note(J.Outcome(user_id="u", at=time.time(), our_chars=200, their_chars=3, replied=True))
+    await loop3.reflect()
+    rules3 = loop3.ledger.rules()
+    check.ok("接上上游之后她真能自己攒出判断",
+             loop3.stats["added"] == 1 and len(rules3) == 1, loop3.stats)
+    check.ok("攒出来的判断下一轮进提示词",
+             "长解释容易被晾着" in loop3.ledger.read_text(), loop3.ledger.read_text())
+    check.ok("问模型时把统计真给了它", "接话率" in getattr(fake_ask, "seen", ""),
+             getattr(fake_ask, "seen", "")[:80])
+
+    # 退场只该发生在攒新的时候，不该被一次打脸静默抹掉
+    ledger4 = J.JudgmentLedger(tier_settings())
+    ledger4.apply([J.Rule(text="长话会被晾着", confidence=25, seen=3)])
+    before = [rule.text for rule in ledger4.rules()]
+    for _ in range(3):
+        ledger4.reinforce(J.Outcome(user_id="u", at=time.time(), our_chars=200,
+                                    their_chars=260, replied=True))
+    check.ok("连着打脸也不静默删条（退场只在 apply 裁）",
+             [rule.text for rule in ledger4.rules()] == before, ledger4.rules())
+    # 新条目进场至少 35 分（apply 封顶到 [35,70]），所以要打到跌破 15 才该退场
+    ledger4.reinforce(J.Outcome(user_id="u", at=time.time(), our_chars=200,
+                                 their_chars=260, replied=True))
+    ledger4.apply([J.Rule(text="短的更容易接住", confidence=70, seen=1)])
+    check.ok("攒新的时候才把垮掉的裁掉",
+             all(rule.text != "长话会被晾着" for rule in ledger4.rules()), ledger4.read_text())
+
+    # 一条讲篇幅的判断不能被「有没有回问」来回打分
+    long_rule = J.Rule(text="长解释容易被晾着", confidence=50)
+    verdict = J._supports(long_rule, J.Outcome(user_id="u", at=0, our_chars=200,
+                                               their_chars=3, replied=True))
+    check.ok("判断打分按最特殊的信号走", verdict is True, verdict)
+
+
 async def prompt_layer_checks(check: Checker) -> None:
     from core.prompt_builder import PromptBuilder
 
@@ -877,6 +1022,7 @@ async def main() -> int:
     try:
         tree_checks(check)
         owner_qq_checks(check)
+        channel_neutral_checks(check)
         pairing_checks(check)
         await phrase_budget_checks(check)
         grace_checks(check)
@@ -886,6 +1032,7 @@ async def main() -> int:
         await account_behavior_checks(check)
         judgment_checks(check)
         await judgment_loop_checks(check)
+        await judgment_sensors_checks(check)
         await prompt_layer_checks(check)
     finally:
         print(f"\n共 {check.count} 项断言，失败 {len(check.failures)} 项")

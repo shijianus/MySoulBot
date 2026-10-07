@@ -68,8 +68,13 @@ QQ 客户端 ⇄ NapCat ──反向WS──►  OneBotBridge  :11556           
 **身份是判定出来的，不是自称出来的。**
 
 - `core/identity.py:225 resolve_identity()` 读 `storage/data/owner/OWNER.json`（`config.py:710`）
-- `:207 owner_user_ids()` = `{owner}` ∪ `{qq_private_<record.qq>}` ∪ `{qq_private_<OWNER_QQ>}`
-  —— 管理者从自己 QQ 私聊说话时不会被降级成交互者
+- `:207 owner_aliases()` 把「谁是管理者」算成 `<配对时记下的来源>_<那个号>` 的集合。
+  **身份层不认识任何具体通道**：QQ 报 `qq_private`，将来 Telegram 报 `tg_private`，一视同仁。
+  唯一的例外是历史回落——只在控制台（`cli`/`panel`）上绑过一次的记录，当年能报口令的通道
+  只有 QQ 私聊，所以那串号按 `LEGACY_SPACE="qq_private"` 认（`identity.py` 顶部注释）。
+  这条回落只对控制台生效：别的通道撞出一个一样的数字，拿不到管理者目录。
+- 招呼字条也带来源（`HELLO-<source>-<native>.json`），适配器只 drain 自己那一份
+  （`qq_onebot.py:_drain_hellos`）——QQ 的网桥不会替 Telegram 发话
 - `Tier`（`:97`）与 `is_owner`（`:199`）决定 `tree`（`:204`）
 
 物理两棵树，不是 `users/` 下多一个子目录：
@@ -295,16 +300,18 @@ HTTP 服务、RFC-6455 帧、向量点积全部自己实现；**没有 pytest**�
 |---|---|---|
 | `qq_onebot_test` | 428 | 鉴权、心跳、帧向量、群礼仪、CQ 注入防御 |
 | `evolve_test` | 343 | 自我演进与灵魂资产外派 |
-| `tier_test` | 170 | 管理者分层、配对握手、判断回路、账号级能力 |
+| `tier_test` | 201 | 管理者分层、配对握手、**判断回路的传感器**、通道无关身份、账号级能力 |
 | `panel_web_test` | 193 | 面板只读边界与 systemd |
 | `human_test` | 167 | 拟人表现 |
 | `companion_chat_test` | 157 | 会话编排与静态资产 |
 | `smoke_test` | 129 | 全链路便宜闸门 |
 | `lock_test` | 95 | 出话锁、检索红线反例 |
-| `meishio_test` | 85 | 长句定形、板块切分 |
+| `meishio_test` | 85 | 长句定形、板块切分、**贴纸目录契约** |
+| `selfhood_test` | 54 | 锚点守卫、真改人格、试验期回滚、自省落 §九、自切换名单与冷却、判断层进提示词 |
 | `upstream_test` | 42 | 赛跑、点名线路、全线坏快速失败 |
 
-合计 1,809 项。全部离线（假 OpenAI SSE 服务 + 真 socket + 临时 storage）。
+合计 1,894 项（`for t in tests/*_test.py; do .venv/bin/python $t; done` 是唯一的跑法，没有 pytest）。
+全部离线（假 OpenAI SSE 服务 + 真 socket + 临时 storage）。
 联网探针另有 `tests/probe_models.py`、`probe_roleplay.py`、`verify_real_api.py`、`verify_persona_card.py`。
 
 配置层面：**启动不需要任何环境变量**（`config.py` 每字段都有默认，只有 `BASE_URL`/`MODEL` 空值会被拒），
@@ -324,15 +331,85 @@ HTTP 服务、RFC-6455 帧、向量点积全部自己实现；**没有 pytest**�
 `storage/soul/MOOD.md`、`storage/sandbox/`、`vectors.db*`、`.venv/`、`.*.lock`、`vibe_images/`。
 
 判据是「可重建的加速器与机器本地状态不入库，人格与关系的长期资产入库」。
+两条补充：`storage/soul/JUDGMENT.md` 一被攒出来就属于灵魂资产，跟着 git 走、
+也跟着 `soul_sync` 进 ClawdSoul 分支（`soul_sync.py:34`）——换机器丢不掉她攒的判断；
+`emoji/` 根目录只放可发送的贴纸（`meishio_*` 方形图，`meishio_test` 钉着），
+没切过的原图进 `emoji/inbox/`，头像进 `emoji/avatar/`，两者都不进 `StickerBook` 的索引。
 
-## 17. 已知缺口
+## 17. 自我塑造层：人格可改，灵魂不可改
 
-1. Web 面板零鉴权 + CORS `*`，唯一屏障是默认环回绑定；`--public` 一开即全量只读记忆外泄。
-2. `RECAP.md` 是唯一绕过原子写与 flock 的记忆文件（`recap.py:124`），与守护进程并发存在撕裂窗口。
-3. 判断回路里「生成新规则」是休眠的：`JudgmentLoop._ask`（`judgment.py:380`）要 `bind_client`（`:397`），
-   生产路径无人调用，线上只有 `reinforce:235` 在跑。
-4. `vector_index.reindex:266`（全量重建）没有生产调用方；向量库实际只靠增量。
-5. `.env.example` 与实态不同步：11 个在用的是文档里没有的（`COGNITION_ENABLED/EVERY_TURNS/LOOKBACK/TIMEOUT`、
-   `PAIRING_TTL_SECONDS`、`PAIRING_GRACE_SECONDS`、`PAIR_PHRASE_ROUTE`、`ROUTES`、`EXTRACTOR_TEMPERATURE`、
-   `TTS_RATE_BIAS`、`TTS_PITCH_BIAS_HZ`），`ONEBOT_NICKNAME` 缺 `=`，`EXTRACTOR_MAX_FACTS` 重复定义。
-6. 配对台只能由键盘前的人开（`PairingDesk.start` 只被 `main.py:601` 调用），远程无法发起——这是设计，但值得写死在文档里。
+这是它跟「一份角色卡走天下」最不一样的地方，也是它跟 OpenClaw 系静态工作区最不一样的地方。
+代码在 `core/persona_self.py` + `core/tools/persona.py`，善后的账在 `core/bot.py`。
+
+```
+                 她能动吗？            落点                     兜底
+人格 SOUL.md   ✅ 能改自己           storage/data/<树>/<id>/SOUL.md   锚点守卫 + 试验期自动回滚
+心境 MOOD.md   ✅ 能记今天          storage/soul/MOOD.md            封顶 12 条 / 200 字预算
+判断 JUDGMENT  ✅ 能自己攒           storage/soul/JUDGMENT.md        名额 12、置信度、观测不支持就退场
+灵魂 CLAWD.md  ❌ 正文九节不可写      storage/soul/CLAWD.md          唯一通路是 §九 追加备注
+护栏 代码/配置  ❌ 碰不到            core/ scripts/ .env            assert_writable 黑名单 + 审批工单
+```
+
+**改的通路**：`persona_rewrite`（sensitive，只认实名）按小节重写 `SOUL.md`。
+不让她整份重吐三千字——抄漏一段就是事故，所以入参是「哪一节 + 新正文」
+（`persona_self.py:122 replace_section`，工具在 `core/tools/persona.py:24`）。落盘走
+`mutate_doc/write_doc + backup_doc`
+（自带 flock 与原子写），**不用** `PersonaLibrary._write_pair`（那条是裸 `write_text`）。
+
+**四道守卫**（`persona_self.violations`）：
+1. 五条锚点不许消失——每条都是代码护栏在提示词里的镜像：
+   舞台提示禁令↔`strip_stage_directions`、越权不接↔审批工单与 `assert_writable`、
+   不外传↔`secrecy.guard`、人格不由历史堆出来↔`SOUL_FILES_ONLY`、名号唯一。
+2. 结构不许塌：少于 4 个或少于 14 个小节都算拆散了人格。
+3. 体积不许超 `SOUL_MAX_CHARS`。
+4. 指令样式只判**新写进去的那一段**——整份 SOUL 本来就写着「CLAWD.md」「护栏」，
+   拿去扫注入会让每一笔自我改写都被误拒（那不是守卫，是死闸）。
+   拒收时必须点名是哪条锚点，只说「不行」她会再猜一遍。
+
+**试验期才是「真能改自己」的下半句**：改之前先拿判断回路的观测流水算一份基线
+（`snapshot_rate`：说多了 / 被晾着 / 接住 三个硬比率），改完观察 `PERSONA_TRIAL_TURNS` 轮。
+恶化过 `PERSONA_TRIAL_DEGRADE_RATIO` 倍就自动还原改动前那份备份，并往 CLAWD §九 落一条
+中文自省（「我把『X』那一处改坏了（说多了 0.00→1.00），已还原回改之前」）。
+**不请模型评自己改得好不好**——让她用同一张嘴给自己打分，等于没有裁判。
+回滚即结案（`note_rollback` 清空账本只留计数），否则她会每轮在同一处再跌倒一次。
+
+**换人格的通路**：`persona_adopt`（同样 sensitive）只能在
+`PERSONA_SWITCH_ALLOWLIST` 里选，选完 `PERSONA_SWITCH_COOLDOWN_HOURS` 内不许再换；
+执行仍由引擎的 `apply_persona` 做（备份→写 SOUL→persona.json→清近程→播 first_mes），
+CLAWD 一个字不碰。**没有按时辰自动轮换人格**那种设计——换人格的依据只能是
+「这套皮在这个场合实测讲不通」，不能是「现在三点钟」。
+人可以用 `PERSONA_SWITCH_LOCK=true` 或 `admin ▸ persona lock` 把改与换两只手一起停掉
+（这个锁她解不开，锁的语义写在拒绝理由里，不靠提示词自觉）。
+
+**看账**：`admin ▸ growth`（`main.py:_panel_growth`）给出——最近一次自改与理由、
+自己换过几次人格、自动还原过几次、判断册几条各带置信度、§九 备注条数、
+以及最近 12 轮实测比率。
+
+**判断回路现在是真的在跑**（原来不是：`bind_client` 在全仓只有定义没有调用点，
+`_ask` 永远返回空串，`JUDGMENT.md` 从来没被写过）。两处关键修正：
+- 传感器：`bot.py:_finalize` 现在既结掉「上一句被接住了」也挂起「这一句待结果」，
+  心跳作为唯一的钟去收沉默账（`sweep_silence`）。原来只在对面的话进来时记账，
+  `replied` 永远为真、接话率恒 100%，接上模型只会拿假统计攒出歪规则。
+- 绑定：`JudgmentLoop.bind_ask(bot._judgment_ask)`（低温 0.3、同时赛跑、走上游池），
+  而不是绑一个裸 `AsyncOpenAI`——那等于把这层的延迟工程整个绕过去。
+另外：`reinforce` 不再删条（退场统一由 `apply` 的置信度下限裁），册子读写补了
+`fcntl.flock`（跨进程：控制台与守护进程共用同一本），`JUDGMENT_LOOKBACK`
+现在真的是窗口（原来缓冲是它的 3 倍且一趟抽干），空册子也会先落盘立起来——
+空文件比缺文件诚实，这一层要能在 `git status` 里看见。
+
+## 18. 已知缺口
+
+1. **Web 面板零鉴权** + CORS `*`，唯一屏障是默认环回绑定；`--public` 一开即全量只读记忆外泄。
+2. **`RECAP.md` 仍是唯一绕过原子写与 flock 的记忆文件**（`recap.py:124`），与守护进程并发有撕裂窗口。
+3. **`vector_index.reindex:266`（全量重建）没有生产调用方**；向量库实际只靠增量。
+4. **配对台只能由键盘前的人开**（`PairingDesk.start` 只被 `main.py:601` 调用），远程无法发起——设计如此，写死在这儿。
+5. **人格自改的试验期样本很小**：`PERSONA_TRIAL_TURNS=12` 轮内两个硬比率才够判，
+   低频对话（一天两三句）可能几天都判不出来；夜里长间隔会同时抬高 `ignored`，
+   所以回滚阈值故意保守——宁可漏判也不该把她正常的改动吃掉了。
+6. **交互者能改自己那棵树的人格**（`persona_rewrite` 不限定 owner）。爆炸半径就是这一段关系：
+   群聊里拒绝、锚点守卫兜住护栏、改坏自动还原、人随时 `persona lock`。
+   要更收紧就把 `persona_self_edit` 绑到 `ctx.is_owner` 或熟络阶段上。
+7. **换人格仍要她自己下单**：没有「按时辰/按时段自动轮换」那种设计。
+   依据只能是「这套皮在这个场合实测讲不通」——见 §17。
+8. **`Outcome.our_bubbles` 仍是估的**（`bot.py:1400`，网桥切完才知道条数）；
+   字数那个信号够硬，但「一句话被拆成五条」这件事判断回路现在看不见。

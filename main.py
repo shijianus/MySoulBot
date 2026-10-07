@@ -685,6 +685,8 @@ class App:
             "audit": self._panel_audit,
             "persona": self._panel_persona,
             "char": self._panel_persona,
+            "growth": self._panel_growth,
+            "成长": self._panel_growth,
             "user": self._panel_user,
         }
         if not sub:
@@ -709,7 +711,8 @@ class App:
             ("/panel edit <soul|user|memory>", "用 $EDITOR 改，保存即生效"),
             ("/panel append <一句话>", "手工写一条事实"),
             ("/panel note <一句话>", "手工写一条关系动态（怎么跟他相处）"),
-            ("/panel persona [list|switch|import|show|delete]", "人格库与酒馆卡"),
+            ("/panel persona [list|switch|import|show|lock|unlock|delete]", "人格库与酒馆卡；lock 停掉她自己动人格的两只手"),
+            ("/panel growth", "她改了人格没有、改完效果怎么样、攒出了几条判断"),
             ("/panel user <id>", "切用户（四份文件与日志完全隔离）"),
             ("/panel model [名字]", "查看或临时切换对话模型"),
             ("/panel tools", "当前挂载了哪些工具"),
@@ -999,8 +1002,50 @@ class App:
         elif sub in {"show", "info"}:
             preset = self.library.get(rest)
             self.ui.block(f"{preset.slug} · {preset.name}", preset.soul_text())
+        elif sub in {"lock", "unlock"}:
+            on = sub == "lock"
+            self._settings.persona_switch_lock = on
+            self.ui.line(f"  {'锁上了' if on else '松开了'}——她自己动人格的两只手"
+                         f"{'（改与换）现在都停' if on else '（改与换）现在归她'}"
+                         + ("。这是本进程的开关，写死请用 PERSONA_SWITCH_LOCK=true" if on else ""))
         else:
-            self.ui.line("  可用：/panel persona | switch <标识> [keep] | import <卡.json> [标识] | show <标识> | delete <标识>", style="dim")
+            self.ui.line("  可用：/panel persona | switch <标识> [keep] | import <卡.json> [标识] "
+                         "| show <标识> | lock|unlock | delete <标识>", style="dim")
+        return True
+
+    async def _panel_growth(self) -> bool:
+        """她的自我成长账本：改过什么、效果怎么样、攒出几条「怎么说」。"""
+        from core import persona_self
+
+        meta = dict(await self.storage.read_persona_meta(self.user_id))
+        trial = persona_self.read_trial(meta)
+        rules = self.bot.judgment.ledger.rules()
+        notes = await self.clawd.notes()
+        lines = [
+            f"- 人格自改：{'允许' if self._settings.persona_self_edit else '关着'}"
+            f"（锁：{'已锁' if self._settings.persona_switch_lock else '没锁'}）",
+            f"- 最近一次自改：{meta.get('edited_at') or '还没有'}"
+            f"{'｜' + str(meta.get('last_edit_reason')) if meta.get('last_edit_reason') else ''}",
+            f"- 自己换过人格：{meta.get('switch_at') or '还没有'}"
+            f"{'｜换成 ' + str(meta.get('last_switch_slug')) if meta.get('last_switch_slug') else ''}",
+            f"- 改坏之后自动还原过 {int(meta.get('rollbacks') or trial.rollbacks or 0)} 次",
+            f"- 判断册 {len(rules)} 条（上限 12，攒够 "
+            f"{self._settings.judgment_every_turns} 轮跑一趟）",
+            f"- 给自己的备注 {len(notes)} 条（CLAWD §九）",
+        ]
+        for rule in rules[:12]:
+            lines.append(f"    · {rule.text}〔c={rule.confidence} n={rule.seen}〕")
+        if trial.backup:
+            lines.append(f"- 正在观察这一笔：『{trial.where}』（还有 "
+                         f"{max(0, trial.needed - trial.tick)} 轮到期）基线 "
+                         + " ".join(f"{k}={v:.2f}" for k, v in trial.baseline.items()
+                                    if k != "turns"))
+        else:
+            lines.append("- 这一笔没有挂着的试验期")
+        rates = persona_self.snapshot_rate(self.bot.judgment.trail(self.user_id, limit=12))
+        lines.append(f"- 最近 {int(rates['turns'])} 轮实测：说多了 {rates['over_talked']:.2f}"
+                     f"，被晾 {rates['ignored']:.2f}，接住 {rates['landed']:.2f}")
+        self.ui.block("她自己长成什么样了", "\n".join(lines))
         return True
 
     def _persona_list(self) -> None:

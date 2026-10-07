@@ -59,7 +59,7 @@ __all__ = [
     "Tier", "Identity", "Challenge", "OwnerRecord", "PairingError", "PairingDesk",
     "OWNER_USER_ID", "phrase_matches", "format_code", "extract_code", "derive_code",
     "candidate_key", "consume_pairing",
-    "owner_user_ids",
+    "owner_user_ids", "owner_aliases", "LEGACY_SPACE",
     "normalize_code", "read_owner", "resolve_identity", "unpair",
 ]
 
@@ -89,6 +89,9 @@ _CODE_STRIP: Final[re.Pattern[str]] = re.compile(r"[^A-Z0-9]")
 # 两个方向各跨一次通道，证的才是「控制台前这个人 && 那个 QQ 号的主人」是同一个人才拿得下：
 # 口令 控制台→QQ（他有机器权限、也把话送进了那个号），码 QQ→控制台（号上看到的字回到了机器这头）。
 _CONSOLE: Final[frozenset[str]] = frozenset({"cli", "panel", "dashboard"})
+# 历史回落：只在控制台上绑过的人，当年能报口令的通道只有 QQ 私聊。
+# 只对控制台来源生效，别的地方一律按配对时记下的来源认（见 `owner_aliases`）。
+LEGACY_SPACE: Final[str] = "qq_private"
 # 挑战的三个阶段：等激活语 → 已确认唯一来源（此时才敢把码念出来）→ 终态
 _STAGE_OPEN: Final[frozenset[str]] = frozenset({"waiting", "unique"})
 
@@ -113,6 +116,11 @@ def _now() -> float:
 def _stamp(ts: float | None = None) -> str:
     moment = datetime.fromtimestamp(ts if ts is not None else _now(), tz=timezone.utc)
     return moment.astimezone().isoformat(timespec="seconds")
+
+
+def _token(value: object) -> str:
+    """把来源名与号码收成能进文件名片段的一串。越界的东西不该变成一个文件名。"""
+    return re.sub(r"[^A-Za-z0-9\-_.]", "", str(value if value is not None else ""))[:48]
 
 
 def normalize_phrase(text: str) -> str:
@@ -194,6 +202,7 @@ class Identity:
     user_id: str
     source: str = ""
     qq: str = ""
+    native: str = ""      # 他在自己那个通道里的原生号；`qq` 是旧名字，留着不改调用方
 
     @property
     def is_owner(self) -> bool:
@@ -204,22 +213,40 @@ class Identity:
         return "owner" if self.is_owner else "users"
 
 
-def owner_user_ids(settings: Settings) -> set[str]:
-    """管理者会以哪些 user_id 出现。
+def owner_aliases(settings: Settings) -> dict[str, str]:
+    """管理者会以哪些引擎侧 user_id 出现，以及每个 id 在他那个通道里的原生号。
 
-    QQ 那侧进来的话一律被折成 `qq_private_<qq号>`（群聊是 `qq_group_<群号>`），
-    所以只认字面量 "owner" 会漏掉他本人——那等于账号级能力在他唯一真正需要它的
-    场景里永远不可用。这里把两种形态都算上。
+    身份层不认识任何具体通道：id 的形状是 `<配对时记下的来源>_<那个号>`，
+    来源由通道适配器在 `present()` 时报上来（QQ 是 `qq_private`/`qq_group`，
+    以后接进来的是 `tg_private`、`feishu_group`，这里一视同仁）。
+
+    唯一的例外是历史：只在命令行上绑过一次（来源是 `cli`/`panel`），
+    当年能报口令的通道只有 QQ 私聊，所以那串号按 `qq_private_` 认。
+    **这条回落只对控制台来源成立**——将来某个 Telegram 号绑上之后，
+    它绝不会因为数字撞上某个 QQ 号就拿到管理者目录。
     """
     record = read_owner(settings) if settings.owner_enabled else None
     if record is None:
-        return set()
-    ids = {record.user_id}
-    for uin in (record.qq, settings.owner_qq):
-        uin = str(uin or "").strip()
-        if uin.isdigit():
-            ids.add(f"qq_private_{uin}")
-    return ids
+        return {}
+    out: dict[str, str] = {record.user_id: record.qq or ""}
+    pairs: list[tuple[str, str]] = [(record.source, record.qq)]
+    pairs.extend((str(item.get("source") or ""), str(item.get("qq") or ""))
+                 for item in record.history)
+    for source, native in pairs:
+        native = str(native or "").strip()
+        if not native:
+            continue
+        space = LEGACY_SPACE if (not source or source in _CONSOLE) else source
+        out[f"{space}_{native}"] = native
+    bootstrap = str(settings.owner_qq or "").strip()
+    if bootstrap.isdigit():
+        out[f"{LEGACY_SPACE}_{bootstrap}"] = bootstrap
+    return out
+
+
+def owner_user_ids(settings: Settings) -> set[str]:
+    """管理者会以哪些 user_id 出现（`owner_aliases` 的键，留给旧调用方）。"""
+    return set(owner_aliases(settings))
 
 
 def resolve_identity(settings: Settings, user_id: str, *, source: str = "") -> Identity:
@@ -230,11 +257,10 @@ def resolve_identity(settings: Settings, user_id: str, *, source: str = "") -> I
     """
     if settings.owner_enabled:
         record = read_owner(settings)
-        if record is not None and user_id in owner_user_ids(settings):
-            qq = record.qq or settings.owner_qq
-            if user_id.startswith("qq_private_"):
-                qq = user_id[len("qq_private_"):]
-            return Identity(Tier.OWNER, user_id, source, qq=qq)
+        aliases = owner_aliases(settings)
+        if record is not None and user_id in aliases:
+            native = aliases[user_id] or (record.qq or settings.owner_qq)
+            return Identity(Tier.OWNER, user_id, source, qq=native, native=native)
     return Identity(Tier.INTERACTOR, user_id, source)
 
 
@@ -612,16 +638,21 @@ class PairingDesk:
         return cleared
 
     # ---------------------------------------------------------- 招呼字条（跨进程）
-    def _hello_path(self, qq: str) -> Path:
-        safe = re.sub(r"[^A-Za-z0-9\-]", "", str(qq or "")) or "anon"
-        return self.directory / f"HELLO-{safe}.json"
+    def _hello_path(self, source: str, native: str) -> Path:
+        return self.directory / f"HELLO-{_token(source) or 'anon'}-{_token(native) or 'anon'}.json"
 
     def _leave_hello(self, source: str, qq: str, challenge_id: str) -> None:
-        if source != "qq_private" or not qq:
-            return                             # 本机命令行上绑的，没有 QQ 可打招呼
+        """配对成功后留一张「该从通道那头打声招呼」的字条。
+
+        哪个通道留下的就归哪个通道去发：字条上带着来源，适配器只挑自己那一份，
+        免得 QQ 的网桥跑去替 Telegram 发话（而它根本没有那个口）。
+        """
+        if source in _CONSOLE or not qq:
+            return                             # 本机命令行上绑的，没有对面可打招呼
         self.directory.mkdir(parents=True, exist_ok=True)
-        note = {"qq": qq, "at": _stamp(), "challenge": challenge_id, "born": _now()}
-        path = self._hello_path(qq)
+        note = {"qq": qq, "native": qq, "source": source, "at": _stamp(),
+                "challenge": challenge_id, "born": _now()}
+        path = self._hello_path(source, qq)
         atomic_write(path, json.dumps(note, ensure_ascii=False, indent=2) + "\n")
         with contextlib.suppress(OSError):
             path.chmod(0o600)
@@ -642,14 +673,21 @@ class PairingDesk:
                 with contextlib.suppress(OSError):
                     path.unlink()
                 continue
-            qq = str(raw.get("qq") or "")
-            if qq:
-                out.append({"qq": qq, "at": str(raw.get("at") or "")})
+            native = str(raw.get("native") or raw.get("qq") or "")
+            if native:
+                out.append({"qq": native, "native": native,
+                            "source": str(raw.get("source") or LEGACY_SPACE),
+                            "at": str(raw.get("at") or "")})
         return out
 
-    def ack_hello(self, qq: str) -> None:
-        with contextlib.suppress(OSError):
-            self._hello_path(qq).unlink()
+    def ack_hello(self, qq: str, *, source: str = "") -> None:
+        """销掉一张发出去了的字条。不给来源就按号销——旧调用方还是那句 `ack_hello(qq)`。"""
+        targets = [self._hello_path(source, qq)] if source else \
+            sorted(self.directory.glob(f"HELLO-*-{_token(qq)}.json"))
+        targets.append(self.directory / f"HELLO-{_token(qq)}.json")   # 旧文件名一并清
+        for path in targets:
+            with contextlib.suppress(OSError):
+                path.unlink()
 
     def void(self, challenge_id: str) -> Challenge | None:
         challenge = self._load(challenge_id)

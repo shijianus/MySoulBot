@@ -29,13 +29,14 @@ from openai import (
 )
 
 from config import Settings
-from core.card_loader import PersonaLibrary, Preset
+from core import persona_self
+from core.card_loader import PersonaLibrary, Preset, PresetError
 from core.clawd_soul import ClawdSoul
 from core.mood_soul import MoodSoul
 from core.identity import resolve_identity
 from core.recap import SessionRecap
 from core.cognition import CognitionLoop
-from core.judgment import JudgmentLoop, observe
+from core.judgment import JudgmentLoop
 from core.memory_extractor import MemoryExtractor
 from core.prompt_builder import (
     TIER_FULL,
@@ -212,6 +213,10 @@ class MySoulBot:
         self.cognition = CognitionLoop(settings, storage, self.mood)
         # 判断回路：后端根据真实结果攒「怎么说」，写进 JUDGMENT.md，下一轮直接改前端取舍
         self.judgment = JudgmentLoop(settings, storage)
+        # 攒判断那一问走上游池（换家/赛跑/按实测速度挑线都在 ask_once 上）。
+        # 原来这里谁都接不上——`bind_client` 在全仓只有一个定义和一个文档提及，
+        # 于是 `_ask` 永远返回空串，`apply()` 生产不可达，JUDGMENT.md 从来没被写过。
+        self.judgment.bind_ask(self._judgment_ask)
         self._prompts.bind_judgment(self.judgment.ledger)
         self.rapport = RapportEngine(settings, storage)
         self._client: AsyncOpenAI | None = None
@@ -322,10 +327,11 @@ class MySoulBot:
         return candidates
 
     async def _ask_route(self, name: str, model: str, base: str, prompt: str, *,
-                         max_tokens: int, timeout: float) -> str:
+                         max_tokens: int, timeout: float,
+                         temperature: float = 0.9) -> str:
         """问一条线路。失败与空答都返回空串——调用方管换下一条，这里不抛。"""
         try:
-            kwargs: dict[str, Any] = {"model": model, "temperature": 0.9,
+            kwargs: dict[str, Any] = {"model": model, "temperature": temperature,
                                       "max_tokens": max_tokens,
                                       "messages": [{"role": "user", "content": prompt}]}
             if base:
@@ -350,7 +356,7 @@ class MySoulBot:
 
     async def ask_once(self, prompt: str, *, max_tokens: int = 120,
                        timeout: float = 20.0, prefer: str = "",
-                       race: bool = False) -> str:
+                       race: bool = False, temperature: float = 0.9) -> str:
         """后台问一句，拿纯文本回来。给配对口令、招呼语这类短产出用。
 
         刻意不复用对话那条链：那条要挂人格、要切档、要落历史，而这里要的只是
@@ -369,7 +375,8 @@ class MySoulBot:
             # 每条线各自问，谁先落正文用谁。带名字回，才知道该把账记在谁头上
             async def tagged(name: str, model: str, base: str) -> tuple[str, str]:
                 body = await self._ask_route(name, model, base, prompt,
-                                             max_tokens=max_tokens, timeout=timeout)
+                                             max_tokens=max_tokens, timeout=timeout,
+                                             temperature=temperature)
                 return name, body
 
             tasks = [asyncio.ensure_future(tagged(name, model, base))
@@ -394,12 +401,23 @@ class MySoulBot:
 
         for name, model, base in candidates:
             body = await self._ask_route(name, model, base, prompt,
-                                         max_tokens=max_tokens, timeout=timeout)
+                                         max_tokens=max_tokens, timeout=timeout,
+                                         temperature=temperature)
             if body:
                 return body
             last_error = f"{name} 没落正文"
         logger.warning("现生成没成功（%s），交调用方兜底", last_error or "没有可用线路")
         return ""
+
+    async def _judgment_ask(self, prompt: str, *, max_tokens: int = 400,
+                            temperature: float = 0.3, timeout: float = 20.0) -> str:
+        """判断回路的问法：低温、同时赛跑、拿纯文本。
+
+        和配对口令一样是后台短产出，不该占对话那条链（不挂人格、不落历史）。
+        `race=True`：攒判断没有 deadline，但一条慢线吃光预算会让这一趟整趟白等。
+        """
+        return await self.ask_once(prompt, max_tokens=max_tokens, timeout=timeout,
+                                   race=True, temperature=temperature)
 
     def _route_client(self, route: Route) -> AsyncOpenAI:
         """取这条线的客户端；探针（`_client_hook`）接管时也要**按线路**各包一层。
@@ -758,7 +776,8 @@ class MySoulBot:
                     break
                 rounds += 1
                 session.tool_calls += len(calls)
-                groups = await self._run_tools(calls, groups, registry, mode, can_see)
+                groups = await self._run_tools(calls, groups, registry, mode, can_see,
+                                                user_id=session.user_id)
             completed = True
         finally:
             try:
@@ -920,6 +939,8 @@ class MySoulBot:
         registry: ToolRegistry,
         mode: str,
         can_see: bool,
+        *,
+        user_id: str = "",
     ) -> list[list[Message]]:
         """静默执行，然后把「下单 + 结果」补成一组消息。
 
@@ -930,6 +951,9 @@ class MySoulBot:
         模型下单要图，就得真的拿到图，而不是拿到一句「图已生成」。
         """
         pairs = await registry.call_many((name, call_args) for _, name, call_args in calls)
+        # 自我塑造那两只手在这里落地：工具只留下该记的账与该换的装，
+        # 基线观测和真换人都在引擎这一头——它有判断回路，工具没有
+        await self._settle_selfhood(user_id, pairs)
         taken, _ = trim(
             [ref for (_, _, _), (_, result) in zip(calls, pairs, strict=True)
              for ref in (result.meta.get("images") or [])],
@@ -1336,6 +1360,79 @@ class MySoulBot:
             )
         return ""
 
+    # ------------------------------------------------------------ 自我塑造的善后
+    async def _settle_selfhood(self, user_id: str, pairs: Sequence[Any]) -> None:
+        """工具改完人格之后，引擎这一头把账记上：试验期的基线、以及真要换的那套装。
+
+        为什么分两处：`persona_rewrite` 能把正文写进 SOUL.md（`StorageManager` 就在
+        `ctx` 上），但它拿不到判断回路的观测流水——基线必须由「改之前那几轮的实测」
+        算出来，所以留一张字条回来，在这儿记账。
+        """
+        if not user_id:
+            return
+        for _, result in pairs:
+            if not getattr(result, "ok", False):
+                continue
+            meta = getattr(result, "meta", None) or {}
+            edit = meta.get("persona_rewrite")
+            if isinstance(edit, dict):
+                raw = str(edit.get("backup") or "")
+                await persona_self.start_trial(
+                    self._storage, user_id,
+                    backup=Path(raw) if raw else None,
+                    reason=str(edit.get("reason") or ""),
+                    where=str(edit.get("section") or ""),
+                    baseline=persona_self.snapshot_rate(self.judgment.trail(user_id)),
+                    needed=int(self._settings.persona_trial_turns))
+                logger.info("%s 自己改写了人格『%s』，往后观察 %d 轮", user_id,
+                            str(edit.get("section") or "")[:24],
+                            int(self._settings.persona_trial_turns))
+            adopt = meta.get("persona_adopt")
+            if isinstance(adopt, dict):
+                await self._adopt_persona(user_id, str(adopt.get("slug") or ""))
+
+    async def _adopt_persona(self, user_id: str, slug: str) -> None:
+        """她自己要换的人格，在这儿真的换上。换失败只记一行——换装失败不该掀翻这一回合。"""
+        if not slug:
+            return
+        try:
+            preset = PersonaLibrary(self._settings).get(slug)
+            applied = await self.apply_persona(user_id, preset, keep_history=False, greet=True)
+        except (PresetError, BotError, OSError, StorageError) as exc:
+            logger.info("%s 自己换装没换成：%s", user_id, exc)
+            return
+        await persona_self.note_switch(self._storage, user_id, slug)
+        logger.info("%s 自己换上了 %s（前一套：%s）",
+                    user_id, applied.slug, applied.previous_slug or "无")
+
+    async def _settle_persona_trial(self, user_id: str) -> None:
+        """试验期到期：改坏了就自己还原，不必等人救——这是「真能改自己」的下半句。
+
+        判据只有两个硬比率（说多了 / 被晾着），不请模型来评「我改得好不好」：
+        让她用同一张嘴给自己打分，等于没有裁判。
+        """
+        trial = await persona_self.bump_trial(self._storage, user_id)
+        if not trial.backup or trial.tick < max(1, trial.needed):
+            return
+        now = persona_self.snapshot_rate(self.judgment.trail(user_id, limit=trial.needed * 2))
+        bad = persona_self.degraded(trial.baseline, now,
+                                    ratio=float(self._settings.persona_trial_degrade_ratio),
+                                    needed=trial.needed)
+        if not bad:
+            await persona_self.clear_trial(self._storage, user_id)
+            logger.info("%s 自己改的人格实测讲得通，收下了", user_id)
+            return
+        restored = await persona_self.restore(self._storage, user_id, Path(trial.backup))
+        await persona_self.note_rollback(self._storage, user_id, trial)
+        where = trial.where or trial.reason or "说话方式"
+        note = (f"我把『{where}』那一处改坏了（{'，'.join(bad)}），"
+                f"已还原回改之前{'' if restored else '（还原也没成）'}")
+        try:
+            await self.clawd.append_note(note)
+        except OSError as exc:
+            logger.debug("还原后的自省没写进去（忽略）：%s", exc)
+        logger.info("%s 自改人格没过试验期，已还原：%s", user_id, "，".join(bad))
+
     async def _finalize(
         self,
         session: Session,
@@ -1381,18 +1478,17 @@ class MySoulBot:
         self._extractor.submit(session.user_id, window, today=day)
         # 慢环：攒够几轮就在后台复盘一次，把心得落进 MOOD.md，下一轮的提示词自然带上
         self.cognition.note_turn(session.user_id)
-        # 判断回路：这一句用户消息就是上一句我们那话的「结果」——
-        # 隔多久回的、回了多长、有没有反问，全在这儿量得出来，不交给模型回忆
-        if session.last_reply_at:
-            self.judgment.note(observe(
-                user_id=session.user_id,
-                our_text=session.last_reply_text,
-                our_bubbles=session.last_bubbles,
-                their_text=user_text,
-                gap_seconds=max(0.0, time.time() - session.last_reply_at),
-                replied=bool((user_text or "").strip()),
-                group=group_mode,
-            ))
+        # 判断回路两半都要记：这一句进来是**上一句**的结果（接住了），
+        # 这一句出去得挂起来等下一个结果（可能一直是安静的）。
+        # 原来只在对面的话进来时记账，`replied` 就永远是真、接话率永远 100%，
+        # 而 `_PROMPT` 明令「只提由这些数字撑得住的规则」——那等于让模型拿假统计攒判断。
+        self.judgment.note_arrived(user_id=session.user_id, their_text=user_text)
+        self.judgment.track_reply(
+            user_id=session.user_id, our_text=text,
+            our_bubbles=session.last_bubbles, group=group_mode,
+        )
+        # 她自己改过人格的话，这一轮就是证据之一：够数了就判一次
+        await self._settle_persona_trial(session.user_id)
         session.last_reply_at = time.time()
         session.last_reply_text = text
         # 气泡条数由网桥切完才知道，这里先按「一条长话」估：
