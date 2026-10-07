@@ -104,13 +104,22 @@ MOVED: Final[dict[str, str]] = {
 _SPEAKER: Final[str] = "  ▸ "
 
 
+PROMPT: Final[str] = "admin ▸ "
+# 角色说的一律浅色、不带前缀；提示符只属于「正在等你输入」那一刻。
+ROLE_STYLE: Final[str] = "grey84"
+
+
 class TerminalUI:
-    """渲染层：角色表达（沉浸）与控制台输出（诊断）严格分家。"""
+    """渲染层：角色表达（沉浸）与控制台输出（诊断）严格分家。
+
+    界面上只有一种前缀：`admin ▸ ` —— 它只在**等键盘**的那一刻出现。
+    她说的话、系统提示、报错都不带前缀，角色那几行是浅灰的。
+    """
 
     def __init__(self, settings: Settings, console: Console | None = None) -> None:
         self.console: Console = console or Console(highlight=False)
         self._settings = settings
-        self._role_style = "bright_magenta"
+        self._role_style = ROLE_STYLE
         self._stream_open = False
         self._chars = 0
 
@@ -138,7 +147,7 @@ class TerminalUI:
             [
                 f"在跟谁说话  {persona or '（SOUL.md 现内容）'}",
                 f"当前用户    {user_id}",
-                "直接输入就是说话。想看后台：/panel（这里不会再弹东西）",
+                "看见 admin ▸ 就是等你：直接打字就是说话。想看后台：/panel",
             ]
         )
         self.console.print(
@@ -187,8 +196,6 @@ class TerminalUI:
 
     # ------------------------------------------------------------ 流式：角色的声音
     def begin_stream(self) -> None:
-        if not self.immersive:
-            self.console.print(Text("  ◍ 角色 ▸ ", style=f"bold {self._role_style}"), end="")
         self._stream_open = True
         self._chars = 0
 
@@ -207,13 +214,10 @@ class TerminalUI:
         return self._chars > 0
 
     def role_block(self, text: str, tag: str = "") -> None:
-        """非流式输出角色台词（开场白）。"""
-        prefix = f"  ◍ {tag} ▸ " if not self.immersive and tag else ""
-        if prefix:
-            self.console.print(Text(prefix, style=f"bold {self._role_style}"))
-        self.console.print(Text(text.replace("\n", "\n"), style=self._role_style))
+        """非流式输出角色台词（开场白）。浅色、无前缀。"""
+        self.console.print(Text(text, style=self._role_style))
 
-    def ask(self, prompt_text: str) -> str | None:
+    def ask(self, prompt_text: str = PROMPT) -> str | None:
         try:
             return self.console.input(prompt_text, markup=False)
         except EOFError:
@@ -221,24 +225,23 @@ class TerminalUI:
 
 
 class _StdinPump:
-    """一根**常驻 daemon 线程**读键盘，把行放进队列喂给事件循环。
+    """一根常驻 daemon 线程读键盘；**提示符只在被放行那一刻打出来**。
 
-    为什么不用 `asyncio.to_thread(input)`：Ctrl-C 之后那个线程还堵在 `input()` 里，
-    而取消一个 to_thread 只是不要它的结果——线程照活。线程池的线程在解释器退出时
-    是要一根根 join 的，于是「按了 Ctrl-C 却退不掉，再按一次甩出
-    `Exception ignored in: <module 'threading'>`」。daemon 线程不参与那个 join，
-    而且全进程只有这一根读键盘的线。
+    两件事都要办到：
+      · 不能每次输入都新建一根读线程 —— Ctrl-C 之后老线程还堵在 `input()` 里，
+        而线程池的线程解释器退出时要一根根 join，那就成了「按了 Ctrl-C 退不掉，
+        再按一次甩 Exception ignored」。daemon 线程不参与那个 join。
+      · 但也不能刚读完就立刻再打提示符 —— 那样上一轮的回话会盖在提示符后面，
+        看着就是「等输入却没有光标前那串 admin ▸」。所以每一轮由主循环 `arm()` 放行，
+        线程打印 `admin ▸ ` 然后等键盘；没放行就一句话都不打。
     """
 
-    def __init__(self, ui: "TerminalUI", prompt: str = "") -> None:
+    def __init__(self, ui: "TerminalUI") -> None:
         self._ui = ui
-        self._prompt = prompt
         self._queue: asyncio.Queue[str | None] = asyncio.Queue()
+        self._go = threading.Event()
         self._thread: threading.Thread | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
-
-    def set_prompt(self, prompt: str) -> None:
-        self._prompt = prompt
 
     def start(self) -> None:
         if self._thread is not None:
@@ -246,6 +249,10 @@ class _StdinPump:
         self._loop = asyncio.get_running_loop()
         self._thread = threading.Thread(target=self._pump, daemon=True, name="stdin")
         self._thread.start()
+
+    def arm(self) -> None:
+        """轮到键盘了：这会儿除了提示符，谁都不该往屏幕上写。"""
+        self._go.set()
 
     def _push(self, line: str | None) -> None:
         loop = self._loop
@@ -256,19 +263,18 @@ class _StdinPump:
 
     def _pump(self) -> None:
         while True:
+            self._go.wait()
+            self._go.clear()
             try:
-                line = self._ui.ask(self._prompt)
+                line = self._ui.ask()
             except EOFError:
-                self._push(None)                   # Ctrl-D：到此为止
+                self._push(None)                     # Ctrl-D：到此为止
                 return
             except KeyboardInterrupt:
-                # Ctrl-C 是「这一行作废」，不是退出：接着等下一行（真要走有 /quit，
-                # 或者连按两下——那一下走的是 _bail，不等任何东西）
+                # Ctrl-C 是「这一行作废」，不是退出：把空行交回去，等下一次放行
                 self._push("")
                 continue
-            self._push(line)
-            if line is None:
-                return
+            self._push(line if line is not None else "")
 
     async def get(self) -> str | None:
         return await self._queue.get()
@@ -390,7 +396,8 @@ class App:
         if self._stdin is None:
             self._stdin = _StdinPump(self.ui)
             self._stdin.start()
-        self._stdin.set_prompt("群 ▸ " if self._settings.group_mode else "你 ▸ ")
+        self.ui.end_stream()                  # 上一句哪怕没说完，也先把行收干净
+        self._stdin.arm()                     # 到这一步才打 admin ▸，等的就是键盘
         try:
             return await self._stdin.get()
         except asyncio.CancelledError:

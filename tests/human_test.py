@@ -670,20 +670,25 @@ async def tavern_checks(check: Checker, settings: Any) -> None:
 
 
 # ================================================================ 主流程
-def cli_exit_checks(check: Checker, root: Path) -> None:
-    """命令行退出路径：Ctrl-C 之后不许卡住，也不许甩一段 threading 的 traceback。
+def cli_surface_checks(check: Checker, root: Path, base_url: str) -> None:
+    """命令行的两张脸：等输入时必须有 `admin ▸ `，说话时一律不带前缀；Ctrl-C 得退得干净。
 
-    回归的是那个现场：读键盘的线程堵在 `input()` 里，而解释器退出时要把线程池的
-    线程一根根 join 完——于是「按了 Ctrl-C 退不掉，再按一次甩出 Exception ignored」。
+    两件事都是回归：
+      · 读键盘的线程堵在 `input()` 里，而线程池的线程解释器退出时一根根 join——
+        于是「按了 Ctrl-C 退不掉，再按一次甩 Exception ignored」；
+      · 提示符若是「读完立刻再打一次」，上一轮的回话就会盖在它后面，
+        看着就是等输入却没有那串 `admin ▸ `。
     """
     # 空目录跑不起来（深层灵魂模板是启动的一部分），所以先用建测试档案那套种子铺好
-    make_settings(root, "http://127.0.0.1:1/v1")
+    make_settings(root, base_url)
     env = dict(os.environ, STORAGE_DIR=str(root), ONEBOT_ENABLED="false", PANEL_ENABLED="false",
                EXTRACTOR_ENABLED="false", TOOLS_ENABLED="false", LOG_LEVEL="CRITICAL",
-               API_KEY="sk-test", MODEL="chat-only", TERM="dumb", COLUMNS="100")
+               API_KEY="sk-test", BASE_URL=base_url, MODEL="chat-only",
+               TERM="dumb", COLUMNS="100")
+    PROMPT = "admin ▸"
 
     def run(steps: list[Any]) -> tuple[int | None, bool, str]:
-        """步骤是 ("quit",秒) / ("sigint",秒)。返回 (退出码, 结束时还活着吗, 输出)。"""
+        """步骤 ("sigint",秒) / ("quit",秒) / ("send", 文本, 秒)。返回 (退出码, 还活着吗, 输出)。"""
         pid, fd = pty.fork()
         if pid == 0:                                   # 子进程：跑真正的 CLI
             os.chdir(str(PROJECT_ROOT))
@@ -706,21 +711,44 @@ def cli_exit_checks(check: Checker, root: Path) -> None:
                     return
                 buf += chunk
 
+        def wait_for(needle: str, secs: float) -> bool:
+            limit = time.time() + secs
+            while time.time() < limit:
+                if needle.encode() in buf:
+                    return True
+                slurp(0.3)
+            return needle.encode() in buf
+
+        def wait_prompt(secs: float = 40.0) -> bool:
+            """等**新打出来的那一次**提示符。屏幕上残留的那一个是上一轮的，不算。"""
+            seen = buf.count(PROMPT.encode())
+            limit = time.time() + secs
+            while time.time() < limit:
+                if buf.count(PROMPT.encode()) > seen:
+                    return True
+                slurp(0.3)
+            return buf.count(PROMPT.encode()) > seen
+
         def exit_code() -> int | None:
             done, status = os.waitpid(pid, os.WNOHANG)
             return os.waitstatus_to_exitcode(status) if done else None
 
-        slurp_until_banner = time.time() + 25.0
-        while time.time() < slurp_until_banner and b"MySoulBot" not in buf:
-            slurp(0.5)
-        for kind, wait in steps:
-            if kind == "sigint":
+        wait_for("MySoulBot", 25.0)
+        for step in steps:
+            kind = step[0]
+            if kind == "sigint":                       # ("sigint", 秒)
                 with contextlib.suppress(ProcessLookupError):
                     os.kill(pid, signal.SIGINT)
-            else:
+                slurp(step[1])
+            elif kind == "quit":                       # ("quit", 秒)
                 os.write(fd, b"/quit\r")
-            time.sleep(0.2)
-            slurp(wait)
+                slurp(step[1])
+            elif kind == "line":                       # ("line", 文本) —— 等到提示符回来
+                os.write(fd, str(step[1]).encode() + b"\r")
+                wait_prompt()
+            else:                                      # ("see", 文本, 秒) —— 只等一会儿
+                os.write(fd, str(step[1]).encode() + b"\r")
+                slurp(step[2])
         code = None
         for _ in range(30):                            # 最多再等 3 秒看它走不走
             code = exit_code()
@@ -743,9 +771,22 @@ def cli_exit_checks(check: Checker, root: Path) -> None:
              not alive2 and code2 == 130 and "Exception ignored" not in out2,
              f"code={code2} alive={alive2} 尾:{out2[-80:]!r}")
 
-    code3, alive3, out3 = run([("sigint", 1.2)])
+    code3, alive3, out3 = run([("sigint", 1.5)])
     check.ok("只按一下 Ctrl-C 是作废这一行，人还在命令行上",
              alive3 and "已作废这一行" in out3, f"alive={alive3} 尾:{out3[-80:]!r}")
+
+    # 界面不变量：每等一次输入，屏幕上都得有一个 admin ▸；她说的话一个前缀都不带
+    _, alive4, out4 = run([("line", "/help"), ("line", "在吗"), ("quit", 2.0)])
+    seg = out4.split(PROMPT)          # [启动横幅][我敲 /help 到下一次提示符][我敲 在吗 到下一次提示符][/quit]
+    check.ok("一开始、命令之后、答完之后各停一次在 admin ▸ 上",
+             len(seg) >= 4, f"提示符 {len(seg) - 1} 次 / 尾:{out4[-70:]!r}")
+    check.ok("命令的回话里不带 ▸ 前缀（那一串只属于提示符）",
+             all("▸" not in piece for piece in seg[1:3]), [p[-40:] for p in seg[1:3]])
+    check.ok("她那一句也是裸的（没有「◍ 角色 ▸」这种标记）",
+             all("角色 ▸" not in piece for piece in seg), repr(seg[3][:70]) if len(seg) > 3 else "")
+    check.ok("角色那句真的说出口了（假上游在回话）",
+             any(word in out4 for word in ("还醒着", "想聊什么", "抬眼", "没说出口")), repr(out4[-90:]))
+    check.ok("屏上不再有「你 ▸」那串旧提示", "你 ▸" not in out4, "")
 
 
 async def main() -> int:
@@ -764,7 +805,7 @@ async def main() -> int:
     await prompt_injection_checks(check, fresh("mysoulbot-inject-"))
     await panel_checks(check, fresh("mysoulbot-panel-"))
     await tavern_checks(check, fresh("mysoulbot-tavern-", server_host="127.0.0.1"))
-    cli_exit_checks(check, Path(tempfile.mkdtemp(prefix="mysoulbot-cli-exit-")))
+    cli_surface_checks(check, Path(tempfile.mkdtemp(prefix="mysoulbot-cli-")), base_url)
 
     # 越界 id 不许建目录
     from core.storage_manager import PathSafetyError, StorageManager
