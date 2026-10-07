@@ -1602,6 +1602,12 @@ class OneBotBridge:
         if str(event.get("meta_event_type") or "") != "heartbeat":
             return
         self.last_heartbeat = time.time()
+        # 「被晾着」不会自己触发——没人说话就没有任何调用。心跳是这一层唯一的钟：
+        # 挂过 `judgment_silence_seconds` 还没等到结果的，在这儿结掉记为「没接」。
+        try:
+            self._bot.judgment.sweep_silence()
+        except Exception as exc:  # noqa: BLE001 - 收个账不该掀翻心跳
+            logger.debug("判断回路收沉默账失败（忽略）：%s", exc)
         status = event.get("status")
         if isinstance(status, Mapping) and "online" in status:
             self.peer_online = bool(status.get("online"))
@@ -1641,17 +1647,20 @@ class OneBotBridge:
         """
         if not connection.alive:
             return
+        mine = _PRIVATE_SPACE.rstrip("_")        # "qq_private"：这个通道自己的来源名
         for hello in self._pairing.pending_hellos():
+            if str(hello.get("source") or "") != mine:
+                continue                         # 别的通道留下的字条不归我发
             qq = hello["qq"]
             greet = await make_greeting(short_ask(self._bot.ask_once, self._settings),
                                         deadline=self._settings.pair_phrase_deadline_seconds,
                                         settings=self._settings)
             if not await self._push_text(connection, qq, greet):
                 continue
-            self._pairing.ack_hello(qq)
+            self._pairing.ack_hello(qq, source=mine)
             logger.info("配对后的招呼已送到 %s", qq)
             await self._type_pause()
-            tools = await self._owner_capability_line(f"qq_private_{qq}")
+            tools = await self._owner_capability_line(f"{mine}_{qq}")
             if tools:
                 await self._push_text(connection, qq, tools)
 
