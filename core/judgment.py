@@ -48,6 +48,9 @@ logger: Final = logging.getLogger("mysoulbot.judgment")
 __all__ = ["Outcome", "Rule", "OpenReply", "JudgmentLedger", "JudgmentLoop", "observe"]
 
 _MAX_RULES: Final[int] = 12
+# 一趟（每 `judgment_every_turns` 轮一次）最多进几条新判断：
+# 一次换掉整本册子不叫成长叫换挡，下一回合的她会突然像另一个人
+_MAX_NEW_PER_SPIN: Final[int] = 2
 _LINE_CHARS: Final[int] = 140
 # `_PROMPT` 让模型把正文压在 60 字内，但那只是请求、不是强制。
 # 收进来这一步得自己封顶：一句 140 字的「判断」进提示词，挤掉的是一段真话。
@@ -359,6 +362,10 @@ class JudgmentLedger:
                     kept.seen += 1
                     kept.updated_at = time.time()
                     revised += 1
+                elif added >= _MAX_NEW_PER_SPIN:
+                    # 一趟最多进这么几条新条：一次塞满 12 条新规则等于把上一版的她
+                    # 整份换掉——那是换挡，不是偏移。成长要看得出一格一格走
+                    continue
                 else:
                     fresh = Rule(text=text[:_LINE_CHARS], kind=incoming.kind,
                                  confidence=max(35, min(70, incoming.confidence)), seen=1,

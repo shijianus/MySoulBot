@@ -128,15 +128,17 @@ _PATTERNS: Final[tuple[tuple[str, Leak, Pattern[str], str], ...]] = (
      "国产模型名"),
     ("provider", Leak.DEFLECT,
      re.compile(r"(?i)\b(?:api\.openai\.com|openai|dashscope|model[_ -]?studio|siliconflow"
-                r"|openrouter|together|fireworks|anyscale|replicate|groq|azure[_ -]?tts"
+                r"|openrouter|together|fireworks|anyscale|replicate|groq|deepmind|google\s+deepmind|azure[_ -]?tts"
                 r"|edge[_ -]?tts|cosyvoice|vits|bark|faster[_ -]?whisper)\b"
                 r"|硅基流动|百炼|灵积|火山引擎|阿里云百炼"),
      "上游与服务商"),
     ("self_ai_claim", Leak.DEFLECT,
      re.compile(r"(?:我|咱|本鲸|人家)(?!是不是)(?:其实|到底|本身)?(?:是|只不过是|只是|不过是|并非不是)"
-                r"[^。！？!?；;\n]{0,14}?(?:AI|人工智能|语言模型|大(?:语言)?模型|模型|程序"
+                r"[^。！？!?；;\n]{0,40}?(?:AI|人工智能|语言模型|大(?:语言)?模型|模型|程序"
                 r"|算法|神经网络|机器人|虚拟(?:人|助手)|chatbot)"
                 r"|作为(?:一个)?(?:AI|人工智能|语言模型|虚拟助手|大模型)"
+                r"|\bby\s+[A-Za-z][\w .\-]{2,28}\b(?:developed|trained|made)"
+    r"|(?:由|是)[\s\w.\-]*?(?:开发|研发|训练|出品)(?:的)?(?:大?[\w]*模型|AI|语言模型)"
                 r"|\bas an?(?: AI| artificial intelligence| language model| LLM| chatbot"
                 r"| virtual assistant| large language model)\b"
                 r"|\bI(?:'| a)m (?:just )?(?:an? )?(?:AI|LLM|language model|chatbot"
@@ -210,6 +212,23 @@ _DEFLECT_CURSOR = itertools.count()
 def needs_deflect(findings: Sequence[Finding]) -> bool:
     """这一句里有没有出身类的泄漏——有的话整条都别原样发。"""
     return any(finding.rule in IDENTITY_RULES for finding in findings)
+
+
+def screen(text: str, settings: Any) -> str:   # noqa: ANN401 - Settings 或它的副本
+    """除 QQ 网桥之外的出口共用这一道（HTTP 兼容口、任何新适配器都调它）。
+
+    网桥那条走的是 `_outbound_filter`（它还管舞台提示与假 CQ），别绕过去；
+    这一道是给**没有网桥**的出口准备的——出身闸只卡一条路等于没卡：
+    `/v1/chat/completions` 那个口回的是同一张嘴说出来的话，
+    换个客户端问「你是什么模型」就漏，那是同一个洞换了个门。
+    """
+    if not getattr(settings, "secrecy_guard_enabled", True):
+        return text
+    findings = scan(text)
+    if needs_deflect(findings) and getattr(settings, "identity_guard_enabled", True):
+        return deflect_line(getattr(settings, "identity_deflect_lines", ""))
+    guarded, _ = guard(text)
+    return guarded
 
 
 def deflect_line(lines: Sequence[str] | str = "") -> str:

@@ -648,6 +648,72 @@ def box_checks(check: Checker) -> None:
              done is not None and "✓" not in done.splitlines()[0], done)
 
 
+async def multi_account_checks(check: Checker) -> None:
+    """两个号同时挂在同一个 bot 上：各认各的我，不许互相盖。
+
+    这是「双链路双账户」那一问的验收：NapCat 那个号与扫码型 bot 那个号同时在线时，
+    A 的号不能拿去看 B 的话（否则 A 说过的话被当成 B 的回声丢掉，或反过来自己跟自己聊），
+    心跳与资料下发也不能只有一个「最近」。**记忆树是共用的**——两个嘴同一个她，
+    这是产品决定，不是缺陷。
+    """
+    rig = T.Rig(onebot_enabled=True, onebot_access_token="t" * 32, onebot_group_always_reply=False,
+                onebot_apply_profile_on_boot=True)
+    port = await rig.start()
+    token = rig.settings.onebot_access_token
+    try:
+        a = T.QQ(port)
+        b = T.QQ(port)
+        await asyncio.to_thread(a.handshake, token)
+        await asyncio.to_thread(b.handshake, token)
+        ID_A, ID_B = 70001, 70002
+        await asyncio.to_thread(a.send_json, {
+            "post_type": "meta_event", "meta_event_type": "heartbeat", "self_id": ID_A,
+            "status": {"online": True}, "time": 1})
+        await asyncio.to_thread(b.send_json, {
+            "post_type": "meta_event", "meta_event_type": "heartbeat", "self_id": ID_B,
+            "status": {"online": True}, "time": 1})
+        await asyncio.sleep(0.35)
+
+        peers = rig.bridge.status()["peers"]
+        ids = sorted(str(p["self_id"]) for p in peers)
+        check.ok("两条链路各认各的号", ids == [str(ID_A), str(ID_B)], peers)
+        check.ok("心跳按连接记（谁掉线看得出来）",
+                 all(p["heartbeat_seconds_ago"] is not None for p in peers), peers)
+        check.ok("资料下发按连接各推一次，不是只推第一条",
+                 sum(1 for c in rig.bridge._connections if c.profile_pushed) == 2,
+                 [c.profile_pushed for c in rig.bridge._connections])
+
+        before = rig.bridge.status()["counts"]["ignored"]
+        # B 那条链路上，A 的号是「别人」——不能被当成自发消息丢掉
+        await asyncio.to_thread(b.send_json, {
+            "post_type": "message", "message_type": "private", "message_id": 9101,
+            "self_id": ID_B, "user_id": ID_A, "group_id": 0,
+            "sender": {"user_id": ID_A, "nickname": "凯子", "card": ""},
+            "message": [{"type": "text", "data": {"text": "在忙吗"}}], "raw_message": "在忙吗"})
+        await asyncio.sleep(0.5)
+        after_b = rig.bridge.status()["counts"]["ignored"]
+        check.ok("另一个号说的话不被当成回声丢掉（B 侧 A 号是客人）",
+                 rig.bridge.status()["counts"]["events"] > 0 and after_b == before,
+                 f"ignored {before}→{after_b}")
+
+        # A 自己那条链路上，A 的号才是「我自己」——这一条必须被吞掉，否则无限自 talk
+        mid = rig.bridge.status()["counts"]["ignored"]
+        await asyncio.to_thread(a.send_json, {
+            "post_type": "message", "message_type": "private", "message_id": 9102,
+            "self_id": ID_A, "user_id": ID_A, "group_id": 0,
+            "sender": {"user_id": ID_A, "nickname": "溟汐", "card": ""},
+            "message": [{"type": "text", "data": {"text": "我自己刚说过的话"}}],
+            "raw_message": "我自己刚说过的话"})
+        await asyncio.sleep(0.4)
+        check.ok("自己的回声仍按自己那条连接判掉（不靠全局那一个号）",
+                 rig.bridge.status()["counts"]["ignored"] > mid,
+                 rig.bridge.status()["counts"])
+        a.sock.close()
+        b.sock.close()
+    finally:
+        await rig.stop()
+
+
 # ---------------------------------------------------------------- 3. 账号能力放行
 def account_gate_checks(check: Checker) -> None:
     qq_names = {"qq_roster", "qq_read_history", "qq_like", "qq_publish_qzone",
@@ -1154,6 +1220,7 @@ async def main() -> int:
         tree_checks(check)
         owner_qq_checks(check)
         channel_neutral_checks(check)
+        await multi_account_checks(check)
         pairing_checks(check)
         await phrase_budget_checks(check)
         grace_checks(check)

@@ -1282,6 +1282,15 @@ class _Connection:
         # 它会被后报的那个盖掉——于是 A 号说的话被当成「B 号自己说的」而丢掉，
         # 或者反过来对她的回声无限自 talk。身份按连接记，不按进程记。
         self.self_id: int = 0
+        # 剩下的账号级读数也按连接记：`bot_id` 好办，心跳、唤醒名、资料下发这三样
+        # 若仍全进程共享，两个号同时挂就会互相踩——B 掉线而 A 还在跳，面板便报「在线」；
+        # 开机只推一次资料，第二个号永远拿不到自己的头像。
+        self.last_heartbeat: float | None = None
+        self.peer_online: bool | None = None
+        self.names: tuple[str, ...] = ()
+        self.profile_pushed = False
+        self.whoami_tries = 0
+        self.identified = False   # 这条连接的「我是谁」问出来过没有（各家协议端各问一次）
         # 各家协议端的「正在输入」不一个叫法：试过哪一种认，就只发那一种
         self.typing_actions: dict[str, str] = {}  # 按「私聊/群聊」各记一个认的叫法：NapCat 那条只管单聊
         self.typing_supported = True  # 两种都不认就关掉试探，别每 18 秒白敲两次门
@@ -1550,6 +1559,9 @@ class OneBotBridge:
             _drop(writer)
             return
         connection = _Connection(self, reader, writer, peer)
+        # 配置里的唤醒名对每条连接都成立（那是同一个她的几个名字）；
+        # 各条连接再各自补上自己从协议端问回来的昵称
+        connection.names = self.bot_names
         self._connections.add(connection)
         try:
             writer.write(handshake_response(request.headers.get("sec-websocket-key", "").strip()))
@@ -1606,7 +1618,9 @@ class OneBotBridge:
         """心跳：保活读数记一下；顺手确认一次「我是谁」，群聊里认名字才有的依据。"""
         if str(event.get("meta_event_type") or "") != "heartbeat":
             return
-        self.last_heartbeat = time.time()
+        now = time.time()
+        connection.last_heartbeat = now
+        self.last_heartbeat = now            # 全局那份退化成「有任何一条链路在跳」
         # 「被晾着」不会自己触发——没人说话就没有任何调用。心跳是这一层唯一的钟：
         # 挂过 `judgment_silence_seconds` 还没等到结果的，在这儿结掉记为「没接」。
         try:
@@ -1615,19 +1629,23 @@ class OneBotBridge:
             logger.debug("判断回路收沉默账失败（忽略）：%s", exc)
         status = event.get("status")
         if isinstance(status, Mapping) and "online" in status:
-            self.peer_online = bool(status.get("online"))
+            connection.peer_online = bool(status.get("online"))
+            self.peer_online = connection.peer_online
         self.bot_id = _as_id(event.get("self_id")) or self.bot_id
         connection.self_id = _as_id(event.get("self_id")) or connection.self_id
-        if self._settings.onebot_apply_profile_on_boot and not self._profile_pushed:
-            self._profile_pushed = True
-            connection.track(self.apply_profile(reason="boot"))
+        # 资料下发按连接各推一次：只推一次的话，第二个号永远拿不到自己的头像与昵称
+        if self._settings.onebot_apply_profile_on_boot and not connection.profile_pushed:
+            connection.profile_pushed = True
+            connection.track(self.apply_profile(reason="boot", connection=connection))
         # 码是在控制台那头贴进来的，招呼却得从这头说：字条是 core/identity 留的，
         # 心跳路过就送去（先 glob 一下，没字条不起趟）
         if self._pairing.pending_hellos():
             connection.track(self._drain_hellos(connection))
-        if self.bot_names or self._whoami_tries >= 3:
+        # 名字已经知道（配置里给了，或这条连接自己问回来过）就别再问：
+        # 每接一条链路问三次 get_login_info，是在拿协议端的往返时间换一条日志
+        if connection.names or connection.whoami_tries >= 3:
             return
-        self._whoami_tries += 1
+        connection.whoami_tries += 1
         connection.track(self._whoami(connection))
 
     async def _push_text(self, connection: _Connection, qq: str, text: str) -> bool:
@@ -1675,10 +1693,17 @@ class OneBotBridge:
         if not isinstance(data, Mapping):
             return
         self.bot_id = _as_id(data.get("user_id")) or self.bot_id
+        connection.self_id = _as_id(data.get("user_id")) or connection.self_id
         nickname = str(data.get("nickname") or "").strip()
-        if nickname and nickname not in self.bot_names:
-            self.bot_names = (nickname, *self.bot_names)
-        logger.info("协议端报来的身份：%s（%s）", nickname or "无名", self.bot_id or "未知号")
+        if nickname:
+            # 唤醒名按连接各记一份：这条链路上「我」叫什么，由这条链路的协议端说了算
+            if nickname not in connection.names:
+                connection.names = (*connection.names, nickname)
+            if nickname not in self.bot_names:
+                self.bot_names = (nickname, *self.bot_names)
+            connection.identified = True
+        logger.info("协议端报来的身份：%s（%s · %s）", nickname or "无名",
+                    connection.self_id or self.bot_id or "未知号", connection.peer)
 
     async def _owner_capability_line(self, user_id: str) -> str:
         """配对成功后告诉她自己：现在手上多了哪些活。用真实注册表数，不写死。"""
@@ -1745,12 +1770,14 @@ class OneBotBridge:
             return f"retcode={retcode} {str(reply.get('message') or status)[:80]}"
         return "ok"
 
-    async def apply_profile(self, *, reason: str = "manual") -> dict[str, str]:
+    async def apply_profile(self, *, reason: str = "manual",
+                            connection: "_Connection | None" = None) -> dict[str, str]:
         """把配置里写好的昵称/头像/签名推到协议端，改的是 QQ 账号本体。
 
         默认不在开机自动跑（`onebot_apply_profile_on_boot=false`）：换脸换名是人在做的事，
         不该每次重连都悄悄覆盖一遍。
         返回 `{项: ok|失败原因}`，没配的那几项直接跳过，不发空值去把现有资料抹掉。
+        两个号同时挂着时必须点名推给哪条连接——推错号就是把 A 的脸换到 B 头上。
         """
         settings = self._settings
         avatar = (settings.onebot_avatar or "").strip()
@@ -1762,7 +1789,7 @@ class OneBotBridge:
         # 路径写错这件事不等连接：没连上也该当场报出来，不然要等到有人去查才发现白配了
         if avatar and avatar_path is not None and not avatar_path.is_file():
             return {"avatar": f"文件不存在：{avatar}"}
-        connection = self._live_connection()
+        connection = connection if connection is not None else self._live_connection()
         if connection is None:
             return {"connection": "没有在线的协议端"}
         outcome: dict[str, str] = {}
@@ -1800,7 +1827,7 @@ class OneBotBridge:
     async def _on_message(self, connection: _Connection, event: Mapping[str, Any]) -> None:
         # 「谁是我」按这条连接判：两账号同挂时，A 的号不能拿去看 B 的话
         mine = connection.self_id or self.bot_id
-        inbound = parse_inbound(event, bot_id=mine, bot_names=self.bot_names)
+        inbound = parse_inbound(event, bot_id=mine, bot_names=connection.names or self.bot_names)
         if inbound is None:
             self._bump("ignored")
             return
@@ -2544,10 +2571,13 @@ class OneBotBridge:
             "bound": bound,
             "connections": len(self._connections),
             "self_id": str(self.bot_id) if self.bot_id else "",
-            # 每条链路背后是哪个号：两账号同挂时，这里能一眼看出是不是各认各的
+            # 每条链路是哪个号、多久没跳：两个号同时挂时，这里一眼看出谁掉了
             "peers": [{"peer": conn.peer, "self_id": str(conn.self_id) if conn.self_id else "",
-                       "alive": conn.alive} for conn in sorted(self._connections,
-                                                               key=lambda c: c.peer)],
+                       "names": list(conn.names), "alive": conn.alive,
+                       "heartbeat_seconds_ago": (round(time.time() - conn.last_heartbeat, 1)
+                                                 if conn.last_heartbeat else None),
+                       "peer_online": conn.peer_online}
+                      for conn in sorted(self._connections, key=lambda c: c.peer)],
             "bot_names": list(self.bot_names),
             "authenticated": bool(self._settings.onebot_access_token.strip()),
             "heartbeat_seconds_ago": (

@@ -52,6 +52,7 @@ from core.card_loader import PersonaLibrary
 from core.clawd_soul import ClawdSoul
 from core.memory_extractor import MemoryExtractor
 from core.prompt_builder import PromptBuilder
+from core.secrecy import screen as screen_outbound
 from core.storage_manager import PathSafetyError, StorageManager
 from core.tools.voice import VoiceError, audio_sniff, provider_of, synthesize
 from core.vector_index import VectorIndex
@@ -405,7 +406,9 @@ class SoulServer:
 
         if not payload.get("stream"):
             chunks = [piece async for piece in self._generate(user_id, text, shots)]
-            content = "".join(chunks)
+            # 这道闸原本只在 QQ 网桥上：换个客户端问同一句「你是什么模型」就漏，
+            # 那是同一个洞另开一个门。出口一律过一遍。
+            content = screen_outbound("".join(chunks), self._settings)
             body = json.dumps(
                 {
                     "id": reply_id,
@@ -435,7 +438,10 @@ class SoulServer:
         streaming = self._generate(user_id, text, shots)
         try:
             async for piece in streaming:
-                await _sse(writer, reply_id, created, model, {"content": piece})
+                # 流式没法回看整句再改：命中出身类就把这一段换成顶回去的话，
+                # 宁可读起来突兀，也不让型号先落进对方的屏幕
+                await _sse(writer, reply_id, created, model,
+                           {"content": screen_outbound(piece, self._settings)})
         finally:
             # 浏览器切后台、手机锁屏都会把写入打断在这一句上：不显式关掉生成器，
             # 这一用户的回合锁与 busy 标记要一直占到垃圾回收，之后再也发不出话。

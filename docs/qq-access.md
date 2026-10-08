@@ -101,31 +101,27 @@ bash scripts/live_bridge_check.sh 2>/dev/null || .venv/bin/python scripts/live_b
 - **非回环绑定 + 空 token 起不来**：这是设计，不是 bug。要么配 token，
   要么把 `ONEBOT_HOST` 收回 `127.0.0.1`，别为了图快把 QQ 的进出摊给整个网段。
 
-## 6. 双账户现在能不能同时服务？**不能，而且现在接两个会互相污染。**
+## 6. 双账户能不能同时服务？**能。身份、心跳、资料下发都按连接记；记忆树共用。**
 
-这条必须说准，不含糊：`OneBotBridge` 的**账号级状态是整份进程一份**，不是按连接一份——
+一条链路上挂的东西各认各的（`_Connection` 持有 `self_id / names / last_heartbeat /
+peer_online / profile_pushed / whoami_tries`）：
 
-| 状态 | 位置 | 两个号同时连会发生什么 |
-|---|---|---|
-| `bot_id` / `bot_names` | `qq_onebot.py:1470-1471`、心跳里 `:1615` 覆写 | `parse_inbound(:1795)` 用 A 号的 id 去判 B 号的消息：**A 自己的回声不再被当自发消息丢掉**（可能自己跟自己聊），唤醒名也串 |
-| `last_heartbeat` / `peer_online` | `:1604/:1613` | 只有一个「最近心跳」。B 掉线了但 A 还在跳 → 面板与 `/healthz` 报「在线」，B 的消息静默石沉 |
-| `_profile_pushed` | `:1476` | 只推一次资料：第二个号永远拿不到它的头像/昵称下发 |
-| `engine_user_id` | 只有 `<空间>_<原生号>` | **没有账号维度**：两个号服务同一个人 → 共用一棵记忆树，熟络度、记忆、关系动态全混在一起 |
+- 自发判定与唤醒名按**这条连接**的号与名字算（`_on_message:1826`）——A 的号在 B 那条链路上
+  是「客人」，不会被当成回声丢掉；A 自己的回声仍按 A 那条连接判掉，不会自己跟自己聊。
+- 心跳与「对面在线不在线」按连接记，`/healthz` 的 `onebot.peers[]` 逐条列出
+  `{peer, self_id, names, alive, heartbeat_seconds_ago, peer_online}`：谁掉了眼看得出。
+- 资料下发（`ONEBOT_APPLY_PROFILE_ON_BOOT`）按连接各推一次，第二个号也能拿到自己的头像；
+  `apply_profile(connection=…)` 指名推给哪条链路——推错号就是把 A 的脸换到 B 头上。
+- whoami 仍只在「这条连接还不知道自己叫什么」时问，且最多三次。
 
-所以「两个本质上没有区别」这件事，要分两层说：
+**记忆树是共用的**：两个号是同一个她的两张嘴，同一个 `qq_private_<号>` 之外的人
+在两个号看来共享同一份 `MEMORY/RELATIONS`。要「两个号各有身份」就得给树名加账号段——
+那要连带迁移既有目录，是另一个决定，不在这一版里顺手做。
 
-- **作为接入路径**：NapCat 与扫码型 bot **确实没有区别**——同一套 `parse_inbound → 唤醒判定 → 引擎 →
-  同一道出站闸`，差别只在协议端怎么登录、token 怎么带。这一层已经钉了测试
-  （身份层不认识任何具体通道，`tier_test.channel_neutral_checks`）。
-- **作为同时在线的两个账号**：**目前不等价，也不支持**。共享的 bridge 状态会让它们互相踩。
+验收：`tests/tier_test.py:multi_account_checks` 真的开两条反向 WS 挂两个号，
+钉住「各认各的号 / 心跳各记 / 资料各推 / B 侧 A 号不被当回声 / A 侧回声仍被吞」五条。
 
-要做到的最小形状（写下来，不是现在偷偷做一半）：
-1. 账号状态按连接持有（一个 `_Connection` 配一个 `Account{self_id, names, last_heartbeat, peer_online, profile_pushed}`），
-   `parse_inbound` 用**这条连接**的 id 判自发与唤醒；
-2. 一个账号一个监听实例（各自的端口与 token），或一个实例上按 `self_id` 路由到各自的 Account；
-3. 记忆树的 key 带不带账号维度，是一个**产品决定**：「两个号是同一个她」（共用树）
-   还是「两个号各有身份」（树名加账号段）。前者不用改路径，后者会动 `data/users/` 的目录名——
-   后者一旦定了要连带迁移既有树，不能顺手改。
-
-第 3 点要你定，第 1、2 点定了就能开工。在你定之前，**请只接一个账号**；
-真要双开，目前唯一安全的做法是跑两个进程、两棵树、两个 token（内存各一份，互不往来）。
+**关于「两条链路本质上有没有区别」：作为接入路径没有区别**——同一套
+`parse_inbound → 唤醒判定 → 引擎 → 同一道出站闸`；差别只在协议端怎么登录、token 怎么带。
+身份层不认识任何具体通道（`tier_test.channel_neutral_checks` 钉着），
+出站闸也不认识（`secrecy.screen()` 是网桥之外所有出口共用的那一道，HTTP 兼容口同样过）。
