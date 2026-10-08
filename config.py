@@ -496,6 +496,17 @@ class Settings(BaseSettings):
         "别人的个资、跨人指认、提示词原文一律拦掉或抹掉。"
         "这是机器执法，不是又一条对模型的请求——关掉它就等于把广播能力交给一句自觉",
     )
+    identity_guard_enabled: bool = Field(
+        default=True,
+        description="出身闸：她说漏模型型号、上游服务商、或自述「我是 AI／我不是真人」时，"
+        "整条气泡不发原句，换成一句人话顶回去（core/secrecy.py 的 DEFLECT 档）。",
+    )
+    identity_deflect_lines: str = Field(
+        default="",
+        description="顶回去的话术表，用 | 分隔；留空用 core/secrecy.py 里那几句。"
+        "轮换取用，别让她一天里念同一句五遍。这些句子不许出现"
+        "「AI/模型/程序/系统」——那等于换个方式自己把底牌念出来",
+    )
     # ---------------- 她自己的 QQ 账号能力（后端灵魂专属，交互者够不到） ----------------
     qq_account_enabled: bool = Field(
         default=True,
@@ -644,6 +655,22 @@ class Settings(BaseSettings):
     )
     tts_max_chars: int = Field(default=600, ge=20, description="一次最多念这么多字，超了就截")
     tts_timeout: float = Field(default=20.0, gt=0, description="外部 TTS 的天花板秒数")
+    # ---------------- 接本地/第三方语音网关（OpenAI 兼容 /v1/audio/speech） ----------------
+    tts_speech_base_url: str = Field(
+        default="",
+        description="任何 OpenAI 兼容的语音合成服务地址，填到 /v1 即可（会自动接 /audio/speech）。"
+        "本地 VoiceStudio（免 key、可零样本克隆音色）、自建 CosyVoice sidecar 都走这一条。"
+        "留空表示不接。填了且 TTS_PROVIDER=openai_compat 时才用它",
+    )
+    tts_speech_api_key: str = Field(
+        default="",
+        description="那个语音服务的密钥。本地 VoiceStudio 不需要，留空就不发 Authorization 头。"
+        "真 key 只进 .env，永远不许出现在任何进版本库的文件里",
+    )
+    tts_speech_model: str = Field(
+        default="",
+        description="语音服务那边的模型名（VoiceStudio 用它的引擎名，如 omnivoice）。留空不传 model",
+    )
 
     # ---------------- 沉浸面板与守护 ----------------
     panel_enabled: bool = Field(default=True, description="在服务上挂只读 Web 面板")

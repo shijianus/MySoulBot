@@ -687,6 +687,7 @@ class App:
             "char": self._panel_persona,
             "growth": self._panel_growth,
             "成长": self._panel_growth,
+            "reindex": self._panel_reindex,
             "user": self._panel_user,
         }
         if not sub:
@@ -713,6 +714,7 @@ class App:
             ("/panel note <一句话>", "手工写一条关系动态（怎么跟他相处）"),
             ("/panel persona [list|switch|import|show|lock|unlock|delete]", "人格库与酒馆卡；lock 停掉她自己动人格的两只手"),
             ("/panel growth", "她改了人格没有、改完效果怎么样、攒出了几条判断"),
+            ("/panel reindex", "按 md 文件全量重建向量索引（换了嵌入后端就用这个）"),
             ("/panel user <id>", "切用户（四份文件与日志完全隔离）"),
             ("/panel model [名字]", "查看或临时切换对话模型"),
             ("/panel tools", "当前挂载了哪些工具"),
@@ -1046,6 +1048,28 @@ class App:
         lines.append(f"- 最近 {int(rates['turns'])} 轮实测：说多了 {rates['over_talked']:.2f}"
                      f"，被晾 {rates['ignored']:.2f}，接住 {rates['landed']:.2f}")
         self.ui.block("她自己长成什么样了", "\n".join(lines))
+        return True
+
+    async def _panel_reindex(self) -> bool:
+        """全量重建向量索引。原来 `reindex()` 全仓没有调用方——换了嵌入后端就没人能重建它。"""
+        from core.vector_index import VectorIndex
+
+        if not self._settings.vector_enabled:
+            self.ui.line("  向量检索是关着的（VECTOR_ENABLED=false），重建了也不会有人查")
+            return True
+        index = VectorIndex(self._settings)
+        corpus: dict[str, list[tuple[str, str, str]]] = {}
+        for uid in self.storage.known_user_ids():
+            rows = [("fact", day, text) for day, text in await self.storage.read_facts(uid)]
+            rows += [("relation", day, text) for day, text in await self.storage.read_relations(uid)]
+            if rows:
+                corpus[uid] = rows
+        total = await index.reindex(corpus)
+        note = index.status() if hasattr(index, "status") else ""
+        self.ui.line(f"  重建完：{total} 条向量化，覆盖 {len(corpus)} 个人"
+                     + (f"｜{note}" if note else ""))
+        self.ui.line("  （真相在 md 文件里，索引只是加速器——重建失败也不影响她记得的事）",
+                     style="dim")
         return True
 
     def _persona_list(self) -> None:

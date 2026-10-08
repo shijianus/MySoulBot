@@ -885,6 +885,65 @@ def channel_neutral_checks(check: Checker) -> None:
     check.ok("只给号也销得掉", desk.pending_hellos() == [], desk.pending_hellos())
 
 
+async def audience_checks(check: Checker) -> None:
+    """逐人微调：判断册要能分清「对谁成立」。
+
+    「对凯子要一次说完一件事」和「对龙腾可以贫」是两条不同的经验。
+    合成一条全局规则，等于两条都写错；把甲试出来的打法端给乙看，
+    她就会拿乙当试验田——这不是成长，是串味。
+    """
+    s = tier_settings()
+    ledger = J.JudgmentLedger(s)
+    ledger.apply([
+        J.Rule(text="长话会被晾着，先给一句短的", confidence=60, who=""),
+        J.Rule(text="对这人要一次说完一件事", confidence=60, who="qq_group_950689514"),
+    ])
+    lines = ledger.read_text("qq_group_950689514")
+    check.ok("本人看得到通用条与专属条",
+             "长话会被晾着" in lines and "一次说完一件事" in lines, lines)
+    other = ledger.read_text("qq_private_999")
+    check.ok("别人看不到那条专属判断（不然就拿甲的打法打乙）",
+             "长话会被晾着" in other and "一次说完一件事" not in other, other)
+    check.ok("专属条在盘上带得出是谁",
+             any(rule.who == "qq_group_950689514" for rule in ledger.rules()),
+             [rule.line() for rule in ledger.rules()])
+
+    # 同一句措辞对不同人是两条，不许被字面相近合成一条
+    added, revised = ledger.apply([J.Rule(text="对这人要一次说完一件事", confidence=50,
+                                        who="qq_private_777")])
+    check.ok("同话不同人不合并（新增一条而不是加置信度）",
+             added == 1 and revised == 0, f"{added}/{revised}")
+    check.ok("两条同措辞的规则各自活着",
+             len([r for r in ledger.rules() if r.text == "对这人要一次说完一件事"]) == 2,
+             ledger.read_text("qq_private_777"))
+
+    # 观测只核对它那一味的人
+    before = {r.text: r.confidence for r in ledger.rules() if r.who == "qq_private_777"}
+    for _ in range(3):
+        ledger.reinforce(J.Outcome(user_id="qq_group_950689514", at=time.time(),
+                                   our_chars=20, their_chars=40, replied=True))
+    after = {r.text: r.confidence for r in ledger.rules() if r.who == "qq_private_777"}
+    check.ok("别人的成败不动这条专属判断", before == after, f"{before}→{after}")
+
+    # 凭空发明一个 w= 要被打回全局：给不存在的人定打法是幻觉
+    loop = J.JudgmentLoop(tier_settings(judgment_every_turns=3), StorageManager(s))
+
+    async def ghost_ask(prompt: str, **kwargs: Any) -> str:
+        return "- 对这人别列条目 [k=audience c=60 n=1 w=qq_private_404notfound]"
+
+    loop.bind_ask(ghost_ask)
+    loop.note(J.Outcome(user_id="u_here", at=time.time(), our_chars=200,
+                        their_chars=3, replied=True))
+    loop.note(J.Outcome(user_id="u_here", at=time.time(), our_chars=200,
+                        their_chars=3, replied=True))
+    loop.note(J.Outcome(user_id="u_here", at=time.time(), our_chars=200,
+                        their_chars=3, replied=True))
+    await loop.reflect()
+    made = [rule for rule in loop.ledger.rules() if rule.text == "对这人别列条目"]
+    check.ok("统计里没有的人，不许挂上 w=",
+             bool(made) and made[0].who == "", [(r.text, r.who) for r in loop.ledger.rules()])
+
+
 # ---------------------------------------------------------------- 5. 提示词吃到判断
 async def judgment_sensors_checks(check: Checker) -> None:
     """传感器的对错：被晾着必须量得出来，接话率必须能低于 100%。
@@ -1005,6 +1064,14 @@ async def prompt_layer_checks(check: Checker) -> None:
     check.ok("快捷档也吃到判断（短对话才是大多数）", "长解释容易被晾着" in quick, "")
     check.ok("快捷档仍不背宪法", "LAYER 0 · 深层灵魂" not in quick, "")
 
+    # 出戏的两半：提示词说清 + 出口拦死。这里验前半。
+    check.ok("全量档带真人身份锁", "【真人身份锁】" in full and "沉默不出戏" in full, "")
+    check.ok("快捷档也带身份锁（「你是什么模型」正是短对话，最常走快捷档）",
+             "【身份锁】" in quick, quick[-200:])
+    primed = [name for name in ("GPT", "gpt", "Qwen", "GLM", "Claude", "Gemini",
+                                "DeepSeek", "siliconflow") if name in full or name in quick]
+    check.ok("提示词里一个模型名都没有（摆上去等于给她一排候选答案）", not primed, primed)
+
     empty = J.JudgmentLedger(tier_settings(storage_dir=Path(tempfile.mkdtemp())))
     builder.bind_judgment(empty)
     bare, _ = await builder.build_system_prompt(OWNER_USER_ID, tool_mode="off")
@@ -1033,6 +1100,7 @@ async def main() -> int:
         judgment_checks(check)
         await judgment_loop_checks(check)
         await judgment_sensors_checks(check)
+        await audience_checks(check)
         await prompt_layer_checks(check)
     finally:
         print(f"\n共 {check.count} 项断言，失败 {len(check.failures)} 项")

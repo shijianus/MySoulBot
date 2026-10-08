@@ -27,6 +27,7 @@ import datetime as dt
 import hashlib
 import importlib.util
 import itertools
+import json
 import math
 import random
 import re
@@ -36,6 +37,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Final
 from urllib.parse import quote
+import urllib.error
+import urllib.request
 
 from config import Settings
 from core.presence import in_deep_night, resolve_now, slot_for
@@ -57,7 +60,8 @@ _STYLE_CHARS: Final[re.Pattern[str]] = re.compile(r"[*_`#>|]+")
 _UNTIL_BREAK: Final[re.Pattern[str]] = re.compile(r"[（(\[【].*$", re.S)
 _NAME_SAFE: Final[re.Pattern[str]] = re.compile(r"[^\w.\-]+")
 _SERIAL: Final = itertools.count()
-_PROVIDERS: Final[frozenset[str]] = frozenset({"auto", "edge", "stub", "none"})
+_PROVIDERS: Final[frozenset[str]] = frozenset(
+    {"auto", "edge", "stub", "openai_compat", "none"})
 
 # 时段 → (语速倍率, 基频 Hz, 响度, 音节间隙 ms, 换气 ms)。深夜那一档最慢最低最轻。
 _SLOT_PROSODY: Final[dict[str, tuple[float, float, float, int, int]]] = {
@@ -157,17 +161,50 @@ def spoken_text(text: str, settings: Settings) -> str:
     cleaned = _ACTION_SPAN.sub(" ", cleaned)
     cleaned = _UNTIL_BREAK.sub(" ", cleaned)  # 没闭合的括号：后面整段都是动作描写
     cleaned = _STYLE_CHARS.sub(" ", cleaned)
-    flat = re.sub(r"\s+", " ", cleaned).strip()
+    cleaned = _pauses_in(cleaned)
+    flat = re.sub(r"[ \t]+", " ", cleaned).strip()
     return flat[: settings.tts_max_chars]
 
 
+# 一句结尾有没有收口气的标点：没有的话补一个句号，念出来才有个停顿
+_OPEN_END: Final[re.Pattern[str]] = re.compile(r"[。！？!?…；;，,：:．.—”』」）)]$")
+
+
+def _pauses_in(text: str) -> str:
+    """把「换行」翻译回「气口」。
+
+    原来这里一把 `re.sub(r"\\s+", " ")` 把所有空白压平：她在屏幕上分成三条气泡、
+    用空行隔开板块的那些停顿，到嘴里就成了一串没有断句的长句——
+    「像机器翻的、中间不停顿」那一手投诉，根子就在这一行上。
+    真人念话是靠断句喘气的：一行没说 complete 的，补个句号让它停一下。
+    """
+    pieces: list[str] = []
+    for chunk in re.split(r"\n+", text or ""):
+        line = chunk.strip()
+        if not line:
+            continue
+        if not _OPEN_END.search(line):
+            line = line + "。"
+        pieces.append(line)
+    return "".join(pieces)
+
+
 def provider_of(settings: Settings) -> str:
-    """`auto` 的落点：装了 edge-tts 就真人声，没装就标准库哼一段。"""
+    """`auto` 的落点：装了 edge-tts 就真人声，配了本地语音网关就用它，都没有就标准库哼一段。
+
+    `openai_compat` 指的是**任何** OpenAI 兼容的 `/v1/audio/speech`：
+    VoiceStudio（本地、免 key、可克隆音色）、CosyVoice 之类的网关、以及自建 sidecar
+    都走这一条——接新引擎不该再改这个文件，改的是 .env 里那个 base_url。
+    """
     wanted = (settings.tts_provider or "auto").strip().lower()
     if wanted not in _PROVIDERS:
         wanted = "auto"
     if wanted == "auto":
-        return "edge" if _edge_present() else "stub"
+        if _edge_present():
+            return "edge"
+        return "openai_compat" if (settings.tts_speech_base_url or "").strip() else "stub"
+    if wanted == "openai_compat" and not (settings.tts_speech_base_url or "").strip():
+        return "stub"          # 没填地址就没有网关可问，别把一段话憋死在这里
     return wanted
 
 
@@ -221,12 +258,14 @@ async def synthesize(
         raise VoiceError("这句里没有要说出口的话")
     prosody = prosody_for(now or resolve_now(None, settings.user_timezone), settings)
     directory = storage.audio_dir(user_id)
-    suffix = "mp3" if provider == "edge" else "wav"
+    suffix = "wav" if provider == "stub" else "mp3"
     path = directory / _stamp_name(user_id, suffix)
     await asyncio.to_thread(directory.mkdir, parents=True, exist_ok=True)
     try:
         if provider == "edge":
             seconds = await _via_edge(words, settings, path, prosody)
+        elif provider == "openai_compat":
+            seconds = await _via_gateway(words, settings, path, prosody)
         else:
             seconds = await asyncio.to_thread(_render_wav, words, prosody, path)
     except VoiceError:
@@ -274,6 +313,64 @@ async def _via_edge(words: str, settings: Settings, path: Path, prosody: VoicePr
     except Exception as exc:  # noqa: BLE001 - 在线合成失败不该惊动界面
         raise VoiceError(f"声音没念成（{type(exc).__name__}）") from exc
     # mp3 的时长不在标准库里猜：猜错比不说更容易骗到界面上的进度条
+    return 0.0
+
+
+def _speech_request(url: str, payload: dict[str, Any], key: str, timeout: float) -> bytes:
+    """问一次语音服务，拿回音频字节。同步函数，交给 `to_thread` 跑。"""
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    headers = {"content-type": "application/json"}
+    if key:
+        headers["authorization"] = f"Bearer {key}"
+    request = urllib.request.Request(url, data=body, headers=headers, method="POST")
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            content_type = str(response.headers.get("content-type") or "")
+            data = response.read()
+    except urllib.error.HTTPError as exc:
+        detail = ""
+        with contextlib.suppress(Exception):
+            detail = exc.read().decode("utf-8", "ignore")[:160]
+        raise VoiceError(f"语音服务回了 {exc.code}{('：' + detail) if detail else ''}") from exc
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        raise VoiceError(f"语音服务没接电话（{type(exc).__name__}）") from exc
+    if "audio" not in content_type.lower() and "octet" not in content_type.lower():
+        # 网关报错时常常回一段 JSON 200：那玩意儿存成 .mp3 就是一段能点的噪音
+        raise VoiceError(f"语音服务回的不是音频（{content_type[:40] or '没写类型'}）")
+    return data
+
+
+async def _via_gateway(words: str, settings: Settings, path: Path,
+                       prosody: VoiceProsody) -> float:
+    """走 OpenAI 兼容的 /v1/audio/speech：VoiceStudio、CosyVoice 网关、自建 sidecar 都这条路。
+
+    为什么只做 HTTP 而不引 SDK：这个专案刻意只有五个依赖（`requirements.txt`），
+    接谁家引擎该改的是 .env 里那个地址，不是往环境里塞一个几百 MB 的 torch。
+    """
+    base = (settings.tts_speech_base_url or "").strip().rstrip("/")
+    if not base:
+        raise VoiceError("没填语音服务的地址（TTS_SPEECH_BASE_URL）")
+    url = base if base.endswith("/audio/speech") else f"{base}/audio/speech"
+    voice = settings.tts_voice_night if prosody.night else settings.tts_voice_day
+    payload: dict[str, Any] = {
+        "input": words,
+        "response_format": "mp3",
+        # 语速按时段走（深夜那一档本来就慢）：这是「像她今天这个状态」的一半
+        "speed": round(max(0.5, min(2.0, prosody.rate)), 2),
+    }
+    if voice:
+        payload["voice"] = voice
+    if settings.tts_speech_model:
+        payload["model"] = settings.tts_speech_model
+    # 音调不在 OpenAI 的形状里，但支持的网关各自认这些键；一并带上，不认的就忽略
+    if settings.tts_pitch_bias_hz:
+        payload["pitch"] = round(prosody.pitch_hz, 1)
+    data = await asyncio.to_thread(_speech_request, url, payload,
+                                   (settings.tts_speech_api_key or "").strip(),
+                                   settings.tts_timeout)
+    if not data:
+        raise VoiceError("语音服务回了个空")
+    await asyncio.to_thread(path.write_bytes, data)
     return 0.0
 
 

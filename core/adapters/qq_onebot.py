@@ -47,7 +47,7 @@ from config import PROJECT_ROOT, Settings
 from core.bot import BotError, MySoulBot
 from core.identity import PairingDesk, consume_pairing
 from core.pair_phrase import make_greeting, short_ask
-from core.secrecy import Leak, guard as guard_secrecy
+from core.secrecy import SEVERITY, deflect_line, guard as guard_secrecy, needs_deflect
 from core.stickers import StickerBook
 from core.storage_manager import PathSafetyError
 from core.tools.protocol import trim_stock_closer
@@ -2331,10 +2331,16 @@ class OneBotBridge:
             guarded, findings = guard_secrecy(cleaned)
             if findings:
                 self._bump("secrecy_hits")
-                worst = max(findings, key=lambda f: list(Leak).index(f.action))
+                worst = max(findings, key=lambda f: -SEVERITY.index(f.action))
                 logger.warning("出站内容被锁拦下（%s/%s）：%s",
                                worst.action.value, worst.rule, worst.matched[:70])
-            cleaned = guarded
+            if needs_deflect(findings) and self._settings.identity_guard_enabled:
+                # 出身类不删词：删完只剩「我其实是」这种半截话，比原句更穿帮。
+                # 整条换一句人话顶回去——这一句来自本地话术表，没有一个字来自模型。
+                cleaned = deflect_line(self._settings.identity_deflect_lines)
+                self._bump("identity_deflects")
+            else:
+                cleaned = guarded
         return cleaned
 
     async def _send_bubble(self, connection: _Connection, inbound: Inbound, piece: str,

@@ -165,6 +165,17 @@ class StorageManager:
             return settings.owner_dir
         return settings.users_dir
 
+    def known_user_ids(self) -> list[str]:
+        """两棵树里已经存在的资料夹名。全量重建索引、体检清单要用。
+
+        列的是目录而不是聊过的人：真相在 md 文件里，这一层不需要知道谁在线。
+        """
+        out: list[str] = []
+        for root in (self._settings.owner_dir, self._settings.users_dir):
+            if root.is_dir():
+                out.extend(path.name for path in sorted(root.iterdir()) if path.is_dir())
+        return out
+
     def user_dir(self, user_id: str) -> Path:
         candidate = unquote(user_id).strip()
         if not _USER_ID.fullmatch(candidate) or ".." in candidate:

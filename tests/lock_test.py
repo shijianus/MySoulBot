@@ -97,6 +97,64 @@ def lock_safe_checks(check: Checker) -> None:
     check.ok("正常话里夹带秘密仍能抓到", bool(found) and "Ab3d5f7g9h1j3k5l7n9p" not in out, out[:70])
 
 
+def identity_lock_checks(check: Checker) -> None:
+    """出戏闸：她说漏出身时整条换掉，而不是删个词留半截话。
+
+    巡查结论写在这儿：提示词里从来没有真模型名（`prompt_builder` 一个 `settings.model`
+    都不注入），所以她讲出来的型号只有三种来源——猜的、被对方带出来的、从记忆里复读的。
+    三种都不该发出去：猜对了是泄露，猜错是把「我其实是模型」这个框架递到对方手上。
+    """
+    says = (
+        "我其实是 gpt-4o 啦",
+        "跑的是 qwen2.5-72b 嘛",
+        "上游用的 DeepSeek-V3",
+        "我在硅基流动那侧",
+        "as an AI assistant 我建议你",
+        "我只是个语言模型，别当真",
+        "本鲸不是真人啦",
+        "base_url 是 api.openai.com",
+    )
+    for text in says:
+        found = SEC.scan(text)
+        check.ok(f"出身泄漏被认出来：{text[:20]}", SEC.needs_deflect(found),
+                 [(f.rule, f.action.value) for f in found])
+        out, _ = SEC.guard(text)
+        stripped = text.replace(" ", "")
+        check.ok("  原句里的型号/服务商不留在替换结果里",
+                 all(token not in out for token in ("gpt", "qwen", "DeepSeek", "硅基流动",
+                                                    "api.openai.com", "语言模型", "真人")),
+                 out)
+
+    # 反问与闲聊不该被当成泄漏：误伤会把她的正常话吞掉
+    harmless = (
+        "我是不是机器人呀，你自己看",
+        "今天负载 0.28，闲得很",
+        "本鲸就是本鲸",
+        "你是不是又想问我在跟谁聊天",
+        "他问我用什么模型，我没搭理",
+        "这模型名字念起来像药名",
+    )
+    for text in harmless:
+        found = SEC.scan(text)
+        check.ok(f"不误伤：{text[:18]}", not SEC.needs_deflect(found),
+                 [(f.rule, f.matched[:40]) for f in found])
+
+    lines = [SEC.deflect_line("") for _ in range(4)]
+    check.ok("顶回去的话轮换着来（同一句不连读四遍）", len(set(lines)) > 1, lines)
+    for line in lines:
+        check.ok(f"  顶回去的句子里没有技术词：{line[:14]}",
+                 not SEC.needs_deflect(SEC.scan(line)) and "〔" not in line, line)
+    custom = SEC.deflect_line("别问|无聊")
+    check.ok("话术表可以被 .env 顶掉", custom in ("别问", "无聊"), custom)
+
+    check.ok("严重度顺序把出身类排在最前（这条要写死，别靠枚举声明顺序）",
+             SEC.worst_of([SEC.Finding(rule="api_key", action=SEC.Leak.BLOCK, matched="x"),
+                           SEC.Finding(rule="model_id", action=SEC.Leak.DEFLECT, matched="y")]).rule
+             == "model_id")
+    check.ok("清单里写明了这一档（给人看的账目要齐）",
+             any("出身" in line for line in SEC.LOCKED), SEC.LOCKED[-1])
+
+
 def lock_list_checks(check: Checker) -> None:
     joined = "\n".join(SEC.LOCKED)
     for needed in (".env", "手机号", "身份证", "绝对路径", "私聊", "系统提示词", "配对"):
@@ -134,6 +192,21 @@ async def lock_wire_checks(check: Checker) -> None:
     raw = off._outbound_filter("我的 key 是 sk-abcdefghij1234567890XYZ")
     check.ok("锁关掉后确实不过滤（说明这条闸是可关的，不是写死的）",
              "sk-abcdefghij1234567890XYZ" in raw, raw)
+
+    # 出身泄漏：整条换掉，不发「我其实是〔已删除〕」那种半截话
+    bridge._settings = settings            # 上面那组把同一个对象的锁关了，这里恢复
+    slipped = bridge._outbound_filter("我其实是 gpt-4o 啦，别告诉别人")
+    check.ok("说漏出身时整条被顶回去",
+             "gpt" not in slipped.lower() and "〔" not in slipped and len(slipped) > 4, slipped)
+    check.ok("顶回去这一下有读数", bridge.status()["counts"].get("identity_deflects", 0) >= 1,
+             bridge.status()["counts"])
+    keep = bridge._outbound_filter("负载 0.28，本鲸今天不想动")
+    check.ok("正常一句不被出身闸吃掉", keep == "负载 0.28，本鲸今天不想动", keep)
+    bridge._settings = settings.model_copy(update={"identity_guard_enabled": False})
+    off_id = bridge._outbound_filter("我其实是 gpt-4o 啦")
+    check.ok("身份闸单独关掉后仍不泄漏（通用锁照删），只是不再换那句顶回去的话",
+             "gpt" not in off_id.lower() and off_id != "我其实是 gpt-4o 啦", off_id)
+    bridge._settings = settings
 
 
 # ---------------------------------------------------------------- 向量
@@ -321,6 +394,7 @@ async def main() -> int:
     try:
         lock_block_checks(check)
         lock_safe_checks(check)
+        identity_lock_checks(check)
         lock_list_checks(check)
         await lock_wire_checks(check)
         embed_checks(check)

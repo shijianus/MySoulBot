@@ -552,7 +552,94 @@ async def voice_checks(check: Checker, settings: Any, base: str) -> None:
     check.ok("超长被截到上限",
              len(voice.spoken_text("话" * (settings.tts_max_chars + 400), settings)) <= settings.tts_max_chars)
 
+    # ---- 换行是气口 ----
     storage = StorageManager(settings)
+    # 「配音没有停顿、像机器翻的」那一手投诉的根子：原来一个 `\s+ → " "` 把她
+    # 分三条气泡、用空行隔开板块的停顿全压平了。真人念话是靠断句喘气的。
+    paced = voice.spoken_text("本鲸不去\n\n真的不去\n你劝我也不会动", settings)
+    check.ok("分行说的话念得出停顿（补句读而不是压成空格）",
+             paced.count("。") >= 2 and "\n" not in paced, paced)
+    check.ok("本来就收住的地方不重复补刀",
+             "。。" not in voice.spoken_text("今天好热啊……你去游泳了？\n嗯。", settings),
+             voice.spoken_text("今天好热啊……你去游泳了？\n嗯。", settings))
+
+    # ---- OpenAI 兼容语音网关：VoiceStudio（本地、可克隆音色）与 CosyVoice sidecar 都走这条 ----
+    captured: dict[str, Any] = {}
+
+    class _SpeechHandler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def log_message(self, *args: object) -> None:
+            return None
+
+        def do_POST(self) -> None:
+            length = int(self.headers.get("content-length") or 0)
+            try:
+                captured.update(json.loads(self.rfile.read(length).decode("utf8") or "{}"))
+            except json.JSONDecodeError:
+                captured["bad_json"] = True
+            captured["_auth"] = self.headers.get("authorization") or ""
+            if "nope" in self.path:
+                self.send_error(404, "no such engine")
+                return
+            blob = b"ID3\x03\x00fake-mp3-payload"
+            self.send_response(200)
+            self.send_header("content-type", "audio/mpeg")
+            self.send_header("content-length", str(len(blob)))
+            self.end_headers()
+            self.wfile.write(blob)
+
+        def do_GET(self) -> None:
+            self.send_response(404)
+            self.send_header("content-length", "0")
+            self.end_headers()
+
+    fake_speech = ThreadingHTTPServer(("127.0.0.1", 0), _SpeechHandler)
+    threading.Thread(target=fake_speech.serve_forever, daemon=True).start()
+    speech_port = fake_speech.server_address[1]
+    gw = settings.model_copy(update={
+        "tts_provider": "openai_compat",
+        "tts_speech_base_url": f"http://127.0.0.1:{speech_port}/v1",
+        "tts_speech_api_key": "local-test-key",
+        "tts_speech_model": "omnivoice",
+    })
+    try:
+        check.ok("填了地址才选得到网关这条路",
+                 voice.provider_of(gw) == "openai_compat", voice.provider_of(gw))
+        check.ok("选了网关却没填地址 → 退回本地哼一段，不把话憋死",
+                 voice.provider_of(gw.model_copy(update={"tts_speech_base_url": ""})) == "stub")
+        clip = await voice.synthesize("本鲸不去\n你劝我也不会动", gw, storage, "gw_user", now=noon)
+        check.ok("网关的音频真的落盘",
+                 clip.path.is_file() and clip.path.read_bytes().startswith(b"ID3"), str(clip.path))
+        check.ok("网关那条落的是 mp3（stub 才落 wav）", clip.path.suffix == ".mp3", clip.path.name)
+        check.ok("provider 记在片子上", clip.provider == "openai_compat", clip.provider)
+        check.ok("按时段把语速带过去了", 0.5 <= float(captured.get("speed") or 0) <= 2.0, captured)
+        check.ok("音色与模型都传给了引擎",
+                 captured.get("voice") and captured.get("model") == "omnivoice", captured)
+        check.ok("填了 key 才发 Authorization 头",
+                 captured.get("_auth") == "Bearer local-test-key", captured.get("_auth"))
+        twin = gw.model_copy(update={"tts_voice_night": "zh-CN-XiaohanNeural"})
+        await voice.synthesize("深夜了，靠过来点", twin, storage, "gw_user", now=late)
+        check.ok("深夜里传给引擎的是夜间音色",
+                 captured.get("voice") == "zh-CN-XiaohanNeural", captured.get("voice"))
+        await voice.synthesize("下午好呀", twin, storage, "gw_user", now=noon)
+        check.ok("白天回到白天那套音色", captured.get("voice") == twin.tts_voice_day,
+                 captured.get("voice"))
+        no_key = gw.model_copy(update={"tts_speech_api_key": ""})
+        await voice.synthesize("再念一句", no_key, storage, "gw_user", now=noon)
+        check.ok("本地 VoiceStudio 免 key：不填就不发 Authorization 头",
+                 captured.get("_auth") == "", captured.get("_auth"))
+        broken = gw.model_copy(update={"tts_speech_base_url": f"http://127.0.0.1:{speech_port}/nope"})
+        try:
+            await voice.synthesize("试一句", broken, storage, "gw_user", now=noon)
+            check.ok("网关报错时收敛成一句人话", False, "竟然念成了")
+        except voice.VoiceError as exc:
+            check.ok("网关报错时收敛成一句人话（不炸、不留半成品文件）",
+                     "语音服务" in str(exc), str(exc))
+    finally:
+        fake_speech.shutdown()
+        threading.Event().wait(0.05)
+
     short_day = await voice.synthesize(SPOKEN_LINE, settings, storage, "voice_user", now=noon)
     again = await voice.synthesize(SPOKEN_LINE, settings, storage, "voice_user", now=noon)
     short_night = await voice.synthesize(SPOKEN_LINE, settings, storage, "voice_user", now=late)

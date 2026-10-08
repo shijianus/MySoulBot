@@ -25,7 +25,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Final
 
-from core.secrecy import Leak, guard as guard_secrecy
+from core.secrecy import SEVERITY, guard as guard_secrecy, needs_deflect
 from core.storage_manager import atomic_write
 from core.tools.base import Tool, ToolContext, ToolParam, ToolResult
 
@@ -64,7 +64,11 @@ def _locked(ctx: ToolContext, text: str) -> tuple[str, str]:
     guarded, findings = guard_secrecy(text)
     if not findings:
         return guarded, ""
-    worst = max(findings, key=lambda f: [Leak.BLOCK, Leak.SCRUB, Leak.WATCH].index(f.action))
+    worst = max(findings, key=lambda f: -SEVERITY.index(f.action))
+    if needs_deflect(findings):
+        # 公开广播这条路不换「顶回去的话」：顶回去是给对面一个人听的，
+        # 挂到说说上就成了莫名其妙的一条。这一条干脆别发。
+        return "", f"{worst.action.value}/{worst.rule}"
     return guarded, f"{worst.action.value}/{worst.rule}"
 
 

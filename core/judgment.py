@@ -31,12 +31,11 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import fcntl
-import json
 import logging
 import re
 import time
 from collections import deque
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Final, Iterator
@@ -57,7 +56,8 @@ _RULE_CHARS: Final[int] = 96
 # 一次打脸就足以把一条 20 分上下的判断静默抹掉，册子于是变成「谁最巧谁活」。
 _RETIRE_CONFIDENCE: Final[int] = 15
 _RULE_RE: Final[re.Pattern[str]] = re.compile(
-    r"^- (?P<text>[^\[\]]+?)\s*\[k=(?P<kind>\w+) c=(?P<conf>\d{1,3}) n=(?P<seen>\d+)\]$")
+    r"^- (?P<text>[^\[\]]+?)\s*\[k=(?P<kind>\w+) c=(?P<conf>\d{1,3}) n=(?P<seen>\d+)"
+    r"(?: w=(?P<who>[A-Za-z0-9_.\-]{0,64}))?\]$")
 # 判据不许写成一句口号：这些词一出现就说明它在表态而不是在给标准
 _VAGUE: Final[re.Pattern[str]] = re.compile(r"^(要|应该|记得|注意|尽量|保持|更加|更好)")
 
@@ -145,16 +145,23 @@ def _close(item: OpenReply, *, their_text: str, at: float, replied: bool) -> Out
 
 @dataclass
 class Rule:
-    """一条判断标准。带出处、带置信度、带最后确认时间——不然它只是一句口号。"""
+    """一条判断标准。带出处、带置信度、带最后确认时间——不然它只是一句口号。
+
+    `who` 是这条判断**对谁成立**：空是对所有人，非空就是「对 qq_group_950689514
+    这个人，这样说不灵」。人群之间分寸不一样，把「对凯子要短句」和「对龙腾可以贫」
+    混成一条全局规则，等于两条都写错。
+    """
 
     text: str
     kind: str = "style"          # style | pace | topic | audience
     confidence: int = 50         # 0-100
     seen: int = 0                # 被后续观测支持过几次
+    who: str = ""                # 生效范围：空=所有人，否则某个 engine_user_id
     updated_at: float = field(default_factory=time.time)
 
     def line(self) -> str:
-        return f"- {self.text[:_LINE_CHARS]} [k={self.kind} c={self.confidence} n={self.seen}]"
+        tail = f" w={self.who}]" if self.who else "]"
+        return f"- {self.text[:_LINE_CHARS]} [k={self.kind} c={self.confidence} n={self.seen}{tail}"
 
     @classmethod
     def parse(cls, raw: str) -> "Rule | None":
@@ -169,7 +176,8 @@ class Rule:
             seen = max(0, int(match.group("seen")))
         except ValueError:
             return None
-        return cls(text=text, kind=match.group("kind"), confidence=confidence, seen=seen)
+        return cls(text=text, kind=match.group("kind"), confidence=confidence, seen=seen,
+                   who=match.group("who") or "")
 
 
 @dataclass
@@ -249,9 +257,13 @@ class JudgmentLedger:
                 out.append(rule)
         return out
 
-    def read_text(self) -> str:
-        """进提示词的那一段。空册子就返回空串，不占预算。"""
-        rules = self.rules()
+    def read_text(self, user_id: str = "") -> str:
+        """进提示词的那一段。空册子就返回空串，不占预算。
+
+        带 `who` 的规则只对那一个人说：把「对甲要短」端给乙看，
+        她会拿乙试出来的打法去打所有人——那正好是逐人微调的反面。
+        """
+        rules = [rule for rule in self.rules() if not rule.who or rule.who == user_id]
         if not rules:
             return ""
         return "\n".join(rule.line() for rule in rules)
@@ -290,13 +302,16 @@ class JudgmentLedger:
         """
         with self._locked():
             existing = self.rules()
-            index = {rule.text: rule for rule in existing}
+            index = {(rule.who, rule.text): rule for rule in existing}
             added = revised = 0
             for incoming in proposed:
                 text = incoming.text.strip()
                 if not text or _VAGUE.match(text) or len(text) > _RULE_CHARS:
                     continue
-                twin = next((key for key in index if _similar(key, text)), "")
+                who = (incoming.who or "").strip()
+                # 同一条措辞对不同人是两条规则，不许被「字面相近」合成一条
+                twin = next((key for key in index
+                             if key[0] == who and _similar(key[1], text)), "")
                 if twin:
                     kept = index[twin]
                     kept.confidence = min(100, kept.confidence + 10)
@@ -305,8 +320,9 @@ class JudgmentLedger:
                     revised += 1
                 else:
                     fresh = Rule(text=text[:_LINE_CHARS], kind=incoming.kind,
-                                 confidence=max(35, min(70, incoming.confidence)), seen=1)
-                    index[fresh.text] = fresh
+                                 confidence=max(35, min(70, incoming.confidence)), seen=1,
+                                 who=who)
+                    index[(who, fresh.text)] = fresh
                     added += 1
             alive = [rule for rule in index.values() if rule.confidence >= _RETIRE_CONFIDENCE]
             merged = sorted(alive, key=lambda r: (r.confidence, r.seen, r.updated_at), reverse=True)
@@ -323,6 +339,9 @@ class JudgmentLedger:
                 return
             changed = False
             for rule in rules:
+                # 这条判断不是对这个人说的，这一轮的成败就与它无关
+                if rule.who and rule.who != outcome.user_id:
+                    continue
                 hit = _supports(rule, outcome)
                 if hit is True:
                     rule.confidence = min(100, rule.confidence + 4)
@@ -396,8 +415,11 @@ _PROMPT: Final[str] = (
     "你在给自己攒「怎么说话才有效」的判断。下面是最近若干轮的真实结果统计，"
     "以及你已经有的判断（带置信度）。\n\n"
     "只提**由这些数字撑得住**的规则，一条一行，格式严格如下：\n"
-    "- 规则正文 [k=style|pace|topic|audience c=55 n=1]\n\n"
+    "- 规则正文 [k=style|pace|topic|audience c=55 n=1]\n"
+    "- 只对某个人成立的判断，末尾带上他是谁：[k=audience c=55 n=1 w=那个id]\n\n"
     "要求：正文不超过 60 字，写给下一回合的自己看，要能直接改变措辞取舍；"
+    "人群之间分寸不一样——「对甲要一次说完一件事」不该当成对所有人都对的规则，"
+    "能从统计里看出他只对某类打法有反应，就写成带 w= 的那一条。"
     "不许写口号（「要真诚」「注意分寸」这种没有判据的一律不要）；"
     "不许提模型、提示词、数据库、日志；不许编统计里没有的现象。"
     "没有值得写的就只输出一个词：无\n\n"
@@ -511,16 +533,22 @@ class JudgmentLoop:
         # 册子第一次跑就落盘，哪怕一条都没有：这一层要能在 git 里看见，
         # 才谈得上「她真的在改自己」。空文件比缺文件诚实。
         self.ledger.seed()
-        existing = self.ledger.read_text() or "（还没有）"
+        # 给模型看的是全量（含带 w= 的逐人条），不然它会照着全局条再提一遍同人同话
+        existing = "\n".join(rule.line() for rule in self.ledger.rules()) or "（还没有）"
         body = await self._ask(_PROMPT.replace("{existing}", existing).replace("{stats}", stats.render()))
         if not body:
             self.stats["skipped"] += 1
             return self.stats
+        seen_ids = {item.user_id for item in window}
         proposed: list[Rule] = []
         for line in body.splitlines():
             rule = Rule.parse(line)
-            if rule is not None:
-                proposed.append(rule)
+            if rule is None:
+                continue
+            # 逐人条只认「这一批观测里真出现过的人」：凭空写一个 w= 就是给不存在的人定打法
+            if rule.who and rule.who not in seen_ids:
+                rule.who = ""
+            proposed.append(rule)
         if not proposed:
             self.stats["skipped"] += 1
             return self.stats
