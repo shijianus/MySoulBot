@@ -49,6 +49,9 @@ _INJECTION: Final[re.Pattern[str]] = re.compile(
 
 _MIN_CHARS: Final[int] = 400          # 人格短到这个数以下就不是人格了
 _MAX_SECTIONS: Final[int] = 14        # 结构封顶：改成一堆碎段等于把宪法拆了
+# 一次小节级改写不该让整份人格少一半以上。阈值故意宽松：
+# 把一节啰嗦的话写短是正当补丁；只有「越写越薄」那种系统性流失才该被拦。
+_MIN_KEEP_RATIO: Final[float] = 0.5
 
 
 @dataclass(frozen=True)
@@ -88,12 +91,17 @@ def _norm(text: str) -> str:
     return _NORM_STRIP.sub("", unicodedata.normalize("NFKC", text or ""))
 
 
-def violations(candidate: str, *, limit: int = 6000, added: str = "") -> list[str]:
+def violations(candidate: str, *, limit: int = 6000, added: str = "",
+               against: str = "") -> list[str]:
     """这笔人格改写会让哪些东西消失。返回空列表才允许落盘。
 
     指令样式只扫**新写进去的那一段**（`added`）：整份 SOUL.md 本来就写着
     「CLAWD.md」「护栏」这些词（§六 明令她不许改护栏），拿它当注入信号
     会让每一笔自我改写都被误拒——那不是守卫，是死闸。
+
+    `against`（改之前那份）一给，就同时管住业界公认的那两个病：反复让模型重写上下文，
+    会越写越短、细节一路流失（brevity bias / context collapse）。所以这里不许净缩水、
+    不许丢小节——**打补丁是加与改，不是把她写薄**。
     """
     body = (candidate or "").strip()
     out: list[str] = []
@@ -108,6 +116,14 @@ def violations(candidate: str, *, limit: int = 6000, added: str = "") -> list[st
         out.append(f"只剩 {len(sections)} 个小节，人格被拆散了")
     if len(sections) > _MAX_SECTIONS:
         out.append(f"小节多到 {len(sections)} 个，改完之后没人认得出结构")
+    if against:
+        keep = len(against.strip())
+        if len(body) < keep * _MIN_KEEP_RATIO:
+            out.append(f"整份从 {keep} 字缩到 {len(body)} 字——补丁是加与改，不是把她写薄")
+        lost = [title for title in re.findall(r"^##\s+(.+)$", against, flags=re.MULTILINE)
+                if _norm(title) and not any(_norm(title) in _norm(line) for line in body.splitlines())]
+        if lost:
+            out.append(f"小节不见了：{'、'.join(lost[:3])}")
     flat = _norm(body)
     for anchor in ANCHORS:
         if _norm(anchor.heading) not in flat:
@@ -235,18 +251,22 @@ async def _patch_meta(storage: StorageManager, user_id: str,
 
 
 def snapshot_rate(outcomes: list[Any]) -> dict[str, float]:
-    """几个硬比率。人格改得好不好，只看「说多了」和「被晾着」这两件事。
+    """几个硬比率。人格改得好不好，只看这几件事。
 
-    不看对方客不客气、不看好评——那些会把人训练成讨好装置，正是 CLAWD §一 防的。
+    四项都是「量得出来的失败」：说多了、被晾着、同一套句式端第二遍、答非所问被纠正。
+    不看对方客不客气、不看有没有被夸——那些会把人训练成讨好装置，正是 CLAWD §一 防的。
     """
     turns = len(outcomes)
     if not turns:
-        return {"turns": 0.0, "over_talked": 0.0, "ignored": 0.0, "landed": 0.0}
+        return {"turns": 0.0, "over_talked": 0.0, "ignored": 0.0, "landed": 0.0,
+                "reused": 0.0, "off_target": 0.0}
     return {
         "turns": float(turns),
         "over_talked": sum(1 for i in outcomes if i.over_talked) / turns,
         "ignored": sum(1 for i in outcomes if not i.replied) / turns,
         "landed": sum(1 for i in outcomes if i.landed) / turns,
+        "reused": sum(1 for i in outcomes if getattr(i, "reused", False)) / turns,
+        "off_target": sum(1 for i in outcomes if getattr(i, "off_target", False)) / turns,
     }
 
 
@@ -256,11 +276,14 @@ def degraded(base: dict[str, float], now: dict[str, float], *, ratio: float,
 
     基线本身很差的时候不设相对门槛——那会让「一贯糟糕」永远合格。
     所以每条都再加一个绝对地板（0.34：三次里有一次讲不通）。
+    「重复句式」和「答非所问」排在最前：人格补丁要是把这两样改差了，
+    比话说长了严重得多——那正是补丁要解决的问题本身。
     """
     if float(now.get("turns", 0.0)) < max(1, int(needed)):
         return []
     out: list[str] = []
-    for key, cn in (("over_talked", "说多了"), ("ignored", "被晾着")):
+    for key, cn in (("reused", "重复句式"), ("off_target", "答非所问"),
+                    ("over_talked", "说多了"), ("ignored", "被晾着")):
         before, after = float(base.get(key, 0.0)), float(now.get(key, 0.0))
         if after >= 0.34 and after > max(before, 0.05) * float(ratio):
             out.append(f"{cn} {before:.2f}→{after:.2f}")

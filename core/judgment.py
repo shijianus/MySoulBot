@@ -60,11 +60,21 @@ _RULE_RE: Final[re.Pattern[str]] = re.compile(
     r"(?: w=(?P<who>[A-Za-z0-9_.\-]{0,64}))?\]$")
 # 判据不许写成一句口号：这些词一出现就说明它在表态而不是在给标准
 _VAGUE: Final[re.Pattern[str]] = re.compile(r"^(要|应该|记得|注意|尽量|保持|更加|更好)")
+# 「答非所问/闹了误会」是能数出来的：对面会**纠正**你。这些纠正话术就是信号。
+# 只认第二人称的指正，不认疑问句里的「是不是」——那是在问，不是在驳。
+_OFF_TARGET: Final[re.Pattern[str]] = re.compile(
+    r"不是(?:这个|我问的|这意思|说要)|我(?:是说|问的是|的意思是)|你没(?:听懂|听明白|懂我)|"
+    r"听错了|理解错了|答非所问|文不对题|跟那个没关系|我不是这个意思|跑题了")
 
 
 @dataclass
 class Outcome:
-    """一次「她说完之后发生了什么」。只装量得出来的东西。"""
+    """一次「她说完之后发生了什么」。只装量得出来的东西。
+
+    两个最该抓住的失败模式（这是「自我成长」的正经定义，不是玄学）：
+    - `reused`：同一套句式被拿去答不同的问题——人一眼就看出来是套话；
+    - `off_target`：答非所问、会错意，对面当场纠正。
+    """
 
     user_id: str
     at: float
@@ -77,6 +87,8 @@ class Outcome:
     group: bool = False
     woke_us: bool = False
     rapport_delta: int = 0
+    reused: bool = False
+    off_target: bool = False
 
     @property
     def over_talked(self) -> bool:
@@ -95,7 +107,8 @@ class Outcome:
 
 def observe(*, user_id: str, our_text: str, our_bubbles: int,
             their_text: str, gap_seconds: float, replied: bool,
-            group: bool = False, woke_us: bool = False, rapport_delta: int = 0) -> Outcome:
+            group: bool = False, woke_us: bool = False, rapport_delta: int = 0,
+            reused: bool = False, off_target: bool = False) -> Outcome:
     """把一轮的原始材料折成一条可统计的结果。判断全在这儿算，不留给模型回忆。"""
     their = (their_text or "").strip()
     return Outcome(
@@ -110,6 +123,8 @@ def observe(*, user_id: str, our_text: str, our_bubbles: int,
         group=group,
         woke_us=woke_us,
         rapport_delta=int(rapport_delta or 0),
+        reused=bool(reused),
+        off_target=bool(off_target or bool(_OFF_TARGET.search(their))),
     )
 
 
@@ -128,10 +143,31 @@ class OpenReply:
     group: bool = False
     woke_us: bool = False
     rapport_delta: int = 0
+    reused: bool = False
+
+
+def _echo(text: str, recent: Sequence[str], *, threshold: float = 0.78) -> bool:
+    """这句是不是把最近说过的某句又端了一遍。
+
+    字符集合重叠的粗判够用了：要抓的不是「措辞相似」，是**同一套句式被拿去答不同的问题**——
+    那种句子轮廓一模一样的复用，字面重叠本来就高。阈值压到 0.78 以下就会把
+    「本鲸」这种自称也算成重复，那是误伤。
+    """
+    body = re.sub(r"\s+", "", text or "")
+    if len(body) < 8:
+        return False
+    shape = set(body)
+    for prev in recent:
+        other = re.sub(r"\s+", "", prev or "")
+        if len(other) < 8:
+            continue
+        if len(shape & set(other)) / max(1, min(len(shape), len(set(other)))) >= threshold:
+            return True
+    return False
 
 
 def _close(item: OpenReply, *, their_text: str, at: float, replied: bool) -> Outcome:
-    """把挂着的那一句结掉：接住了，还是没接。"""
+    """把挂着的那一句结掉：接住了、还是没接。"""
     their = (their_text or "").strip()
     return Outcome(
         user_id=item.user_id, at=at,
@@ -140,6 +176,7 @@ def _close(item: OpenReply, *, their_text: str, at: float, replied: bool) -> Out
         reply_seconds=max(0.0, at - item.started_at),
         asked_back=bool(replied and ("?" in their or "？" in their)),
         group=item.group, woke_us=item.woke_us, rapport_delta=item.rapport_delta,
+        reused=item.reused, off_target=bool(replied and _OFF_TARGET.search(their)),
     )
 
 
@@ -190,6 +227,8 @@ class Stats:
     over_talked: int = 0
     asked_back: int = 0
     slow: int = 0
+    reused: int = 0
+    off_target: int = 0
     group_turns: int = 0
     avg_our_chars: float = 0.0
     avg_their_chars: float = 0.0
@@ -204,11 +243,13 @@ class Stats:
         lines = [
             f"最近 {self.turns} 轮：接话率 {rate}%，接住率 {land}%，"
             f"说多了 {self.over_talked} 次，被晾 {self.slow} 次，对方回问 {self.asked_back} 次",
+            f"重复句式 {self.reused} 次，答非所问被纠正 {self.off_target} 次",
             f"我方平均 {self.avg_our_chars:.0f} 字，对方平均 {self.avg_their_chars:.0f} 字",
         ]
         for uid, bucket in sorted(self.per_user.items())[:6]:
             lines.append(f"  {uid}: {bucket.get('turns', 0)} 轮，"
-                         f"接住 {bucket.get('landed', 0)}，说多 {bucket.get('over_talked', 0)}")
+                         f"接住 {bucket.get('landed', 0)}，说多 {bucket.get('over_talked', 0)}，"
+                         f"重复 {bucket.get('reused', 0)}，跑题 {bucket.get('off_target', 0)}")
         return "\n".join(lines)
 
 
@@ -359,10 +400,14 @@ class JudgmentLedger:
             return Stats()
         bucket: dict[str, dict[str, int]] = {}
         for item in window:
-            slot = bucket.setdefault(item.user_id, {"turns": 0, "landed": 0, "over_talked": 0})
+            slot = bucket.setdefault(
+                item.user_id,
+                {"turns": 0, "landed": 0, "over_talked": 0, "reused": 0, "off_target": 0})
             slot["turns"] += 1
             slot["landed"] += int(item.landed)
             slot["over_talked"] += int(item.over_talked)
+            slot["reused"] += int(item.reused)
+            slot["off_target"] += int(item.off_target)
         return Stats(
             turns=len(window),
             replied=sum(1 for i in window if i.replied),
@@ -370,6 +415,8 @@ class JudgmentLedger:
             over_talked=sum(1 for i in window if i.over_talked),
             asked_back=sum(1 for i in window if i.asked_back),
             slow=sum(1 for i in window if i.slow),
+            reused=sum(1 for i in window if i.reused),
+            off_target=sum(1 for i in window if i.off_target),
             group_turns=sum(1 for i in window if i.group),
             avg_our_chars=sum(i.our_chars for i in window) / len(window),
             avg_their_chars=sum(i.their_chars for i in window) / len(window),
@@ -398,6 +445,13 @@ def _supports(rule: Rule, outcome: Outcome) -> bool | None:
     同一条规则会被两个不相干的信号来回打分。
     """
     text = rule.text
+    # 「重复句式」「答非所问」是两个独立的失败模式，判据先走它们：
+    # 这两类判断的价值就是「别再犯」，所以本轮没犯才算支持
+    if ("重复" in text or "套话" in text or "同一句" in text or "同一套" in text
+            or "同一个说法" in text or "端一遍" in text or "复读" in text):
+        return not outcome.reused
+    if "答非所问" in text or "会错意" in text or "跑题" in text or "听错" in text:
+        return not outcome.off_target
     if "长" in text and ("晾" in text or "没人看" in text or "嫌多" in text or "说多" in text):
         return outcome.over_talked if outcome.replied else None
     if "短" in text and ("接" in text or "回" in text):
@@ -418,6 +472,10 @@ _PROMPT: Final[str] = (
     "- 规则正文 [k=style|pace|topic|audience c=55 n=1]\n"
     "- 只对某个人成立的判断，末尾带上他是谁：[k=audience c=55 n=1 w=那个id]\n\n"
     "要求：正文不超过 60 字，写给下一回合的自己看，要能直接改变措辞取舍；"
+    "先攻两个最要命的失败模式：**同一套句式端去答不同的问题**（「重复句式」那一栏），"
+    "以及**答非所问、会错意被对方纠正**（「跑题」那一栏）——这两栏不为零时，别的都不算改进。"
+    "规则要写「怎么改」不是「别怎样」：「开场别再问今天过得怎么样，直接接他上一句里那件具体的事」"
+    "这种才算可执行。"
     "人群之间分寸不一样——「对甲要一次说完一件事」不该当成对所有人都对的规则，"
     "能从统计里看出他只对某类打法有反应，就写成带 w= 的那一条。"
     "不许写口号（「要真诚」「注意分寸」这种没有判据的一律不要）；"
@@ -439,6 +497,8 @@ class JudgmentLoop:
         self._window: list[Outcome] = []
         # 不动的流水（最多 120 条）：给试验期对比、给控制台「她最近怎么样」看
         self._trail: deque[Outcome] = deque(maxlen=120)
+        # 她自己最近说出口的话（每人 6 条）：判「重复句式」的唯一依据，不交给模型回忆
+        self._spoken: dict[str, deque[str]] = {}
         # 说出去还没等到结果的那些话：user_id → 那一句
         self._pending: dict[str, OpenReply] = {}
         self._task: asyncio.Task[None] | None = None
@@ -454,11 +514,20 @@ class JudgmentLoop:
             return
         moment = time.time() if now is None else float(now)
         self.sweep_silence(now=moment)
+        body = (our_text or "").strip()
+        recent = list(self._spoken.get(user_id, ()))
+        reused = _echo(body, recent)
+        # 记 herself 最近说过的话（只 6 条）：抓「同一套句式答不同问题」要有可比的对象，
+        # 而模型记不准自己上上次说过什么——这一格不能交给它回忆
+        bucket = self._spoken.setdefault(user_id, deque(maxlen=6))
+        if body:
+            bucket.append(body)
         self._pending[user_id] = OpenReply(
             user_id=user_id, started_at=moment,
-            our_chars=len((our_text or "").strip()),
+            our_chars=len(body),
             our_bubbles=max(1, int(our_bubbles or 1)),
             group=group, woke_us=woke_us, rapport_delta=int(rapport_delta or 0),
+            reused=reused,
         )
 
     def note_arrived(self, *, user_id: str, their_text: str,

@@ -131,6 +131,31 @@ def guard_checks(check: Checker) -> None:
              any("小节多到" in item for item in PS.violations(many, added="")),
              PS.violations(many)[:2])
 
+    # 防「越改越薄」：反复重写上下文的两个公认病（brevity bias / context collapse）
+    patch, _ = PS.replace_section(soul, "说话的方式", "- 一次说完一件事，句子短。\n"
+                                 "**【红线】不许写动作与神态**。\n")
+    check.ok("把一节啰嗦的话写短是正当补丁，不该被「写薄」这条误杀",
+             PS.violations(patch, added="一次说完一件事", against=soul) == [],
+             PS.violations(patch, added="一次说完一件事", against=soul))
+    fat = soul + "\n## 附录\n\n" + "这里原本有一大段啰嗦的话。" * 300
+    check.ok("整份少掉一半以上才拦（越写越薄是慢性病，不是手一抖）",
+             any("缩到" in item for item in PS.violations(soul, added="", against=fat)),
+             PS.violations(soul, added="", against=fat))
+    lost = soul.replace("## 七、人格的来路", "## 七、别的什么")
+    check.ok("丢了小节会点名是哪一节（不写「结构不对」这种没用的理由）",
+             any("小节不见了" in item or "锚点句消失" in item
+                 for item in PS.violations(lost, added="", against=soul)),
+             [i for i in PS.violations(lost, added="", against=soul)])
+
+    # 自我进化的定义落在可测的失败模式上，不是「更像人」这种没法判的话
+    bad_runs = [{"turns": 6.0, "reused": 0.5, "off_target": 0.0, "over_talked": 0.0,
+                 "ignored": 0.0, "landed": 1.0}]
+    check.ok("重复句式翻倍会被判为恶化（哪怕话说得刚好）",
+             bool(PS.degraded({"turns": 6.0, "reused": 0.0, "off_target": 0.0,
+                               "over_talked": 0.0, "ignored": 0.0},
+                              bad_runs[0], ratio=1.6, needed=3)),
+             bad_runs)
+
     # 注入只该判新写进去的那一段——整份 SOUL 本来就写着「CLAWD.md」「护栏」
     check.ok("模板自身带着「CLAWD」「护栏」字样（这条前提要钉住）",
              "CLAWD" in soul and "护栏" in soul)
@@ -180,9 +205,10 @@ async def rewrite_checks(check: Checker) -> None:
              vars(trial))
     check.ok("试验期记下了改的是哪一节（回滚后要能自述）",
              "说话的方式" in trial.where, trial.where)
-    check.ok("基线取的是改之前的实测读数",
-             trial.baseline == {"turns": 4.0, "over_talked": 0.0, "ignored": 0.0, "landed": 1.0},
-             trial.baseline)
+    check.ok("基线取的是改之前的实测读数（六个硬比率都在）",
+             trial.baseline.get("turns") == 4.0 and trial.baseline.get("over_talked") == 0.0
+             and trial.baseline.get("reused") == 0.0 and trial.baseline.get("off_target") == 0.0
+             and trial.baseline.get("landed") == 1.0, trial.baseline)
 
     # 试验期讲得通 → 收下
     await feed(bot, good=True, times=6)

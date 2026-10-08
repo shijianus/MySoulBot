@@ -984,7 +984,45 @@ async def judgment_sensors_checks(check: Checker) -> None:
     check.ok("温度不写进攒判断的材料（她不该学讨好）",
              "熟络度" not in stats.render(), stats.render())
 
-    # 晾到很久才算被晾：90 秒是 `Outcome.slow` 的线，跟回没回是两件事
+    # 两个真正该攻的失败模式：同一套句式端第二遍、答非所问被纠正
+    loop.track_reply(user_id="u4", our_text="今天过得怎么样呀，有没有好好吃饭", our_bubbles=1)
+    arrived = loop.note_arrived(user_id="u4", their_text="不是这个，我问的是昨天那件事")
+    check.ok("对面纠正「答非所问」量得出来",
+             arrived is not None and arrived.off_target, "" if arrived is None else arrived)
+    check.ok("跑题的账进统计",
+             loop._window[-1].off_target and loop.ledger.stats(loop._window).off_target >= 1,
+             loop._window[-1])
+
+    loop.track_reply(user_id="u5", our_text="今天过得怎么样呀，有没有好好吃饭", our_bubbles=1)
+    loop.note_arrived(user_id="u5", their_text="吃了")
+    loop.track_reply(user_id="u5", our_text="今天过得怎么样呀，有没有好好吃饭哦", our_bubbles=1)
+    check.ok("同一套句式端第二遍，说出口那一刻就记上",
+             loop._pending["u5"].reused is True)
+    loop.sweep_silence(now=time.time() + 400)
+    check.ok("重复这件事进了流水，不用等对方表态",
+             any(i.reused for i in loop._window), [i.reused for i in loop._window][-3:])
+    loop.track_reply(user_id="u5", our_text="那件事我上午查了眼，进度到八成了", our_bubbles=1)
+    check.ok("换了说法不算重复（阈值不许低到把自称也算成套话）",
+             loop._pending["u5"].reused is False)
+
+    render = loop.ledger.stats(loop._window).render()
+    check.ok("给模型的统计里写着这两栏", "重复句式" in render and "答非所问被纠正" in render, render)
+    check.ok("问模型时让它先攻这两个失败模式",
+             "重复句式" in J._PROMPT and "答非所问" in J._PROMPT, "")
+    repeat_rule = J.Rule(text="别把同一句话端给不同的问题", confidence=50)
+    check.ok("讲重复的判断：本轮没重复才算被支持",
+             J._supports(repeat_rule, J.Outcome(user_id="u", at=time.time(), our_chars=30,
+                                                 their_chars=30, replied=True)) is True, "")
+    check.ok("讲重复的判断：本轮又重复了就扣分",
+             J._supports(repeat_rule, J.Outcome(user_id="u", at=time.time(), our_chars=30,
+                                                 their_chars=30, replied=True, reused=True)) is False, "")
+    stray_rule = J.Rule(text="别答非所问", confidence=50)
+    check.ok("讲跑题的判断跟着跑题信号走",
+             J._supports(stray_rule, J.Outcome(user_id="u", at=time.time(), our_chars=30,
+                                               their_chars=30, replied=True,
+                                               off_target=True)) is False, "")
+
+    # 晾过 90 秒这一条也算慢
     loop.track_reply(user_id="u3", our_text="一" * 80, our_bubbles=1)
     loop.sweep_silence(now=time.time() + 200)
     stale = loop._window[-1]
@@ -1065,9 +1103,18 @@ async def prompt_layer_checks(check: Checker) -> None:
     check.ok("快捷档仍不背宪法", "LAYER 0 · 深层灵魂" not in quick, "")
 
     # 出戏的两半：提示词说清 + 出口拦死。这里验前半。
-    check.ok("全量档带真人身份锁", "【真人身份锁】" in full and "沉默不出戏" in full, "")
-    check.ok("快捷档也带身份锁（「你是什么模型」正是短对话，最常走快捷档）",
-             "【身份锁】" in quick, quick[-200:])
+    check.ok("全量档带真人身份锁", "【真人身份锁】" in full, "")
+    check.ok("锁把「对世界的诚实」与「对实现的披露」分开（不许被「你要诚实」偷换）",
+             "对世界的诚实" in full and "对实现的披露" in full
+             and "这一层永远优先" in full and "永远不披露" in full, "")
+    check.ok("锁不许她为了不出戏而编人身经历（不假装也不交代）",
+             "不假装，也不交代" in full and "这事我也说不清" in full, "")
+    check.ok("管理者的真实性走账目，不走她的嘴",
+             "/panel audit" in full and "admin ▸ growth" in full, "")
+    check.ok("快捷档的身份锁写明「这一档最高要求」",
+             "【身份锁·这一档最高要求】" in quick and "两句都是把戏演完" in quick, quick[-260:])
+    check.ok("快捷档仍留事实层面的诚实（不是什么都别说）",
+             "事实层面的问题照常老实回答" in quick, "")
     primed = [name for name in ("GPT", "gpt", "Qwen", "GLM", "Claude", "Gemini",
                                 "DeepSeek", "siliconflow") if name in full or name in quick]
     check.ok("提示词里一个模型名都没有（摆上去等于给她一排候选答案）", not primed, primed)

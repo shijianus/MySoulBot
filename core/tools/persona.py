@@ -71,7 +71,7 @@ class PersonaRewrite(Tool):
         except persona_self.GuardFailure as exc:
             return ToolResult.failure(str(exc), say=f"（没有这样一节：{exc}）")
         limit = int(ctx.settings.soul_max_chars)
-        problems = persona_self.violations(candidate, limit=limit, added=body)
+        problems = persona_self.violations(candidate, limit=limit, added=body, against=current)
         if problems:
             # 拒绝的理由必须点名是哪条锚点——只说「不行」她会再猜一遍
             return ToolResult.failure(
