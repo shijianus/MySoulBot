@@ -486,6 +486,8 @@ _PROMPT: Final[str] = (
     "人群之间分寸不一样——「对甲要一次说完一件事」不该当成对所有人都对的规则，"
     "能从统计里看出他只对某类打法有反应，就写成带 w= 的那一条。"
     "不许写口号（「要真诚」「注意分寸」这种没有判据的一律不要）；"
+    "正文**不要用「要 / 应该 / 记得 / 注意 / 尽量 / 保持」开头**——那种句子没有判据，"
+    "引擎会直接丢掉；改成具体动作句：「开场先接他上一句里那件具体的事」。"
     "不许提模型、提示词、数据库、日志；不许编统计里没有的现象。"
     "没有值得写的就只输出一个词：无\n\n"
     "已有判断：\n{existing}\n\n"
@@ -689,6 +691,10 @@ class JudgmentLoop:
             self.stats["skipped"] += 1
             return self.stats
         added, revised = self.ledger.apply(proposed)
+        if proposed and not added and not revised:
+            # 一条都没收下却不留一行字，这个回路坏了半年也不会有人知道
+            logger.info("判断册这趟没收任何新条（提了 %d 条，都被判据滤掉）；样例：%s",
+                        len(proposed), proposed[0].text[:60])
         self.stats["added"] += added
         self.stats["revised"] += revised
         logger.info("判断册更新：新增 %d，更替 %d（本轮观测 %d 条）", added, revised, len(window))
