@@ -634,7 +634,13 @@ class SoulServer:
             await asyncio.sleep(0.1)
         turns_left = self._in_flight()
         backlog = await self.bot.flush_extractions(max(1.0, deadline - time.monotonic()))
-        return {"turns_left": turns_left, "backlog": backlog}
+        # 自我成长那套账（核对判断册、试验期数账、必要时还原）也是 fire-and-forget 的：
+        # 进程直接走掉会丢掉「这一轮的实测结果」，下次开机她就少一次自我修正的依据
+        growth_left = 0
+        with contextlib.suppress(Exception):
+            await self.bot.flush_growth(max(1.0, deadline - time.monotonic()))
+            growth_left = self.bot.judgment.pending_notes()
+        return {"turns_left": turns_left, "backlog": backlog, "growth_left": growth_left}
 
     def _in_flight(self) -> int:
         """正在出话的回合数，两个入口一起算：只盯酒馆会把 QQ 那一半漏在停机之外。"""

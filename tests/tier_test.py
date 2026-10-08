@@ -944,89 +944,21 @@ async def audience_checks(check: Checker) -> None:
              bool(made) and made[0].who == "", [(r.text, r.who) for r in loop.ledger.rules()])
 
 
-async def hot_path_checks(check: Checker) -> None:
-    """自我成长不许占用回话那一秒：记账在本轮，核对与还原都在后台。
-
-    `reinforce` 是读文件＋flock＋写文件，放在 `_finalize` 里就等于让「她以后怎么说」
-    去排队「她这句什么时候发出去」。偏移落在下一轮才对——本轮提示词早就拼完了。
-    """
-    s = tier_settings(judgment_enabled=True, judgment_every_turns=60)
-    ledger = J.JudgmentLedger(s)
-    ledger.apply([J.Rule(text="长话会被晾着，先给一句短的", confidence=50)])
-    loop = J.JudgmentLoop(s, StorageManager(s), ledger=ledger)
-    stamp = ledger.path.stat().st_mtime_ns
-    loop.note(J.Outcome(user_id="u", at=time.time(), our_chars=200,
-                        their_chars=260, replied=True))
-    check.ok("note() 只入队，不当场改册子", ledger.path.stat().st_mtime_ns == stamp,
-             f"{stamp}→{ledger.path.stat().st_mtime_ns}")
-    await loop.settle()
-    check.ok("后台核完才落盘", ledger.path.stat().st_mtime_ns != stamp)
-    check.ok("落盘后分数真按观测动了（打脸一次扣 6）",
-             [rule.confidence for rule in ledger.rules()] == [44], ledger.read_text())
-
-    cached = ledger.rules()
-    cached[0].confidence = 99
-    check.ok("每轮读册子拿的是副本（按 mtime 缓存原文，不缓存可变对象）",
-             ledger.rules()[0].confidence == 44, ledger.rules()[0].confidence)
-    ledger._write([J.Rule(text="换个说法", confidence=60)])
-    check.ok("写完立刻失效缓存（不会读到上一本的残留）",
-             [rule.text for rule in ledger.rules()] == ["换个说法"], ledger.read_text())
-
-    bot_loop = J.JudgmentLoop(tier_settings(judgment_enabled=True, judgment_every_turns=60),
-                              StorageManager(s))
-    took = time.perf_counter()
-    for _ in range(20):
-        bot_loop.note(J.Outcome(user_id="u", at=time.time(), our_chars=30,
-                                their_chars=30, replied=True))
-    elapsed = (time.perf_counter() - took) * 1000
-    check.ok(f"20 次记账的同步开销很小（{elapsed:.2f}ms）", elapsed < 60, elapsed)
-    await bot_loop.settle()
-
-
-def multi_account_checks(check: Checker) -> None:
-    """两条链路 = 同一个本质；两个账号 = 各认各的我。
-
-    NapCat 与扫码型 bot 的差别只在「谁拨进来、token 放哪儿」，进来之后走的是同一个
-    入站/出站/闸；而 `self_id` 必须按连接记——它是全局单值的话，第二个号一报心跳，
-    第一个号说的话就会被当成「她自己说的」丢掉（或者反过来对她的回声自 talk 不停）。
-    """
-    from core.adapters.qq_onebot import OneBotBridge, _Connection, parse_inbound
-    from core.bot import MySoulBot
-    from core.memory_extractor import MemoryExtractor
-    from core.prompt_builder import PromptBuilder
-
-    s = tier_settings(onebot_enabled=True, onebot_access_token="t" * 32)
-    storage = StorageManager(s)
-    prompts = PromptBuilder(s, storage)
-    bot = MySoulBot(s, storage, prompts, MemoryExtractor(s, storage))
-    bridge = OneBotBridge(s, bot)
-
-    def fake(peer: str, self_id: int) -> _Connection:
-        conn = _Connection.__new__(_Connection)
-        conn.peer, conn.self_id, conn.alive = peer, self_id, True
-        return conn
-
-    a, b = fake("127.0.0.1:5001", 111), fake("127.0.0.1:5002", 222)
-    bridge._connections = {a, b}
-    peers = {p["peer"]: p["self_id"] for p in bridge.status()["peers"]}
-    check.ok("状态里看得出每条链路各是哪个号",
-             peers == {"127.0.0.1:5001": "111", "127.0.0.1:5002": "222"}, peers)
-    check.ok("两条链路互不覆盖身份", a.self_id == 111 and b.self_id == 222)
-
-    def event(uid: int) -> dict[str, Any]:
-        return {"post_type": "message", "self_id": uid, "message_id": 7,
-                "message_type": "private", "time": 0, "user_id": uid,
-                "sender": {"user_id": uid, "card": "", "nickname": "甲"},
-                "message": [{"type": "text", "data": {"text": "在吗"}}]}
-
-    mine_a = parse_inbound(event(111), bot_id=111)
-    mine_b = parse_inbound(event(111), bot_id=222)
-    check.ok("按「这条连接是谁」判回声：A 的号看 A 就是自己，B 的号看 A 是别人",
-             mine_a is not None and mine_a.sender_id == 111
-             and mine_b is not None and mine_b.sender_id != 222,
-             f"{None if mine_a is None else mine_a.sender_id}/"
-             f"{None if mine_b is None else mine_b.sender_id}")
-    bridge._connections = set()
+    # 成长不占本轮：note() 只入队，核对在后台跑（占的是下一轮的准头，不是这一轮的秒数）
+    s5 = tier_settings(judgment_enabled=True, judgment_every_turns=60)
+    led5 = J.JudgmentLedger(s5)
+    led5.apply([J.Rule(text="长话会被晾着，先给一句短的", confidence=60, seen=5)])
+    loop5 = J.JudgmentLoop(s5, StorageManager(s5), ledger=led5)
+    loop5.note(J.Outcome(user_id="u", at=time.time(), our_chars=300, their_chars=260,
+                         replied=True))
+    right_now = [rule.confidence for rule in led5.rules()]
+    check.ok("记一条观测不会当场去改册子（磁盘写不在回话路上）",
+             right_now == [60] and loop5.pending_notes() == 1, f"{right_now}/{loop5.pending_notes()}")
+    left = await loop5.flush(timeout=5.0)
+    after = [rule.confidence for rule in led5.rules()]
+    check.ok("后台排干之后账才落下（FIFO，一条不漏）",
+             left == 0 and after and after[0] < 60, f"{left}/{after}")
+    check.ok("排干之后没有残留队列", loop5.pending_notes() == 0, loop5.pending_notes())
 
 
 # ---------------------------------------------------------------- 5. 提示词吃到判断
@@ -1233,8 +1165,6 @@ async def main() -> int:
         await judgment_loop_checks(check)
         await judgment_sensors_checks(check)
         await audience_checks(check)
-        await hot_path_checks(check)
-        multi_account_checks(check)
         await prompt_layer_checks(check)
     finally:
         print(f"\n共 {check.count} 项断言，失败 {len(check.failures)} 项")

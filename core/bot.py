@@ -213,6 +213,8 @@ class MySoulBot:
         self.cognition = CognitionLoop(settings, storage, self.mood)
         # 判断回路：后端根据真实结果攒「怎么说」，写进 JUDGMENT.md，下一轮直接改前端取舍
         self.judgment = JudgmentLoop(settings, storage)
+        # 自我成长的后台账目（核对判断册、试验期数账、还原）：占下一轮的准头，不占这一轮的秒数
+        self._deferred: set[Any] = set()
         # 攒判断那一问走上游池（换家/赛跑/按实测速度挑线都在 ask_once 上）。
         # 原来这里谁都接不上——`bind_client` 在全仓只有一个定义和一个文档提及，
         # 于是 `_ask` 永远返回空串，`apply()` 生产不可达，JUDGMENT.md 从来没被写过。
@@ -226,9 +228,6 @@ class MySoulBot:
         self.routes = UpstreamPool(settings)
         self._pool_clients: dict[str, AsyncOpenAI] = {}
         self._sessions: dict[str, Session] = {}
-        # 人格试验期判定的后台队列（见 `_schedule_persona_trial`）
-        self._trial_pending: set[str] = set()
-        self._trial_task: asyncio.Task[None] | None = None
         self._today = dt.date.today()
 
     # ------------------------------------------------------------ 资源
@@ -1364,6 +1363,25 @@ class MySoulBot:
         return ""
 
     # ------------------------------------------------------------ 自我塑造的善后
+    def _later(self, coro: Any, *, label: str = "后台账目") -> None:
+        """把不带回复的事挪到后台跑。炸了只记一行，不该掀翻任何东西。"""
+        task = asyncio.create_task(coro)
+        self._deferred.add(task)
+
+        def _done(finished: asyncio.Task) -> None:
+            self._deferred.discard(finished)
+            exc = finished.exception()
+            if exc is not None:
+                logger.warning("%s没跑完：%s", label, exc)
+
+        task.add_done_callback(_done)
+
+    async def flush_growth(self, timeout: float = 15.0) -> None:
+        """等自我成长的后台账目跑完。退出前与面板看准数时用。"""
+        if self._deferred:
+            await asyncio.wait(set(self._deferred), timeout=timeout)
+        await self.judgment.flush(timeout=timeout)
+
     async def _settle_selfhood(self, user_id: str, pairs: Sequence[Any]) -> None:
         """工具改完人格之后，引擎这一头把账记上：试验期的基线、以及真要换的那套装。
 
@@ -1407,30 +1425,6 @@ class MySoulBot:
         await persona_self.note_switch(self._storage, user_id, slug)
         logger.info("%s 自己换上了 %s（前一套：%s）",
                     user_id, applied.slug, applied.previous_slug or "无")
-
-    def _schedule_persona_trial(self, user_id: str) -> None:
-        """试验期判定排队到后台跑。
-
-        它要读改 persona.json、判恶化、还可能整份还原 SOUL.md——全是「以后怎么说」的活。
-        放在回话路径上，就是拿她这句什么时候发出去，去换那本账的及时性。
-        """
-        if not user_id:
-            return
-        self._trial_pending.add(user_id)
-        try:
-            asyncio.get_running_loop()
-        except RuntimeError:
-            return                      # 没在事件循环里（脚本、测试）：由调用方自己 await 判定
-        if self._trial_task is None or self._trial_task.done():
-            self._trial_task = asyncio.create_task(self._drain_trials())
-
-    async def _drain_trials(self) -> None:
-        while self._trial_pending:
-            uid = self._trial_pending.pop()
-            try:
-                await self._settle_persona_trial(uid)
-            except Exception as exc:  # noqa: BLE001 - 判定失败不该掀翻任何人
-                logger.warning("%s 人格试验期判定出错（忽略）：%s", uid, exc)
 
     async def _settle_persona_trial(self, user_id: str) -> None:
         """试验期到期：改坏了就自己还原，不必等人救——这是「真能改自己」的下半句。
@@ -1514,8 +1508,9 @@ class MySoulBot:
             user_id=session.user_id, our_text=text,
             our_bubbles=session.last_bubbles, group=group_mode,
         )
-        # 她自己改过人格的话，这一轮就是证据之一：判定挪到后台，不占这一句的发车时间
-        self._schedule_persona_trial(session.user_id)
+        # 她自己改过人格的话，这一轮就是证据之一。数账与可能的还原都放到后台：
+        # 那是带磁盘写的，不该占对方等回话的时间——偏移要落在下一次，不是这一句
+        self._later(self._settle_persona_trial(session.user_id))
         session.last_reply_at = time.time()
         session.last_reply_text = text
         # 气泡条数由网桥切完才知道，这里先按「一条长话」估：
