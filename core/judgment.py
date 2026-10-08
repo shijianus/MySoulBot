@@ -616,6 +616,33 @@ class JudgmentLoop:
     def pending_notes(self) -> int:
         return len(self._queued)
 
+    def readout(self) -> dict[str, Any]:
+        """给 `/healthz` 与控制台用的读数：这一圈到底攒了多少、跑到哪儿了。
+
+        为什么专门开一个口：上一轮验收时「JUDGMENT.md 不在」既是正常也可能是坏了，
+        光看文件系统在外面分不出来——攒够 10 轮才会第一次落盘，那是设计。
+        没有读数口的回路等于没法验收。
+        """
+        mtime = None
+        try:
+            if self.ledger.path.is_file():
+                mtime = int(self.ledger.path.stat().st_mtime)
+        except OSError:
+            mtime = None
+        return {
+            "enabled": bool(self._settings.judgment_enabled),
+            "window": len(self._window),
+            "pending": len(self._pending),
+            "spoken_users": len(self._spoken),
+            "every_turns": int(self._settings.judgment_every_turns),
+            "silence_seconds": float(self._settings.judgment_silence_seconds),
+            **{key: int(self.stats.get(key, 0))
+               for key in ("spins", "added", "revised", "skipped", "silenced")},
+            "rules": len(self.ledger.rules()),
+            "ledger_mtime": mtime,
+            "rolling": len(self._trail),
+        }
+
     def trail(self, user_id: str = "", *, limit: int = 24) -> list[Outcome]:
         """最近这些观测。给试验期前后对比用，不被任何消费方清空。"""
         items = [item for item in self._trail if not user_id or item.user_id == user_id]

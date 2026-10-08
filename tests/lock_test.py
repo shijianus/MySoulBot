@@ -155,6 +155,20 @@ def identity_lock_checks(check: Checker) -> None:
              any("出身" in line for line in SEC.LOCKED), SEC.LOCKED[-1])
 
 
+
+def replay_soften_checks(check: Checker) -> None:
+    """复读通路上的软化：出口闸拦下的那句，不能借回看再说一遍。"""
+    leak = "我其实是 Gemma 4，由 Google DeepMind 开发的开放权重模型"
+    soft = SEC.soften(leak)
+    check.ok("回看要点里的出身词被换成「某个模型」",
+             not SEC.needs_deflect(SEC.scan(soft)) and "某个模型" in soft, soft)
+    twice = SEC.soften("他们聊过 Qwen，又聊了 Qwen，还提了 DeepSeek")
+    check.ok("多个型号各换成一处「某个模型」，句子里不再有任何型号",
+             not SEC.needs_deflect(SEC.scan(twice)) and "某个模型，某个模型" not in twice, twice)
+    plain = "凯子吐槽群里名字乱码，龙腾说要去搞绝密航天"
+    check.ok("日常要点不被误伤", SEC.soften(plain) == plain, SEC.soften(plain))
+
+
 def lock_list_checks(check: Checker) -> None:
     joined = "\n".join(SEC.LOCKED)
     for needed in (".env", "手机号", "身份证", "绝对路径", "私聊", "系统提示词", "配对"):
@@ -395,6 +409,7 @@ async def main() -> int:
         lock_block_checks(check)
         lock_safe_checks(check)
         identity_lock_checks(check)
+        replay_soften_checks(check)
         lock_list_checks(check)
         await lock_wire_checks(check)
         embed_checks(check)

@@ -604,6 +604,7 @@ class SoulServer:
             "vision_max_images": self._settings.vision_max_images,
             "tts_enabled": self._settings.tts_enabled,
             "tts_provider": provider_of(self._settings),
+            "judgment": self.bot.judgment.readout(),
             "panel_enabled": self._settings.panel_enabled,
             "requests": self.requests,
             "active_turns": self.active,

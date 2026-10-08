@@ -209,6 +209,21 @@ _DEFLECT_DEFAULT: Final[tuple[str, ...]] = (
 _DEFLECT_CURSOR = itertools.count()
 
 
+def soften(text: str) -> str:
+    """把出身词换成「某个模型」——给**复读通路**用的，不是给出口的。
+
+    用途很具体：`RECAP.md` 是从逐轮日志压出来的。日志里可能躺着她自己说漏的那句
+    「我是 Gemma 4」，回看一压就把它送回提示词，下一回合她是在**复述自己坦白过的历史**。
+    出口闸拦得住她当场说，拦不住她把过去说的话再说一遍——那条路只能在这里堵。
+    换词而不是删空：「他们聊过某个模型」还得读得通。
+    """
+    body = text or ""
+    for name, _action, pattern, _why in _PATTERNS:
+        if name in IDENTITY_RULES:
+            body = pattern.sub("某个模型", body)
+    return re.sub(r"(?:某个模型[，,、]?\s*){2,}", "某个模型", body)
+
+
 def needs_deflect(findings: Sequence[Finding]) -> bool:
     """这一句里有没有出身类的泄漏——有的话整条都别原样发。"""
     return any(finding.rule in IDENTITY_RULES for finding in findings)

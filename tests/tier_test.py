@@ -1027,6 +1027,28 @@ async def audience_checks(check: Checker) -> None:
     check.ok("排干之后没有残留队列", loop5.pending_notes() == 0, loop5.pending_notes())
 
 
+
+def readout_checks(check: Checker) -> None:
+    """回路必须可验收：光看 JUDGMENT.md 在不在，分不出「还没攒够」和「坏了」。"""
+    s = tier_settings(judgment_enabled=True, judgment_every_turns=10)
+    loop = J.JudgmentLoop(s, StorageManager(s))
+    read = loop.readout()
+    check.ok("读数口开齐了该看的几样",
+             {"enabled", "window", "pending", "every_turns", "spins", "rules",
+              "ledger_mtime", "silence_seconds"} <= set(read), sorted(read))
+    check.ok("刚开张时全为零而不是缺字段",
+             read["window"] == 0 and read["rules"] == 0 and read["ledger_mtime"] is None, read)
+    loop.track_reply(user_id="u", our_text="本鲸不去", our_bubbles=1)
+    read = loop.readout()
+    check.ok("挂出去的话数得出来（还没等到结果）",
+             read["pending"] == 1 and read["window"] == 0, read)
+    loop.note_arrived(user_id="u", their_text="行吧")
+    read = loop.readout()
+    check.ok("结掉之后转入窗口、pending 归零",
+             read["pending"] == 0 and read["window"] == 1, read)
+    quiet = J.JudgmentLoop(s.model_copy(update={"judgment_enabled": False}), StorageManager(s))
+    check.ok("关掉回路读数说得出「没开」", quiet.readout()["enabled"] is False, quiet.readout())
+
 # ---------------------------------------------------------------- 5. 提示词吃到判断
 async def judgment_sensors_checks(check: Checker) -> None:
     """传感器的对错：被晾着必须量得出来，接话率必须能低于 100%。
@@ -1221,6 +1243,7 @@ async def main() -> int:
         owner_qq_checks(check)
         channel_neutral_checks(check)
         await multi_account_checks(check)
+        readout_checks(check)
         pairing_checks(check)
         await phrase_budget_checks(check)
         grace_checks(check)

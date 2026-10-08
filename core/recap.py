@@ -16,6 +16,7 @@ import re
 from typing import Any, Final
 
 from config import Settings
+from core.secrecy import soften as soften_identity
 from core.storage_manager import StorageManager
 
 logger: Final = logging.getLogger("mysoulbot.recap")
@@ -118,7 +119,9 @@ class SessionRecap:
             line = re.sub(r"\s+", " ", str(raw or "")).strip()
             if not line or _REJECT.search(line):
                 continue
-            out.append(line[:_BULLET_CHARS])
+            # 要点会被当成「她自己说过的话」送回提示词：出身词在这儿就得换掉，
+            # 否则出口闸拦下的那句，会通过回看这条路被她自己复述出来。
+            out.append(soften_identity(line[:_BULLET_CHARS]))
         return out
 
     async def _write(self, user_id: str, bullets: list[str]) -> None:
