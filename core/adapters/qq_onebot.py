@@ -1278,6 +1278,10 @@ class _Connection:
         self._echo = 0
         self.peer = peer
         self.alive = True
+        # 这条连接背后那个号是谁。全局 `bridge.bot_id` 只能存一个号，两条链路接两个账号时
+        # 它会被后报的那个盖掉——于是 A 号说的话被当成「B 号自己说的」而丢掉，
+        # 或者反过来对她的回声无限自 talk。身份按连接记，不按进程记。
+        self.self_id: int = 0
         # 各家协议端的「正在输入」不一个叫法：试过哪一种认，就只发那一种
         self.typing_actions: dict[str, str] = {}  # 按「私聊/群聊」各记一个认的叫法：NapCat 那条只管单聊
         self.typing_supported = True  # 两种都不认就关掉试探，别每 18 秒白敲两次门
@@ -1581,6 +1585,7 @@ class OneBotBridge:
         if post_type == "message":
             self._bump("events")
             self.bot_id = _as_id(payload.get("self_id")) or self.bot_id
+            connection.self_id = _as_id(payload.get("self_id")) or connection.self_id
             connection.track(self._on_message(connection, payload))
             return
         if post_type == "request":
@@ -1612,6 +1617,7 @@ class OneBotBridge:
         if isinstance(status, Mapping) and "online" in status:
             self.peer_online = bool(status.get("online"))
         self.bot_id = _as_id(event.get("self_id")) or self.bot_id
+        connection.self_id = _as_id(event.get("self_id")) or connection.self_id
         if self._settings.onebot_apply_profile_on_boot and not self._profile_pushed:
             self._profile_pushed = True
             connection.track(self.apply_profile(reason="boot"))
@@ -1792,11 +1798,13 @@ class OneBotBridge:
 
     # ------------------------------------------------------------ 一条消息
     async def _on_message(self, connection: _Connection, event: Mapping[str, Any]) -> None:
-        inbound = parse_inbound(event, bot_id=self.bot_id, bot_names=self.bot_names)
+        # 「谁是我」按这条连接判：两账号同挂时，A 的号不能拿去看 B 的话
+        mine = connection.self_id or self.bot_id
+        inbound = parse_inbound(event, bot_id=mine, bot_names=self.bot_names)
         if inbound is None:
             self._bump("ignored")
             return
-        if self.bot_id and inbound.sender_id == self.bot_id:
+        if mine and inbound.sender_id == mine:
             self._bump("ignored")
             return  # 她自己的话再喂给自己，就是无限自 talk
         if not (inbound.text or inbound.images or inbound.quoted):
@@ -2536,6 +2544,10 @@ class OneBotBridge:
             "bound": bound,
             "connections": len(self._connections),
             "self_id": str(self.bot_id) if self.bot_id else "",
+            # 每条链路背后是哪个号：两账号同挂时，这里能一眼看出是不是各认各的
+            "peers": [{"peer": conn.peer, "self_id": str(conn.self_id) if conn.self_id else "",
+                       "alive": conn.alive} for conn in sorted(self._connections,
+                                                               key=lambda c: c.peer)],
             "bot_names": list(self.bot_names),
             "authenticated": bool(self._settings.onebot_access_token.strip()),
             "heartbeat_seconds_ago": (

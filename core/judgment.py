@@ -258,10 +258,29 @@ class JudgmentLedger:
 
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
+        # (mtime_ns, 正文)。提示词每轮都要读这本册子——那是回话热路径上的一次磁盘 I/O。
+        # 按 mtime 缓存原文、每次都重新解析：册子最多 12 条，重解析比一次 stat 便，
+        # 而缓存对象会被 `reinforce` 改分数，缓存对象就是拿一次改一次的错。
+        self._text: tuple[int, str] | None = None
 
     @property
     def path(self) -> Path:
         return self._settings.judgment_path
+
+    def _lines(self) -> list[str]:
+        path = self.path
+        try:
+            stamp = path.stat().st_mtime_ns
+        except OSError:
+            self._text = None
+            return []
+        if self._text is None or self._text[0] != stamp:
+            try:
+                self._text = (stamp, path.read_text("utf8"))
+            except OSError:
+                self._text = None
+                return []
+        return self._text[1].splitlines()
 
     @contextlib.contextmanager
     def _locked(self) -> Iterator[None]:
@@ -289,10 +308,8 @@ class JudgmentLedger:
                     handle.close()
 
     def rules(self) -> list[Rule]:
-        if not self.path.is_file():
-            return []
         out: list[Rule] = []
-        for line in self.path.read_text("utf8").splitlines():
+        for line in self._lines():
             rule = Rule.parse(line)
             if rule is not None:
                 out.append(rule)
@@ -321,6 +338,7 @@ class JudgmentLedger:
         )
         body = "\n".join(rule.line() for rule in rules) or "（还没有攒出判断——刚开张。）"
         atomic_write(self.path, head + body + "\n")
+        self._text = None
 
     def seed(self) -> bool:
         """册子还不存在时先立一个空壳。返回是否真的新建了。
@@ -499,6 +517,9 @@ class JudgmentLoop:
         self._trail: deque[Outcome] = deque(maxlen=120)
         # 她自己最近说出口的话（每人 6 条）：判「重复句式」的唯一依据，不交给模型回忆
         self._spoken: dict[str, deque[str]] = {}
+        # 等着被拿去核对旧判断的观测（后台核，不占回话那一秒）
+        self._queued: list[Outcome] = []
+        self._drain: asyncio.Task[None] | None = None
         # 说出去还没等到结果的那些话：user_id → 那一句
         self._pending: dict[str, OpenReply] = {}
         self._task: asyncio.Task[None] | None = None
@@ -559,7 +580,13 @@ class JudgmentLoop:
         return len(self._pending)
 
     def note(self, outcome: Outcome) -> None:
-        """每轮记一条，并立刻拿它去核对已有判断。"""
+        """每轮记一条。**记账在本轮，核对在后台**——自我成长不许拖慢这一句回复。
+
+        `reinforce` 是读文件＋flock＋写文件：放在回话路径上，等于让「她以后会怎么说」
+        这件事占用「她现在这句什么时候发出去」。所以这里只入队，由一个 FIFO 后台任务
+        一条一条核对（单条任务保序，跨进程的写串行由册子那把 flock 兜）。
+        偏移因此必然落在**下一轮**：本轮提示词已经拼完了。
+        """
         if not self._settings.judgment_enabled:
             return
         self._window.append(outcome)
@@ -569,12 +596,42 @@ class JudgmentLoop:
         cap = max(self._settings.judgment_lookback, self._settings.judgment_every_turns)
         if len(self._window) > cap:
             self._window = self._window[-cap:]
-        try:
-            self.ledger.reinforce(outcome)
-        except OSError as exc:
-            logger.debug("判断册核对失败（忽略）：%s", exc)
+        self._queue_reinforce(outcome)
         if len(self._window) >= self._settings.judgment_every_turns and self._task is None:
             self._task = asyncio.create_task(self._spin())
+
+    def _queue_reinforce(self, outcome: Outcome) -> None:
+        self._queued.append(outcome)
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            self._reinforce_now()          # 没在事件循环里（脚本、测试）就当场核完
+            return
+        if self._drain is None or self._drain.done():
+            self._drain = asyncio.create_task(self._drain_queued())
+
+    def _reinforce_now(self) -> None:
+        while self._queued:
+            item = self._queued.pop(0)
+            try:
+                self.ledger.reinforce(item)
+            except OSError as exc:
+                logger.debug("判断册核对失败（忽略）：%s", exc)
+
+    async def _drain_queued(self) -> None:
+        while self._queued:
+            item = self._queued.pop(0)
+            try:
+                await asyncio.to_thread(self.ledger.reinforce, item)
+            except OSError as exc:
+                logger.debug("判断册核对失败（忽略）：%s", exc)
+
+    async def settle(self) -> None:
+        """等后台把欠的账核完（测试与「退出前排空」用；正常回话不该等它）。"""
+        await self._drain_queued()
+        if self._task is not None:
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._task
 
     def trail(self, user_id: str = "", *, limit: int = 24) -> list[Outcome]:
         """最近这些观测。给试验期前后对比用，不被任何消费方清空。"""

@@ -226,6 +226,9 @@ class MySoulBot:
         self.routes = UpstreamPool(settings)
         self._pool_clients: dict[str, AsyncOpenAI] = {}
         self._sessions: dict[str, Session] = {}
+        # 人格试验期判定的后台队列（见 `_schedule_persona_trial`）
+        self._trial_pending: set[str] = set()
+        self._trial_task: asyncio.Task[None] | None = None
         self._today = dt.date.today()
 
     # ------------------------------------------------------------ 资源
@@ -1405,6 +1408,30 @@ class MySoulBot:
         logger.info("%s 自己换上了 %s（前一套：%s）",
                     user_id, applied.slug, applied.previous_slug or "无")
 
+    def _schedule_persona_trial(self, user_id: str) -> None:
+        """试验期判定排队到后台跑。
+
+        它要读改 persona.json、判恶化、还可能整份还原 SOUL.md——全是「以后怎么说」的活。
+        放在回话路径上，就是拿她这句什么时候发出去，去换那本账的及时性。
+        """
+        if not user_id:
+            return
+        self._trial_pending.add(user_id)
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return                      # 没在事件循环里（脚本、测试）：由调用方自己 await 判定
+        if self._trial_task is None or self._trial_task.done():
+            self._trial_task = asyncio.create_task(self._drain_trials())
+
+    async def _drain_trials(self) -> None:
+        while self._trial_pending:
+            uid = self._trial_pending.pop()
+            try:
+                await self._settle_persona_trial(uid)
+            except Exception as exc:  # noqa: BLE001 - 判定失败不该掀翻任何人
+                logger.warning("%s 人格试验期判定出错（忽略）：%s", uid, exc)
+
     async def _settle_persona_trial(self, user_id: str) -> None:
         """试验期到期：改坏了就自己还原，不必等人救——这是「真能改自己」的下半句。
 
@@ -1487,8 +1514,8 @@ class MySoulBot:
             user_id=session.user_id, our_text=text,
             our_bubbles=session.last_bubbles, group=group_mode,
         )
-        # 她自己改过人格的话，这一轮就是证据之一：够数了就判一次
-        await self._settle_persona_trial(session.user_id)
+        # 她自己改过人格的话，这一轮就是证据之一：判定挪到后台，不占这一句的发车时间
+        self._schedule_persona_trial(session.user_id)
         session.last_reply_at = time.time()
         session.last_reply_text = text
         # 气泡条数由网桥切完才知道，这里先按「一条长话」估：
